@@ -33,13 +33,11 @@ pub fn minimum_charge(
         return Ok(None);
     }
     let shortfall = minimum.checked_sub(doc.net_total())?;
-    Ok(Some(
-        LineItem::debit(description)
-            .fixed_amount(shortfall)
-            .tag("minimum-charge")
-            .build()
-            .expect("minimum_charge LineItem cannot fail: fixed_amount is always set"),
-    ))
+    let item = LineItem::debit(description)
+        .fixed_amount(shortfall)
+        .tag("minimum-charge")
+        .build()?;
+    Ok(Some(item))
 }
 
 #[cfg(test)]

@@ -81,6 +81,35 @@ impl BillingDocument {
         self.gross_total
     }
 
+    /// Sum of all discount positions (always ≤ 0).
+    ///
+    /// Discounts are already embedded in `net_total` as negative amounts.
+    /// This accessor surfaces them separately for display or BO4E output.
+    #[must_use]
+    pub fn discount_total(&self) -> Amount<5> {
+        // Discount positions are bounded by construction; .sum() is safe here.
+        self.discount_positions.iter().map(|p| p.net_amount).sum()
+    }
+
+    /// Iterate over every position (net, discount, and tax) that carries `tag`.
+    ///
+    /// Searches all three position buckets in order: net → discounts → taxes.
+    /// Use this when building domain-specific output (e.g. BO4E `rechnungspositionen`
+    /// filtered by commodity tag).
+    ///
+    /// ```rust,ignore
+    /// for pos in doc.positions_by_tag("commodity") {
+    ///     println!("{}: {}", pos.description, pos.net_amount);
+    /// }
+    /// ```
+    pub fn positions_by_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a LineItem> + 'a {
+        self.net_positions
+            .iter()
+            .chain(self.discount_positions.iter())
+            .chain(self.tax_positions.iter())
+            .filter(move |p| p.has_tag(tag))
+    }
+
     /// All positions in order: net → discounts → taxes.
     ///
     /// Returns a zero-allocation iterator. Call `.collect()` if you need a `Vec`.

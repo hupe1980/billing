@@ -187,6 +187,12 @@ impl<const P: u8> Amount<P> {
     }
 
     /// Construct from a `rust_decimal::Decimal`. Returns `None` on overflow.
+    ///
+    /// The value is first **rounded** to `P` decimal places using `MidpointAwayFromZero`,
+    /// then scaled. Returns `None` only when the scaled integer overflows `i64`.
+    ///
+    /// For a `Result`-returning version that works with `?`, use
+    /// [`Amount::checked_from_decimal`].
     #[must_use]
     pub fn from_decimal(d: Decimal) -> Option<Self> {
         let scaled = d * Decimal::from(Self::SCALE);
@@ -194,6 +200,22 @@ impl<const P: u8> Amount<P> {
             .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
             .to_i64()
             .map(Self)
+    }
+
+    /// Construct from a `Decimal`, returning `Err` on overflow.
+    ///
+    /// Rounds `d` to `P` decimal places (`MidpointAwayFromZero`) before scaling.
+    /// This is the `?`-compatible counterpart of [`Amount::from_decimal`].
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// let a = Amount::<5>::checked_from_decimal(
+    ///     rust_decimal::Decimal::from_str_exact("1.23456").unwrap()
+    /// ).unwrap();
+    /// assert_eq!(a, Amount::parse("1.23456").unwrap());
+    /// ```
+    pub fn checked_from_decimal(d: Decimal) -> Result<Self, BillingError> {
+        Self::from_decimal(d).ok_or(BillingError::MonetaryOverflow { precision: P })
     }
 
     /// Construct from a `rust_decimal::Decimal`. Returns `Err` on overflow.
@@ -362,6 +384,53 @@ impl<const P: u8> Amount<P> {
                 .expect("monetary overflow in abs: i64::MIN has no positive counterpart"),
         )
     }
+
+    /// Returns `true` when `|self − expected| × 1_000_000 ≤ |expected| × ppm`.
+    ///
+    /// All arithmetic is exact integer (`u128`) — **no `f64`, no `Decimal`, no `.abs()` panic**.
+    /// This also avoids the `i64::MIN` edge-case that would otherwise cause `.abs()` to panic
+    /// when `self.0 - expected.0 == i64::MIN`.
+    /// `ppm = 0` means exact equality; `ppm = 10_000` means within 1 %.
+    ///
+    /// When `expected` is zero the comparison degrades to an exact equality test
+    /// (returns `true` only when `self` is also zero).
+    ///
+    /// | `ppm`       | Meaning |
+    /// |-------------|---------|
+    /// | `1_000`     | 0.1 %   |
+    /// | `10_000`    | 1 %     |
+    /// | `20_000`    | 2 %     |
+    /// | `1_000_000` | 100 % (always true unless expected is zero) |
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::Amount;
+    /// let stated   = Amount::<5>::parse("100.00000").unwrap();
+    /// let computed = Amount::<5>::parse("100.50000").unwrap();
+    /// // 0.5 / 100.0 = 0.5 % = 5_000 ppm — within 10_000 ppm (1 %)
+    /// assert!(stated.within_tolerance_ppm(computed, 10_000).unwrap());
+    /// // 0.5 % exceeds a 4_000 ppm (0.4 %) window
+    /// assert!(!stated.within_tolerance_ppm(computed, 4_000).unwrap());
+    /// // Exact equality
+    /// assert!(stated.within_tolerance_ppm(stated, 0).unwrap());
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `Err` only when `self.checked_sub(expected)` overflows — requires
+    /// values near the extremes of `Amount::MAX` / `Amount::MIN`.
+    pub fn within_tolerance_ppm(self, expected: Self, ppm: u32) -> Result<bool, BillingError> {
+        if expected.is_zero() {
+            return Ok(self.is_zero());
+        }
+        let diff = self.checked_sub(expected)?;
+        // Compare |diff| × 1_000_000 ≤ |expected| × ppm using u128 to:
+        //   • avoid any multiplication overflow (u128 is wide enough for all i64 values)
+        //   • avoid the i64::MIN-abs() panic (unsigned_abs() is infallible for all i64)
+        //   • eliminate Decimal / f64 entirely
+        let lhs = (diff.0.unsigned_abs() as u128) * 1_000_000_u128;
+        let rhs = (expected.0.unsigned_abs() as u128) * (ppm as u128);
+        Ok(lhs <= rhs)
+    }
 }
 
 impl<const P: u8> fmt::Debug for Amount<P> {
@@ -487,14 +556,30 @@ impl<const P: u8> From<Amount<P>> for Decimal {
 
 /// Convert a raw `i64` integer into `Amount<P>` (fallible).
 ///
-/// The integer is treated as a whole-number amount (i.e. scaled by `10^P`).
+/// Treats `n` as a **whole-number monetary amount** and multiplies by `10^P`.
 /// Returns `Err` if `n × 10^P` overflows `i64`.
+///
+/// # ⚠️ Not the inverse of `to_raw()`
+///
+/// [`Amount::to_raw`] returns the *scaled* internal integer.
+/// `TryFrom<i64>` goes the other way — it treats `n` as whole units:
+///
+/// ```rust
+/// use billing::Amount;
+/// let a = Amount::<5>::parse("0.03456").unwrap();
+/// let raw = a.to_raw();                          // 3_456  (scaled)
+/// let wrong = Amount::<5>::try_from(raw);        // = 3456.00000  ← WRONG
+/// let right = Amount::<5>::from_raw_units(raw);  // = 0.03456     ← correct
+/// ```
+///
+/// Use [`Amount::from_raw_units`] to reconstruct from a `to_raw()` value.
 ///
 /// # Example
 /// ```rust
 /// use billing::Amount;
+/// // 49 whole units (e.g. 49 EUR stored as integer in a database)
 /// let a = Amount::<5>::try_from(49i64).unwrap();
-/// assert_eq!(a, Amount::<5>::parse("49.00000").unwrap());
+/// assert_eq!(a, Amount::parse("49.00000").unwrap());
 /// ```
 impl<const P: u8> TryFrom<i64> for Amount<P> {
     type Error = crate::error::ParseAmountError;

@@ -40,7 +40,7 @@ rounding — and leaves every domain decision to your crate.
 ```toml
 # Cargo.toml
 [dependencies]
-billing             = "0.1"
+billing             = "0.3"
 rust_decimal_macros = "1"   # dec!() macro for constants
 ```
 

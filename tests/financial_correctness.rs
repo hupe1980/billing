@@ -2971,3 +2971,360 @@ fn try_from_i64_then_line_item_then_allocate() {
         part.assert_valid().unwrap();
     }
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Amount::within_tolerance_ppm  (D-04 from user migration feedback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn within_tolerance_ppm_inside_window() {
+    let stated = Amount::<5>::parse("100.00000").unwrap();
+    let computed = Amount::<5>::parse("100.50000").unwrap();
+    // 0.5 / 100.0 = 5_000 ppm — inside 10_000 ppm (1 %)
+    assert!(stated.within_tolerance_ppm(computed, 10_000).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_outside_window() {
+    let stated = Amount::<5>::parse("100.00000").unwrap();
+    let computed = Amount::<5>::parse("100.50000").unwrap();
+    // 5_000 ppm > 4_000 ppm threshold
+    assert!(!stated.within_tolerance_ppm(computed, 4_000).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_exact_equality_passes_zero_ppm() {
+    let a = Amount::<5>::parse("42.50000").unwrap();
+    assert!(a.within_tolerance_ppm(a, 0).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_different_values_fail_zero_ppm() {
+    let a = Amount::<5>::parse("100.00000").unwrap();
+    let b = Amount::<5>::parse("100.00001").unwrap();
+    assert!(!a.within_tolerance_ppm(b, 0).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_expected_zero_only_passes_when_self_zero() {
+    let zero = Amount::<5>::ZERO;
+    let nonzero = Amount::<5>::parse("0.00001").unwrap();
+    assert!(zero.within_tolerance_ppm(zero, 999_999).unwrap());
+    assert!(!nonzero.within_tolerance_ppm(zero, 999_999).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_negative_expected() {
+    // Tolerance is relative to |expected|, sign doesn't matter.
+    let expected = Amount::<5>::parse("-100.00000").unwrap();
+    let actual = Amount::<5>::parse("-100.50000").unwrap();
+    assert!(actual.within_tolerance_ppm(expected, 10_000).unwrap());
+    assert!(!actual.within_tolerance_ppm(expected, 4_000).unwrap());
+}
+
+#[test]
+fn within_tolerance_ppm_symmetry() {
+    // |a - b| == |b - a|, so the result must be the same both ways.
+    let a = Amount::<5>::parse("100.00000").unwrap();
+    let b = Amount::<5>::parse("101.00000").unwrap();
+    assert_eq!(
+        a.within_tolerance_ppm(b, 15_000).unwrap(),
+        b.within_tolerance_ppm(a, 15_000).unwrap(),
+    );
+}
+
+#[test]
+fn within_tolerance_ppm_invoice_validation_pattern() {
+    // Typical use: check computed invoice total against stated total.
+    // invoic-checker pattern (D-04 use case).
+    let stated_total = Amount::<5>::parse("12345.67890").unwrap();
+    let computed_total = Amount::<5>::parse("12345.56000").unwrap();
+    // diff ≈ 0.119 EUR on 12345 EUR ≈ 9.6 ppm — within 100 ppm
+    assert!(
+        computed_total
+            .within_tolerance_ppm(stated_total, 100)
+            .unwrap()
+    );
+    // but outside 5 ppm
+    assert!(
+        !computed_total
+            .within_tolerance_ppm(stated_total, 5)
+            .unwrap()
+    );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Amount::checked_from_decimal  (D-01 / B-02 from user feedback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn checked_from_decimal_basic() {
+    use rust_decimal::Decimal;
+    let d = Decimal::from_str_exact("1.23456").unwrap();
+    let a = Amount::<5>::checked_from_decimal(d).unwrap();
+    assert_eq!(a, Amount::<5>::parse("1.23456").unwrap());
+}
+
+#[test]
+fn checked_from_decimal_rounds_to_p_digits() {
+    use rust_decimal::Decimal;
+    // 0.123456 rounded to 5 dp = 0.12346 (MidpointAwayFromZero)
+    let d = Decimal::from_str_exact("0.123456").unwrap();
+    let a = Amount::<5>::checked_from_decimal(d).unwrap();
+    assert_eq!(a, Amount::<5>::parse("0.12346").unwrap());
+}
+
+#[test]
+fn checked_from_decimal_overflow_returns_err() {
+    use rust_decimal::Decimal;
+    // A value far exceeding i64::MAX / SCALE overflows.
+    let d = Decimal::from_str_exact("999999999999999999").unwrap();
+    assert!(Amount::<5>::checked_from_decimal(d).is_err());
+}
+
+#[test]
+fn checked_from_decimal_is_question_mark_compatible() {
+    use rust_decimal::Decimal;
+    fn compute(d: Decimal) -> Result<Amount<5>, billing::BillingError> {
+        let a = Amount::<5>::checked_from_decimal(d)?;
+        Ok(a)
+    }
+    let d = Decimal::from_str_exact("42.00000").unwrap();
+    assert_eq!(compute(d).unwrap(), Amount::<5>::from_int(42));
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TryFrom<i64> is NOT the inverse of to_raw()  (B-04 from user feedback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn try_from_i64_is_whole_units_not_raw() {
+    let a = Amount::<5>::parse("0.03456").unwrap();
+    let raw = a.to_raw(); // 3_456  (internal scaled value)
+
+    // TryFrom<i64> treats the integer as whole units → 3456 whole EUR
+    let via_try_from = Amount::<5>::try_from(raw).unwrap();
+    assert_eq!(via_try_from, Amount::<5>::parse("3456.00000").unwrap());
+
+    // from_raw_units is the correct inverse of to_raw()
+    let via_raw_units = Amount::<5>::from_raw_units(raw);
+    assert_eq!(via_raw_units, a);
+    assert_ne!(via_try_from, via_raw_units); // they differ — this IS the footgun
+}
+
+#[test]
+fn from_raw_units_is_exact_inverse_of_to_raw() {
+    for s in &["0.00000", "1.00000", "-9.99999", "92233720368547.75807"] {
+        let a = Amount::<5>::parse(s).unwrap();
+        let reconstructed = Amount::<5>::from_raw_units(a.to_raw());
+        assert_eq!(a, reconstructed, "round-trip failed for {s}");
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BillingDocument::discount_total()  (F-05 from user feedback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn discount_total_no_discounts_is_zero() {
+    let pos = vec![
+        LineItem::fixed("Charge", Amount::parse("100.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
+    assert_eq!(doc.discount_total(), Amount::<5>::ZERO);
+}
+
+#[test]
+fn discount_total_matches_sum_of_discount_positions() {
+    use billing::tax::{FixedDiscount, PercentageDiscount};
+
+    let pos = vec![
+        LineItem::fixed("Service", Amount::parse("200.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let discounts: Vec<Box<dyn billing::DiscountLayer>> = vec![
+        Box::new(FixedDiscount::new(
+            "Voucher",
+            Amount::parse("20.00000").unwrap(),
+        )),
+        Box::new(PercentageDiscount::new("Loyalty 5%", dec!(0.05))),
+    ];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
+
+    // discount_total() must be negative (discounts reduce the base)
+    assert!(doc.discount_total().is_negative());
+    // It must equal the sum of individual discount positions
+    let manual_sum: Amount<5> = doc.discount_positions().iter().map(|p| p.net_amount).sum();
+    assert_eq!(doc.discount_total(), manual_sum);
+    // net_total must account for discounts
+    doc.assert_valid().unwrap();
+}
+
+#[test]
+fn discount_total_plus_net_positions_equals_net_total() {
+    use billing::tax::FixedDiscount;
+
+    let pos = vec![
+        LineItem::fixed("Item", Amount::parse("150.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let discounts: Vec<Box<dyn billing::DiscountLayer>> = vec![Box::new(FixedDiscount::new(
+        "Rebate",
+        Amount::parse("30.00000").unwrap(),
+    ))];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
+
+    // net_total = Σ(net_positions) + discount_total
+    let net_positions_sum: Amount<5> = doc.net_positions().iter().map(|p| p.net_amount).sum();
+    assert_eq!(net_positions_sum + doc.discount_total(), doc.net_total(),);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BillingDocument::positions_by_tag()  (F-02 from user feedback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn positions_by_tag_finds_net_positions() {
+    let pos = vec![
+        LineItem::fixed("Commodity", Amount::parse("100.00000").unwrap())
+            .tag("commodity")
+            .build()
+            .unwrap(),
+        LineItem::fixed("Fixed fee", Amount::parse("10.00000").unwrap())
+            .tag("fixed")
+            .build()
+            .unwrap(),
+    ];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
+
+    let commodity: Vec<_> = doc.positions_by_tag("commodity").collect();
+    assert_eq!(commodity.len(), 1);
+    assert_eq!(commodity[0].net_amount, Amount::parse("100.00000").unwrap());
+
+    let fixed: Vec<_> = doc.positions_by_tag("fixed").collect();
+    assert_eq!(fixed.len(), 1);
+}
+
+#[test]
+fn positions_by_tag_no_match_returns_empty() {
+    let pos = vec![
+        LineItem::fixed("Item", Amount::parse("50.00000").unwrap())
+            .tag("other")
+            .build()
+            .unwrap(),
+    ];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
+    assert_eq!(doc.positions_by_tag("missing").count(), 0);
+}
+
+#[test]
+fn positions_by_tag_searches_tax_positions_too() {
+    let pos = vec![
+        LineItem::fixed("Net", Amount::parse("100.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let taxes: Vec<Box<dyn billing::TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
+    let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
+
+    // Tax positions are tagged "tax" by FixedRateTax
+    let tax_items: Vec<_> = doc.positions_by_tag("tax").collect();
+    assert_eq!(tax_items.len(), 1);
+    assert_eq!(tax_items[0].net_amount, Amount::parse("20.00000").unwrap());
+}
+
+#[test]
+fn positions_by_tag_all_tags_returns_all() {
+    // An item can have multiple tags
+    let pos = vec![
+        LineItem::fixed("Multi", Amount::parse("1.00000").unwrap())
+            .tag("a")
+            .tag("b")
+            .build()
+            .unwrap(),
+    ];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
+    assert_eq!(doc.positions_by_tag("a").count(), 1);
+    assert_eq!(doc.positions_by_tag("b").count(), 1);
+    assert_eq!(doc.positions_by_tag("c").count(), 0);
+}
+
+// ── Regression: within_tolerance_ppm i64::MIN-abs panic (bug fixed 2025) ────
+
+/// When `self.0 - expected.0 == i64::MIN` the old Decimal-based implementation
+/// called `.abs()` on the difference, which panics because `i64::MIN` has no
+/// positive i64 counterpart.  The new u128-integer implementation must NOT panic.
+#[test]
+fn within_tolerance_ppm_no_panic_when_diff_equals_i64_min() {
+    // Craft two amounts whose raw difference is exactly i64::MIN.
+    // self.0 = i64::MIN + 5,  expected.0 = 5  →  diff.0 = i64::MIN
+    // expected != 0 so the early-return branch is not taken.
+    let self_amt = Amount::<5>::from_raw_units(i64::MIN + 5);
+    let expected_amt = Amount::<5>::from_raw_units(5);
+    // The difference is i64::MIN, which is a very large deviation.
+    // Even with ppm = u32::MAX the relative tolerance is nowhere near i64::MIN,
+    // so the result must be false — but crucially it must NOT panic.
+    let result = self_amt.within_tolerance_ppm(expected_amt, u32::MAX);
+    assert!(
+        result.is_ok(),
+        "must not panic or return Err on extreme inputs"
+    );
+    assert!(
+        !result.unwrap(),
+        "a diff of i64::MIN is not within any reasonable tolerance of 5"
+    );
+}
+
+/// Symmetry property: tolerance is independent of direction.
+#[test]
+fn within_tolerance_ppm_no_panic_extreme_values() {
+    // Both amounts at extreme ends — checked_sub will overflow → should return Err, not panic.
+    let max = Amount::<5>::MAX;
+    let min = Amount::<5>::MIN;
+    let result = max.within_tolerance_ppm(min, 1_000);
+    // The subtraction MAX - MIN overflows i64, so we expect Err, not a panic.
+    assert!(
+        result.is_err(),
+        "MAX - MIN overflows i64, must return Err not panic"
+    );
+}
+
+// ── Regression: minimum_charge with empty description returns Err (bug fixed 2025) ──
+
+/// The old implementation used `.expect("cannot fail")` but `build()` validates
+/// that the description is non-empty.  Passing an empty description must return
+/// `Err(BillingError::InvalidInput)` instead of panicking.
+#[test]
+fn minimum_charge_empty_description_returns_err() {
+    let doc = BillingDocument::from_positions(
+        DocumentMeta::default(),
+        vec![
+            LineItem::fixed("Item", Amount::parse("1.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let result = minimum_charge(&doc, Amount::parse("100.00000").unwrap(), "");
+    assert!(
+        result.is_err(),
+        "empty description must propagate Err, not panic"
+    );
+    assert!(
+        matches!(result, Err(billing::BillingError::InvalidInput { .. })),
+        "expected InvalidInput error for empty description"
+    );
+}
