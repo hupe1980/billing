@@ -298,12 +298,21 @@ impl<const P: u8> Amount<P> {
         self.0
     }
 
-    /// Construct from a raw scaled `i64` without validation.
+    /// Construct from a raw scaled `i64` — the value is `n × 10⁻ᴾ`.
     ///
-    /// This is intended for internal library use, tests, and serialisation
-    /// round-trips where the scale is known to be correct.
-    #[allow(dead_code)]
-    pub(crate) fn from_raw(n: i64) -> Self {
+    /// Use when you already have an internal representation (e.g. deserialising
+    /// a previously stored [`to_raw`](Amount::to_raw) value, or constructing
+    /// test fixtures that need exact raw values).
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::Amount;
+    /// // 3_456 raw units = 0.03456 EUR at P=5
+    /// let price = Amount::<5>::from_raw_units(3_456);
+    /// assert_eq!(price, Amount::parse("0.03456").unwrap());
+    /// ```
+    #[must_use]
+    pub fn from_raw_units(n: i64) -> Self {
         Self(n)
     }
 
@@ -575,7 +584,7 @@ mod tests {
     #[test]
     fn checked_overflow() {
         let max = Amount::<5>(i64::MAX);
-        assert!(max.checked_add(Amount::<5>::from_raw(1)).is_err());
+        assert!(max.checked_add(Amount::<5>::from_raw_units(1)).is_err());
     }
 
     #[test]
