@@ -1,0 +1,31 @@
+[package]
+name        = "billing"
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.85"
+authors     = ["hupe1980"]
+description = """\
+Generic tariff billing engine. Metered usage, tiered / volume / block / capacity \
+pricing, time-of-use bands, composable tax and discount layers, multi-recipient \
+allocation, and self-validating billing documents. \
+Zero I/O. No async. No domain assumptions.\
+"""
+keywords    = ["billing", "invoice", "tariff", "pricing", "metering"]
+categories  = ["finance", "mathematics", "data-structures"]
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/hupe1980/billing"
+readme      = "README.md"
+
+[features]
+default = []
+## Enable serde Serialize / Deserialize on all public types.
+serde = ["dep:serde", "rust_decimal/serde-with-str"]
+
+[dependencies]
+rust_decimal        = "1"
+rust_decimal_macros = "1"
+thiserror           = "2"
+serde               = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
