@@ -110,6 +110,7 @@ fn main() {
         invoice_number: "SaaS-2026-07-001".into(),
         period_label: "July 2026".into(),
         notes: Some("Includes 350k API overage calls".into()),
+        ..Default::default()
     };
 
     let doc = BillingDocument::builder()
@@ -129,7 +130,7 @@ fn main() {
     println!("  {:50} {:>12}", "TAX TOTAL", doc.tax_total());
     println!("  {:50} {:>12}", "GROSS TOTAL", doc.gross_total());
 
-    doc.assert_valid().unwrap();
+    doc.assert_valid();
     println!();
     println!("✓ Document validation passed");
 }

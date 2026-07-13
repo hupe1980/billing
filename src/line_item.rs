@@ -6,15 +6,54 @@ use crate::amount::Amount;
 use crate::error::BillingError;
 use crate::quantity::{Quantity, UnitPrice};
 
-// ── LineItem ──────────────────────────────────────────────────────────────────
+// ── Period ───────────────────────────────────────────────────────────────────
+
+/// An inclusive billing period: a start/end date pair stored as ISO 8601 strings.
+///
+/// The library is date-type-agnostic: dates are `String` values and are **not parsed
+/// or validated** by the engine. Store `"YYYY-MM-DD"` dates for maximum interoperability
+/// with BO4E, EDIFACT, UBL, and German energy market standards (UStG §14, MessZV §22).
+///
+/// # Example
+/// ```rust
+/// use billing::Period;
+/// let p = Period::new("2026-06-01", "2026-06-30");
+/// assert_eq!(p.from, "2026-06-01");
+/// assert_eq!(p.to,   "2026-06-30");
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Period {
+    /// Start of the period (inclusive), e.g. `"2026-06-01"`.
+    pub from: String,
+    /// End of the period (inclusive), e.g. `"2026-06-30"`.
+    pub to: String,
+}
+
+impl Period {
+    /// Create a period from any `Into<String>` date strings.
+    #[must_use]
+    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+}
 
 /// The atomic billing unit: a single charge or credit position.
 ///
 /// Every `LineItem` has a `net_amount`: positive = debit (charge), negative = credit.
 ///
 /// Tags allow selective tax/discount application without brittle string matching.
+///
+/// The `sign` field records the **original intent** of the position — `Sign::Debit` for
+/// charges (including debits at a negative unit price, e.g. EPEX negative-price hours),
+/// `Sign::Credit` for credits and refunds.  Tax/discount layers should use `sign` to
+/// distinguish consumption from return positions rather than testing `net_amount < 0`,
+/// which is ambiguous after the introduction of negative unit prices.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     /// Human-readable description shown on the invoice.
     pub description: String,
@@ -24,6 +63,15 @@ pub struct LineItem {
     pub unit_price: Option<UnitPrice>,
     /// Pre-computed net amount; positive = charge, negative = credit.
     pub net_amount: Amount<5>,
+    /// Original sign intent: `Debit` = charge (even if `net_amount` is negative due to
+    /// a negative unit price); `Credit` = refund / discount.
+    pub sign: Sign,
+    /// Sub-period this position covers, if different from the document period.
+    ///
+    /// Set when a single invoice contains positions spanning different time windows
+    /// (e.g. a tariff change mid-month: one position for days 1–14, another for 15–30).
+    /// Stored as ISO 8601 date strings (`"2026-06-01"`) — not parsed by the engine.
+    pub period: Option<Period>,
     /// Arbitrary labels for selective tax/discount filtering and ERP categorization.
     pub tags: Vec<String>,
     /// Arbitrary key-value metadata for ERP export.
@@ -61,10 +109,92 @@ impl LineItem {
         LineItemBuilder::new(description.into(), Sign::Debit).fixed_amount(amount)
     }
 
+    /// Create a fixed-amount credit position (negative net amount).
+    ///
+    /// Symmetric counterpart to [`LineItem::fixed`]. The `amount` is stored as-is;
+    /// if it is positive it is flipped to negative during `build()`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount};
+    /// let item = LineItem::credit_fixed("§25 EEG-Sanktion", Amount::<5>::parse("0.00000").unwrap())
+    ///     .tag("sanction")
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(item.net_amount.is_zero());
+    /// ```
+    #[must_use]
+    pub fn credit_fixed(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
+        LineItemBuilder::new(description.into(), Sign::Credit).fixed_amount(amount)
+    }
+
+    /// Convenience constructor for the most common pattern: `quantity × unit_price`.
+    ///
+    /// A negative `unit_price` produces a negative `net_amount` automatically
+    /// (no need to switch to `Sign::Credit`). This is correct for real-time
+    /// spot markets where negative prices are legally binding (e.g. EPEX negative hours).
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount};
+    /// use rust_decimal_macros::dec;
+    ///
+    /// // Normal positive EPEX price
+    /// let pos = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.289), "EUR/kWh")
+    ///     .build().unwrap();
+    /// assert_eq!(pos.net_amount, Amount::<5>::parse("289.00000").unwrap());
+    ///
+    /// // Negative EPEX spot price (§27 EEG 2023 — post-EEG plant)
+    /// let neg = LineItem::for_usage("EPEX Spot (negativ)", dec!(1000), "kWh", dec!(-0.005), "EUR/kWh")
+    ///     .build().unwrap();
+    /// assert_eq!(neg.net_amount, Amount::<5>::parse("-5.00000").unwrap());
+    /// ```
+    #[must_use]
+    pub fn for_usage(
+        description: impl Into<String>,
+        quantity: rust_decimal::Decimal,
+        quantity_unit: impl Into<String>,
+        unit_price: rust_decimal::Decimal,
+        price_unit: impl Into<String>,
+    ) -> LineItemBuilder {
+        use crate::quantity::{Quantity, UnitPrice};
+        LineItemBuilder::new(description.into(), Sign::Debit)
+            .quantity(Quantity::new(quantity, quantity_unit))
+            .unit_price(UnitPrice::new(unit_price, price_unit))
+    }
+
     /// Returns `true` if this position has the given tag.
     #[must_use]
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)
+    }
+
+    /// Returns `true` if this position was built with [`Sign::Debit`].
+    ///
+    /// Note: a debit position may have a **negative** `net_amount` when the
+    /// `unit_price` was negative (e.g. EPEX negative-price hours).  Use this
+    /// method rather than `net_amount > 0` to identify consumption positions.
+    #[must_use]
+    pub fn is_debit(&self) -> bool {
+        self.sign == Sign::Debit
+    }
+
+    /// Returns `true` if this position was built with [`Sign::Credit`].
+    ///
+    /// Credit positions are refunds, discounts, and return-feed-in credits.
+    /// Their `net_amount` is always ≤ 0 by construction.
+    #[must_use]
+    pub fn is_credit(&self) -> bool {
+        self.sign == Sign::Credit
+    }
+
+    /// Look up a metadata value by key.
+    ///
+    /// Returns `Some(&str)` if the key exists, `None` otherwise.
+    /// Equivalent to `item.metadata.get(key).map(String::as_str)` but more ergonomic.
+    #[must_use]
+    pub fn get_meta(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     /// Returns the quantity value if present.
@@ -82,7 +212,8 @@ impl LineItem {
 
 // ── Sign ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Sign of a [`LineItem`]: debit (charge) or credit (discount / refund).
 pub enum Sign {
     /// A positive charge added to the invoice total.
@@ -101,6 +232,7 @@ pub struct LineItemBuilder {
     quantity: Option<Quantity>,
     unit_price: Option<UnitPrice>,
     fixed_amount: Option<Amount<5>>,
+    period: Option<Period>,
     tags: Vec<String>,
     metadata: HashMap<String, String>,
 }
@@ -113,6 +245,7 @@ impl LineItemBuilder {
             quantity: None,
             unit_price: None,
             fixed_amount: None,
+            period: None,
             tags: vec![],
             metadata: HashMap::new(),
         }
@@ -153,17 +286,40 @@ impl LineItemBuilder {
         self
     }
 
+    /// Set the sub-period this position covers.
+    ///
+    /// Use when a single invoice contains positions spanning different time windows
+    /// (e.g. a tariff change mid-month). Dates should be ISO 8601 strings (`"2026-06-01"`).
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount};
+    /// let item = LineItem::fixed("Grundpreis (1.–14. Juni)", Amount::<5>::parse("14.00000").unwrap())
+    ///     .period("2026-06-01", "2026-06-14")
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(item.period.as_ref().unwrap().from, "2026-06-01");
+    /// assert_eq!(item.period.as_ref().unwrap().to,   "2026-06-14");
+    /// ```
+    #[must_use]
+    pub fn period(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.period = Some(Period::new(from, to));
+        self
+    }
+
     /// Build the `LineItem`.
     ///
     /// Net amount is:
     /// 1. `fixed_amount` if set (ignores quantity/unit_price)
-    /// 2. `quantity.value × unit_price.value` rounded to 5dp
+    /// 2. `quantity.value × unit_price.value` rounded to 5dp — **both signs allowed**
     /// 3. `Err` if neither is provided
     ///
+    /// Negative `unit_price` is valid and produces a negative `net_amount` (e.g.
+    /// EPEX negative-price hours under §27 EEG 2023).
+    ///
     /// # Errors
-    /// Returns `Err` if description is empty, quantity is negative, unit price
-    /// is negative (on the qty×price path), or neither `fixed_amount` nor
-    /// `quantity + unit_price` is provided.
+    /// Returns `Err` if description is empty, quantity is negative, or neither
+    /// `fixed_amount` nor `quantity + unit_price` is provided.
     pub fn build(self) -> Result<LineItem, BillingError> {
         // A line item without a description is not auditable.
         if self.description.trim().is_empty() {
@@ -182,14 +338,8 @@ impl LineItemBuilder {
                     reason: "LineItem quantity must be non-negative",
                 });
             }
-            // Unit price must be non-negative on the qty×price path.
-            // To model a credit, use Sign::Credit (LineItem::credit) with
-            // a positive price, or use fixed_amount directly.
-            if price.value < rust_decimal::Decimal::ZERO {
-                return Err(BillingError::InvalidInput {
-                    reason: "LineItem unit price must be non-negative; use LineItem::credit() for credits",
-                });
-            }
+            // Negative unit_price is allowed — it produces a negative net amount.
+            // This is correct for spot-market negative prices (e.g. EPEX §27 EEG 2023).
             let raw = qty.value * price.value;
             let rounded =
                 raw.round_dp_with_strategy(5, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
@@ -212,6 +362,8 @@ impl LineItemBuilder {
             quantity: self.quantity,
             unit_price: self.unit_price,
             net_amount: net,
+            sign: self.sign,
+            period: self.period,
             tags: self.tags,
             metadata: self.metadata,
         })

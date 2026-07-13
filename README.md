@@ -40,7 +40,7 @@ rounding — and leaves every domain decision to your crate.
 ```toml
 # Cargo.toml
 [dependencies]
-billing             = "0.3"
+billing             = "0.4"
 rust_decimal_macros = "1"   # dec!() macro for constants
 ```
 
@@ -74,7 +74,7 @@ println!("Net:   {}", doc.net_total());    // 47.10000
 println!("VAT:   {}", doc.tax_total());    // 4.71000
 println!("Gross: {}", doc.gross_total());  // 51.81000
 
-doc.assert_valid()?;  // panics if any of the 3 arithmetic invariants fail
+doc.assert_valid();   // panics if any of the 3 arithmetic invariants fail
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -421,7 +421,7 @@ let equal_docs = EqualAllocation::new(3).allocate(&doc)?;
 // Penny correction guarantees:
 let sum: billing::Amount<5> = tenant_docs.iter().map(|d| d.net_total()).sum();
 assert_eq!(sum, doc.net_total());           // ✓ exact, no drift
-for d in &tenant_docs { d.assert_valid().unwrap(); }  // ✓ each doc is consistent
+for d in &tenant_docs { d.assert_valid(); }  // ✓ each doc is consistent
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -454,7 +454,7 @@ let doc = BillingDocument::from_positions(
     discount_layers,
 )?;
 
-doc.assert_valid()?;                     // all three checks
+doc.assert_valid();                      // all three checks
 println!("Net:   {}", doc.net_total());
 println!("Tax:   {}", doc.tax_total());
 println!("Gross: {}", doc.gross_total());
@@ -512,7 +512,7 @@ just test-msrv       # verify Rust 1.85 compatibility
 just lint            # cargo clippy -D warnings
 just doc             # build & open docs
 just examples        # run all three examples
-just release 0.2.0   # create an annotated git tag
+just release 0.4.0   # create an annotated git tag
 ```
 
 All available tasks: `just --list`
@@ -547,6 +547,7 @@ src/
 ├── allocation.rs   — AllocationRule, ProportionalAllocation, EqualAllocation
 ├── period.rs       — merge_period_documents(), prorate(), prorate_amount()
 ├── minimum.rs      — minimum_charge()
+├── lookup.rs       — RateLookup, RateLookupBuilder
 ├── tariff.rs       — Tariff trait
 └── error.rs        — BillingError, ParseAmountError
 ```

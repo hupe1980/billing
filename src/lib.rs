@@ -39,7 +39,7 @@
 //! let doc = BillingDocument::from_positions(
 //!     DocumentMeta::default(), items, vec![], vec![],
 //! ).unwrap();
-//! doc.assert_valid().unwrap();
+//! doc.assert_valid();
 //! ```
 //!
 //! ## Design invariants
@@ -49,8 +49,8 @@
 //! - **Overflow panics** — `+`, `-` and `mul_qty` panic on overflow; use
 //!   [`Amount::checked_add`] / [`Amount::checked_sub`] for fallible arithmetic.
 //! - **Rounding is always explicit** — [`RoundingStrategy`] is a required parameter.
-//! - **Self-validating documents** — [`BillingDocument::assert_valid`] checks
-//!   `Σ(positions) == net_total` within one unit of the last decimal place.
+//! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
+//!   [`BillingDocument::assert_valid`] panics on failure (convenient for tests).
 //! - **Allocation is exact** — [`ProportionalAllocation`] guarantees
 //!   `Σ(recipient totals) == original total` with per-document penny correction.
 
@@ -65,6 +65,7 @@ pub mod amount;
 pub mod document;
 pub mod error;
 pub mod line_item;
+pub mod lookup;
 pub mod minimum;
 pub mod period;
 pub mod quantity;
@@ -81,7 +82,8 @@ pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation};
 pub use amount::{Amount, EuroAmount, InvoiceAmt, RoundingStrategy};
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
-pub use line_item::{LineItem, LineItemBuilder, Sign};
+pub use line_item::{LineItem, LineItemBuilder, Period, Sign};
+pub use lookup::{RateLookup, RateLookupBuilder};
 pub use minimum::minimum_charge;
 pub use period::{merge_period_documents, prorate, prorate_amount};
 pub use quantity::{Quantity, UnitPrice};
@@ -99,10 +101,10 @@ pub mod prelude {
         AllocationRule, Amount, BillingDocument, BillingDocumentBuilder, BillingError,
         CountAggregator, DiscountLayer, DocumentMeta, DynamicPricing, EqualAllocation, EuroAmount,
         FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineItem, MaxAggregator,
-        ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount,
-        ProportionalAllocation, Quantity, RoundingStrategy, Sign, SumAggregator, Tariff,
-        TariffBand, TariffSchedule, TaxLayer, TimeOfUsePricing, TouBand, UniqueCountAggregator,
-        UnitPrice, UsageAggregator, WeightedSumAggregator, merge_period_documents, minimum_charge,
-        prorate, prorate_amount,
+        ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount, Period,
+        ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder, RoundingStrategy, Sign,
+        SumAggregator, Tariff, TariffBand, TariffSchedule, TaxLayer, TimeOfUsePricing, TouBand,
+        UniqueCountAggregator, UnitPrice, UsageAggregator, WeightedSumAggregator,
+        merge_period_documents, minimum_charge, prorate, prorate_amount,
     };
 }

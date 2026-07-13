@@ -160,7 +160,7 @@ impl DynamicPricing {
         let mut total_net = Amount::<5>::ZERO;
         for (qty, price) in &self.intervals {
             total_qty += qty;
-            total_net = total_net.checked_add(price.mul_qty(*qty))?;
+            total_net = total_net.checked_add(price.checked_mul_qty(*qty)?)?;
         }
         let avg_price = if total_qty.is_zero() {
             Decimal::ZERO

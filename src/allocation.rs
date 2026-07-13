@@ -31,11 +31,12 @@ fn scale_with_target(
     let mut items: Vec<LineItem> = positions
         .iter()
         .map(|p| {
+            let scaled = p.net_amount.checked_mul_qty(share)?;
             let mut item = p.clone();
-            item.net_amount = p.net_amount.mul_qty(share);
-            item
+            item.net_amount = scaled;
+            Ok(item)
         })
-        .collect();
+        .collect::<Result<Vec<_>, BillingError>>()?;
     let sum = Amount::checked_sum(items.iter().map(|p| p.net_amount))?;
     if sum != target {
         let correction = target.checked_sub(sum)?;
@@ -60,19 +61,21 @@ fn scale_combined_net(
     let mut scaled_net: Vec<LineItem> = net_positions
         .iter()
         .map(|p| {
+            let scaled = p.net_amount.checked_mul_qty(share)?;
             let mut item = p.clone();
-            item.net_amount = p.net_amount.mul_qty(share);
-            item
+            item.net_amount = scaled;
+            Ok(item)
         })
-        .collect();
+        .collect::<Result<Vec<_>, BillingError>>()?;
     let mut scaled_disc: Vec<LineItem> = discount_positions
         .iter()
         .map(|p| {
+            let scaled = p.net_amount.checked_mul_qty(share)?;
             let mut item = p.clone();
-            item.net_amount = p.net_amount.mul_qty(share);
-            item
+            item.net_amount = scaled;
+            Ok(item)
         })
-        .collect();
+        .collect::<Result<Vec<_>, BillingError>>()?;
 
     // Penny correction: ensure Σ(net) + Σ(discounts) == target_net_total.
     let combined_sum =
@@ -146,9 +149,9 @@ impl AllocationRule for ProportionalAllocation {
             let (net_total, tax_total, gross_total) = if is_last {
                 (net_remaining, tax_remaining, gross_remaining)
             } else {
-                let net = doc.net_total().mul_qty(*share);
-                let tax = doc.tax_total().mul_qty(*share);
-                let gross = doc.gross_total().mul_qty(*share);
+                let net = doc.net_total().checked_mul_qty(*share)?;
+                let tax = doc.tax_total().checked_mul_qty(*share)?;
+                let gross = doc.gross_total().checked_mul_qty(*share)?;
                 net_remaining = net_remaining.checked_sub(net)?;
                 tax_remaining = tax_remaining.checked_sub(tax)?;
                 gross_remaining = gross_remaining.checked_sub(gross)?;
@@ -169,6 +172,11 @@ impl AllocationRule for ProportionalAllocation {
                 DocumentMeta {
                     invoice_number: format!("{}/{}", doc.meta.invoice_number, i + 1),
                     period_label: doc.meta.period_label.clone(),
+                    period: doc.meta.period.clone(),
+                    issue_date: doc.meta.issue_date.clone(),
+                    due_date: doc.meta.due_date.clone(),
+                    issuer_id: doc.meta.issuer_id.clone(),
+                    recipient_id: doc.meta.recipient_id.clone(),
                     notes: doc.meta.notes.clone(),
                 },
                 net_positions,
@@ -278,9 +286,8 @@ mod tests {
     fn each_doc_passes_assert_valid() {
         let doc = multi_doc();
         let alloc = ProportionalAllocation::new(vec![dec!(0.40), dec!(0.35), dec!(0.25)]).unwrap();
-        for (i, d) in alloc.allocate(&doc).unwrap().iter().enumerate() {
-            d.assert_valid()
-                .unwrap_or_else(|e| panic!("recipient {i}: {e}"));
+        for d in alloc.allocate(&doc).unwrap().iter() {
+            d.assert_valid();
         }
     }
 
@@ -300,7 +307,7 @@ mod tests {
         let total: Amount<5> = docs.iter().map(|d| d.net_total()).sum();
         assert_eq!(total, doc.net_total(), "exact sum must hold");
         for d in &docs {
-            d.assert_valid().unwrap();
+            d.assert_valid();
         }
     }
 
@@ -332,7 +339,7 @@ mod tests {
         let gross_sum: Amount<5> = docs.iter().map(|d| d.gross_total()).sum();
         assert_eq!(gross_sum, doc.gross_total(), "gross_total must not drift");
         for d in &docs {
-            d.assert_valid().unwrap();
+            d.assert_valid();
         }
     }
 }

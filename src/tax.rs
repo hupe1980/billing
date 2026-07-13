@@ -142,13 +142,15 @@ impl TaxLayer for PerUnitLevy {
     }
 
     fn compute(&self, positions: &[LineItem]) -> Result<LineItem, BillingError> {
-        // Sum physical quantities from non-credit positions only.
-        // Credit positions (returns/feed-in) are excluded because most per-unit
-        // levies (excise duties, environmental fees) apply to consumption, not
-        // to credits against consumption.
+        // Sum physical quantities from Sign::Debit positions only.
+        // Credit positions (returns/feed-in) are excluded because per-unit levies
+        // (excise duties, environmental fees) apply to consumption, not to credits.
+        // Using `p.sign` rather than `p.net_amount.is_negative()` correctly handles
+        // Sign::Debit positions that have a negative net_amount due to a negative
+        // unit_price (e.g. EPEX negative-price hours under §27 EEG 2023).
         let total_units: Decimal = positions
             .iter()
-            .filter(|p| !p.net_amount.is_negative())
+            .filter(|p| p.is_debit())
             .filter(|p| p.unit_label() == Some(&self.unit))
             .filter(|p| self.require_tag.as_deref().is_none_or(|t| p.has_tag(t)))
             .filter_map(|p| p.quantity_value())
@@ -247,7 +249,7 @@ impl TaxLayer for PercentageCharge {
             positions
                 .iter()
                 .filter(|p| self.apply_to_tag.as_deref().is_none_or(|t| p.has_tag(t)))
-                .filter(|p| !p.net_amount.is_negative()) // charges only; exclude credits
+                .filter(|p| p.is_debit()) // charges only; exclude Sign::Credit positions
                 .map(|p| p.net_amount),
         )?;
         let mut charge = base.checked_mul_qty(self.rate)?;
@@ -332,7 +334,7 @@ impl DiscountLayer for PercentageDiscount {
             positions
                 .iter()
                 .filter(|p| self.apply_to_tag.as_deref().is_none_or(|t| p.has_tag(t)))
-                .filter(|p| !p.net_amount.is_negative())
+                .filter(|p| p.is_debit()) // discount base is debit positions only
                 .map(|p| p.net_amount),
         )?;
         let discount = base.checked_mul_qty(self.rate)?;

@@ -2,7 +2,7 @@
 use rust_decimal::Decimal;
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A measured quantity: a numeric value paired with a unit label.
 pub struct Quantity {
     /// The numeric value.
@@ -23,7 +23,7 @@ impl Quantity {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A unit price: a [`Decimal`] value paired with a unit label.
 ///
 /// Stored as [`rust_decimal::Decimal`] (not [`crate::Amount`]) because unit

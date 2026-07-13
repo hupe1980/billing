@@ -34,7 +34,7 @@ fn main() {
     let meta = DocumentMeta {
         invoice_number: "WATER-2026-07-001".into(),
         period_label: "July 2026".into(),
-        notes: None,
+        ..Default::default()
     };
 
     let mut doc = BillingDocument::from_positions(meta, items, vec![], vec![]).unwrap();
@@ -53,7 +53,7 @@ fn main() {
     println!();
     println!("  {:40} {:>12}", "TOTAL", doc.net_total());
 
-    doc.assert_valid().unwrap();
+    doc.assert_valid();
     println!("✓ Document validation passed");
 
     // Shared meter: allocate between 3 tenants proportionally

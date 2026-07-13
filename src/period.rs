@@ -89,6 +89,11 @@ pub fn prorate(
         .ok_or(BillingError::MonetaryOverflow { precision: 5 })?;
     let mut result = item.clone();
     result.net_amount = prorated;
+    // Clear the period: the prorated item covers a SUB-period of the source,
+    // and this function only knows day counts, not the actual date range.
+    // Callers who need the exact period must set it explicitly:
+    //   result.period = Some(Period::new("2026-06-15", "2026-06-30"));
+    result.period = None;
     result.description = format!(
         "{} (prorated {active_days}/{total_days}d)",
         item.description

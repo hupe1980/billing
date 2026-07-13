@@ -115,7 +115,7 @@ fn main() {
         .meta(DocumentMeta {
             invoice_number: "CLOUD-2026-07".into(),
             period_label: "July 2026".into(),
-            notes: None,
+            ..Default::default()
         })
         .positions(all_positions)
         .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.20))))
@@ -135,7 +135,7 @@ fn main() {
     println!("  {:48} {:>12}", "VAT (20%)", doc.tax_total());
     println!("  {:48} {:>12}", "GROSS TOTAL", doc.gross_total());
 
-    doc.assert_valid().unwrap();
+    doc.assert_valid();
     println!();
     println!("✓ Document validation passed");
 }

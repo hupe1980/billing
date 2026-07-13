@@ -155,7 +155,11 @@ impl<const P: u8> Amount<P> {
             return Err(err());
         }
 
-        let whole: i64 = whole_str.parse().map_err(|_| err())?;
+        // Parse `whole` as i128 so that the edge case where the whole part equals
+        // |i64::MIN| / SCALE is handled correctly.  For P=0 and Amount::<0>::MIN,
+        // the whole string is "9223372036854775808" which overflows i64 but fits
+        // in i128 and is valid after negation (= i64::MIN).
+        let whole: i128 = whole_str.parse().map_err(|_| err())?;
 
         // Reject non-zero digits beyond P decimal places.
         if frac_str.len() > P as usize {
@@ -176,13 +180,32 @@ impl<const P: u8> Amount<P> {
             frac_padded.parse().map_err(|_| err())?
         };
 
-        let mut raw = whole
-            .checked_mul(Self::SCALE)
-            .and_then(|w| w.checked_add(frac))
+        // Use i128 for the intermediate product so that Amount::MIN can be parsed.
+        //
+        // The magnitude of i64::MIN is 9_223_372_036_854_775_808, which exceeds i64::MAX
+        // (9_223_372_036_854_775_807) by 1.  If we computed `whole * SCALE + frac` as i64
+        // and then negated, the intermediate would overflow before the negation step,
+        // causing `parse(Amount::MIN.to_string())` to return Err — a round-trip violation.
+        //
+        // With i128 the full magnitude fits, and we convert back to i64 only after
+        // applying the sign and confirming the result is in [i64::MIN, i64::MAX].
+        let unsigned_mag: i128 = whole
+            .checked_mul(Self::SCALE as i128)
+            .and_then(|w| w.checked_add(frac as i128))
             .ok_or_else(err)?;
-        if negative {
-            raw = raw.checked_neg().ok_or_else(err)?;
-        }
+
+        let raw: i64 = if negative {
+            let negated = -(unsigned_mag);
+            if negated < i64::MIN as i128 {
+                return Err(err()); // magnitude too large even for i64::MIN
+            }
+            negated as i64 // safe: negated ∈ [i64::MIN, 0]
+        } else {
+            if unsigned_mag > i64::MAX as i128 {
+                return Err(err());
+            }
+            unsigned_mag as i64 // safe: unsigned_mag ∈ [0, i64::MAX]
+        };
         Ok(Self(raw))
     }
 
@@ -284,19 +307,41 @@ impl<const P: u8> Amount<P> {
     /// Round to a different precision.
     ///
     /// # Panics
-    /// Panics on overflow (should not occur for normal monetary values).
+    /// Panics on overflow — see [`Amount::checked_round_to`] for a non-panicking version.
+    /// Overflow can occur when converting to a **higher** precision (`Q > P`) for values
+    /// near `Amount::<P>::MAX`.
     #[must_use]
     pub fn round_to<const Q: u8>(self, strategy: RoundingStrategy) -> Amount<Q> {
+        self.checked_round_to(strategy)
+            .expect("monetary overflow in round_to: use checked_round_to for large values")
+    }
+
+    /// Round to a different precision, returning `Err` on overflow.
+    ///
+    /// Overflow is only possible when converting to a **higher** precision (`Q > P`)
+    /// for values near `Amount::<P>::MAX` / `Amount::<P>::MIN`.
+    ///
+    /// ```rust
+    /// use billing::{Amount, RoundingStrategy};
+    /// let a = Amount::<5>::parse("3.45678").unwrap();
+    /// let r = a.checked_round_to::<2>(RoundingStrategy::MidpointAwayFromZero).unwrap();
+    /// assert_eq!(r, Amount::<2>::parse("3.46").unwrap());
+    /// ```
+    pub fn checked_round_to<const Q: u8>(
+        self,
+        strategy: RoundingStrategy,
+    ) -> Result<Amount<Q>, BillingError> {
         let d = self
             .into_decimal()
             .round_dp_with_strategy(Q as u32, strategy.into());
-        Amount::<Q>::from_decimal(d).expect("monetary overflow in round_to")
+        Amount::<Q>::from_decimal(d).ok_or(BillingError::MonetaryOverflow { precision: Q })
     }
 
     /// Construct from an integer (exact, no rounding).
     ///
     /// # Panics
-    /// Panics if `n × 10^P` overflows `i64`.
+    /// Panics if `n × 10^P` overflows `i64`. Use [`Amount::checked_from_int`] for a
+    /// non-panicking version.
     ///
     /// # Example
     /// ```rust
@@ -309,6 +354,22 @@ impl<const P: u8> Amount<P> {
             n.checked_mul(Self::SCALE)
                 .expect("monetary overflow in from_int: value × scale exceeds i64"),
         )
+    }
+
+    /// Fallible integer constructor — returns `Err` on overflow.
+    ///
+    /// `n` is treated as a whole-number monetary amount (e.g. `49` = 49.00000 at P=5).
+    /// Returns `Err` if `n × 10^P` overflows `i64`.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// assert_eq!(Amount::<5>::checked_from_int(49).unwrap(), Amount::parse("49.00000").unwrap());
+    /// assert!(Amount::<5>::checked_from_int(i64::MAX).is_err());
+    /// ```
+    pub fn checked_from_int(n: i64) -> Result<Self, crate::error::BillingError> {
+        n.checked_mul(Self::SCALE)
+            .map(Self)
+            .ok_or(crate::error::BillingError::MonetaryOverflow { precision: P })
     }
 
     /// Access the raw scaled `i64` representation.
@@ -375,7 +436,8 @@ impl<const P: u8> Amount<P> {
     ///
     /// # Panics
     /// Panics if `self` equals `Amount(i64::MIN)` (the minimum value has no
-    /// positive counterpart in `i64`).
+    /// positive counterpart in `i64`). Use [`Amount::checked_abs`] for a
+    /// non-panicking version.
     #[must_use]
     pub fn abs(self) -> Self {
         Self(
@@ -383,6 +445,17 @@ impl<const P: u8> Amount<P> {
                 .checked_abs()
                 .expect("monetary overflow in abs: i64::MIN has no positive counterpart"),
         )
+    }
+
+    /// Fallible absolute value. Returns `Err` if `self == Amount(i64::MIN)`.
+    ///
+    /// Use this instead of [`Amount::abs`] when the input is externally bounded
+    /// and cannot be guaranteed to be above `Amount::MIN`.
+    pub fn checked_abs(self) -> Result<Self, BillingError> {
+        self.0
+            .checked_abs()
+            .map(Self)
+            .ok_or(BillingError::MonetaryOverflow { precision: P })
     }
 
     /// Returns `true` when `|self − expected| × 1_000_000 ≤ |expected| × ppm`.

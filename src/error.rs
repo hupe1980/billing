@@ -10,6 +10,20 @@ pub struct ParseAmountError {
 }
 
 /// All errors produced by the billing engine.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in **minor** releases
+/// without a semver-major bump.  Always include a `_ =>` arm when matching:
+///
+/// ```rust
+/// use billing::BillingError;
+/// fn describe(e: &BillingError) -> &'static str {
+///     match e {
+///         BillingError::MonetaryOverflow { .. } => "overflow",
+///         BillingError::InvalidInput { .. }    => "bad input",
+///         _ => "other billing error",  // ← required; handles future variants
+///     }
+/// }
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum BillingError {

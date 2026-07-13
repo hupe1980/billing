@@ -274,6 +274,13 @@ impl TariffSchedule {
                 prev_upper = u;
             }
         }
+        // If any units remain after exhausting all bands, the schedule does not cover
+        // the full quantity. Return an explicit error rather than silently under-billing.
+        if remaining > Decimal::ZERO {
+            return Err(BillingError::InvalidInput {
+                reason: "quantity exceeds the schedule's coverage: add an open-ended top band",
+            });
+        }
         Ok(items)
     }
 

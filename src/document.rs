@@ -1,14 +1,15 @@
 //! [`BillingDocument`] — self-validating invoice with ordered positions + totals.
 use crate::amount::Amount;
 use crate::error::BillingError;
-use crate::line_item::LineItem;
+use crate::line_item::{LineItem, Period};
 use crate::tax::{DiscountLayer, TaxLayer};
 
 // ── DocumentMeta ──────────────────────────────────────────────────────────────
 
 /// Non-computed header fields for a billing document.
 ///
-/// `billing` does not parse dates — use whatever date type fits your domain.
+/// All date/identifier fields are `Option<String>` to remain date-type-agnostic.
+/// Store ISO 8601 date strings (e.g. `"2026-07-01"`) for interoperability.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DocumentMeta {
@@ -16,6 +17,20 @@ pub struct DocumentMeta {
     pub invoice_number: String,
     /// Human-readable period label (e.g. `"2026-06"`, `"July 2026"`). Not parsed.
     pub period_label: String,
+    /// The overall billing period covered by this document.
+    ///
+    /// Use [`Period::new`] to set both `from` and `to` together, ensuring they are
+    /// always set as a pair.  Stored as ISO 8601 date strings.
+    pub period: Option<Period>,
+    /// Document issue date as ISO 8601 date string, e.g. `"2026-07-01"`.
+    /// Required by §14 UStG and §22 MessZV for German invoices.
+    pub issue_date: Option<String>,
+    /// Payment due date as ISO 8601 date string, e.g. `"2026-07-31"`.
+    pub due_date: Option<String>,
+    /// Sender / issuer identifier (MP-ID, GLN, BDEW code, or free-form).
+    pub issuer_id: Option<String>,
+    /// Recipient identifier (MP-ID, GLN, BDEW code, or free-form).
+    pub recipient_id: Option<String>,
     /// Optional free-text remarks printed on the document.
     pub notes: Option<String>,
 }
@@ -205,7 +220,7 @@ impl BillingDocument {
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    /// Assert full arithmetic correctness of the document.
+    /// Assert full arithmetic correctness of the document. Returns `Result`.
     ///
     /// Three invariants are checked (all exact — no tolerance):
     /// 1. `Σ(net_positions + discount_positions) == net_total`
@@ -213,9 +228,12 @@ impl BillingDocument {
     /// 3. `net_total + tax_total == gross_total`
     ///
     /// All documents built by this library satisfy these invariants at
-    /// construction time.  Call this after any external mutation to verify
+    /// construction time. Call this after any external mutation to verify
     /// the document has not been corrupted.
-    pub fn assert_valid(&self) -> Result<(), BillingError> {
+    ///
+    /// # See also
+    /// [`BillingDocument::assert_valid`] — panicking convenience form for use in tests.
+    pub fn validate(&self) -> Result<(), BillingError> {
         // Check 1: net positions + discount positions sum exactly to net_total.
         let computed_net = Amount::checked_sum(
             self.net_positions
@@ -252,6 +270,19 @@ impl BillingDocument {
         }
 
         Ok(())
+    }
+
+    /// Assert full arithmetic correctness — panics on failure.
+    ///
+    /// Convenience wrapper around [`BillingDocument::validate`] suitable for use
+    /// in tests and debug assertions. Follows the Rust convention that `assert_*`
+    /// methods panic rather than returning `Result`.
+    ///
+    /// # Panics
+    /// Panics if any of the three arithmetic invariants is violated.
+    pub fn assert_valid(&self) {
+        self.validate()
+            .expect("BillingDocument arithmetic invariants violated");
     }
 
     // ── Mutation helpers ──────────────────────────────────────────────────────
@@ -396,7 +427,7 @@ mod tests {
         assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
         assert_eq!(doc.tax_total(), Amount::parse("20.00000").unwrap());
         assert_eq!(doc.gross_total(), Amount::parse("120.00000").unwrap());
-        doc.assert_valid().unwrap();
+        doc.assert_valid();
     }
 
     /// Compound-tax correctness: the second tax layer must see the first
@@ -427,19 +458,19 @@ mod tests {
         // VAT base = 100.00 + 5.00 = 105.00; VAT = 105.00 × 0.19 = 19.95000
         assert_eq!(doc.tax_total(), Amount::parse("24.95000").unwrap());
         assert_eq!(doc.gross_total(), Amount::parse("124.95000").unwrap());
-        doc.assert_valid().unwrap();
+        doc.assert_valid();
     }
 
     #[test]
     fn assert_valid_full_three_checks() {
         let doc = simple_doc("42.00000");
-        doc.assert_valid().unwrap();
+        doc.assert_valid();
 
-        // Manually corrupt net_total — check 1 should fire.
+        // Manually corrupt net_total — check 1 should fire via validate().
         let mut bad = doc.clone();
         bad.net_total = Amount::parse("99.00000").unwrap();
         assert!(matches!(
-            bad.assert_valid(),
+            bad.validate(),
             Err(crate::error::BillingError::ValidationFailed {
                 check: "net_total",
                 ..
@@ -481,6 +512,6 @@ mod tests {
 
     #[test]
     fn assert_valid_passes() {
-        simple_doc("42.00000").assert_valid().unwrap();
+        simple_doc("42.00000").assert_valid();
     }
 }
