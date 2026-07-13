@@ -113,3 +113,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: ""   # cargo-deny ≥0.17 removed --log-level; suppress the flag
