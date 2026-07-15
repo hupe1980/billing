@@ -81,7 +81,7 @@ impl TimeOfUsePricing {
         for (band_name, qty) in usage {
             if *qty < Decimal::ZERO {
                 return Err(BillingError::InvalidInput {
-                    reason: "TimeOfUsePricing: usage quantity must be non-negative",
+                    reason: "TimeOfUsePricing: usage quantity must be non-negative".into(),
                 });
             }
             if let Some(band) = self.bands.iter().find(|b| b.name == *band_name) {
@@ -123,7 +123,7 @@ impl DynamicPricing {
     pub fn from_intervals(intervals: Vec<(Decimal, Amount<5>)>) -> Result<Self, BillingError> {
         if intervals.is_empty() {
             return Err(BillingError::InvalidInput {
-                reason: "DynamicPricing requires at least one interval",
+                reason: "DynamicPricing requires at least one interval".into(),
             });
         }
         // Every interval quantity must be positive — negative quantities
@@ -132,7 +132,7 @@ impl DynamicPricing {
         for (qty, _) in &intervals {
             if *qty <= Decimal::ZERO {
                 return Err(BillingError::InvalidInput {
-                    reason: "DynamicPricing interval quantity must be > 0",
+                    reason: "DynamicPricing interval quantity must be > 0".into(),
                 });
             }
         }

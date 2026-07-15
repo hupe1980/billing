@@ -61,7 +61,7 @@ impl Tariff for SaasTariff {
                     free,
                     Amount::<5>::try_from_decimal(self.overage_per_call.into_decimal()).map_err(
                         |_| BillingError::InvalidInput {
-                            reason: "invalid overage price",
+                            reason: "invalid overage price".into(),
                         },
                     )?,
                 )

@@ -3482,7 +3482,10 @@ fn billing_error_non_exhaustive_match_pattern() {
     }
     assert_eq!(describe(&billing::BillingError::ZeroPeriod), "period");
     assert_eq!(
-        describe(&billing::BillingError::MonetaryOverflow { precision: 5 }),
+        describe(&billing::BillingError::MonetaryOverflow {
+            precision: 5,
+            input_value: None
+        }),
         "overflow"
     );
 }
@@ -3500,6 +3503,7 @@ fn document_meta_new_fields_round_trip() {
         issuer_id: Some("9900123456789".into()), // BDEW MP-ID
         recipient_id: Some("4012345678901".into()), // GLN of Netzbetreiber
         notes: Some("EEG Einspeisevergütung §21 EEG 2023".into()),
+        ..Default::default()
     };
     assert_eq!(meta.period.as_ref().unwrap().from, "2026-07-01");
     assert_eq!(meta.period.as_ref().unwrap().to, "2026-07-31");
@@ -4444,4 +4448,439 @@ fn rate_lookup_zero_parameter() {
     // 0 ≤ 0.001 → first band
     let r = lookup.rate_for(dec!(0)).unwrap();
     assert_eq!(r, Amount::parse("0.01000").unwrap());
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUG-1 — MonetaryOverflow carries the offending input value
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn overflow_error_from_decimal_includes_input_value() {
+    use rust_decimal::Decimal;
+    let huge = Decimal::from(i64::MAX / 100_000 + 1);
+    let err = Amount::<5>::checked_from_decimal(huge).unwrap_err();
+    match err {
+        BillingError::MonetaryOverflow {
+            precision: 5,
+            input_value: Some(v),
+        } => {
+            assert_eq!(v, huge);
+        }
+        other => panic!("expected MonetaryOverflow with input_value, got {other}"),
+    }
+}
+
+#[test]
+fn overflow_error_from_decimal_message_contains_value() {
+    use rust_decimal::Decimal;
+    let huge = Decimal::from(i64::MAX / 100_000 + 1);
+    let err = Amount::<5>::checked_from_decimal(huge).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("monetary overflow"), "got: {msg}");
+    assert!(
+        msg.contains(&huge.to_string()),
+        "error must name the input; got: {msg}"
+    );
+}
+
+#[test]
+fn overflow_error_arithmetic_has_no_input_value() {
+    let result = Amount::<5>::MAX.checked_add(Amount::<5>::from_raw_units(1));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BillingError::MonetaryOverflow {
+                input_value: None,
+                ..
+            }
+        ),
+        "arithmetic overflow should not carry an input value"
+    );
+}
+
+#[test]
+fn overflow_error_checked_neg_includes_self() {
+    let err = Amount::<5>::MIN.checked_neg().unwrap_err();
+    match err {
+        BillingError::MonetaryOverflow {
+            input_value: Some(v),
+            ..
+        } => {
+            assert_eq!(v, Amount::<5>::MIN.into_decimal());
+        }
+        other => panic!("expected MonetaryOverflow with input_value, got {other}"),
+    }
+}
+
+#[test]
+fn overflow_error_checked_abs_includes_self() {
+    let err = Amount::<5>::MIN.checked_abs().unwrap_err();
+    assert!(matches!(
+        err,
+        BillingError::MonetaryOverflow {
+            input_value: Some(_),
+            ..
+        }
+    ));
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUG-2 — InvalidInput / InvalidSchedule accept dynamic String messages
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn billing_error_invalid_input_dynamic_message() {
+    let year = 2026u32;
+    let band = "0-10 kWp";
+    let err = BillingError::InvalidInput {
+        reason: format!("no EEG rate table for year {year}, band {band}"),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("2026"), "message must contain year");
+    assert!(msg.contains("0-10 kWp"), "message must contain band label");
+}
+
+#[test]
+fn billing_error_invalid_schedule_dynamic_message() {
+    let malo_id = "52435677816";
+    let err = BillingError::InvalidSchedule {
+        reason: format!("tariff schedule not found for MaLo {malo_id}"),
+    };
+    assert!(err.to_string().contains(malo_id));
+}
+
+#[test]
+fn billing_error_static_string_works_via_into() {
+    let err = BillingError::InvalidInput {
+        reason: "static error message".into(),
+    };
+    assert_eq!(err.to_string(), "invalid input: static error message");
+}
+
+#[test]
+fn billing_error_display_overflow_no_input() {
+    let err = BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    };
+    assert_eq!(
+        err.to_string(),
+        "monetary overflow: amount exceeds representable range for Amount<5>"
+    );
+}
+
+#[test]
+fn billing_error_display_overflow_with_input() {
+    use rust_decimal::Decimal;
+    let v = Decimal::from(99_999_999i64);
+    let err = BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: Some(v),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("monetary overflow"));
+    assert!(msg.contains("99999999"), "must name the offending value");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUG-3 — LineItem::for_usage_rounded prevents unit-price precision drift
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn for_usage_rounded_stores_truncated_price() {
+    let rate = dec!(811) / dec!(100_000); // 0.00811 EUR/kWh
+    let item = LineItem::for_usage_rounded(
+        "Arbeit",
+        dec!(1000),
+        "kWh",
+        rate,
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    let stored = item.unit_price.as_ref().unwrap().value;
+    assert!(
+        stored.scale() <= 6,
+        "stored scale must be <=6, got {}",
+        stored.scale()
+    );
+    assert_eq!(item.net_amount, Amount::<5>::parse("8.11000").unwrap());
+}
+
+#[test]
+fn for_usage_rounded_net_agrees_with_rounded_price() {
+    // 1/3 EUR/kWh rounded to 6dp = 0.333333 EUR/kWh
+    // 300 kWh × 0.333333 = 99.9999 → rounded to 5dp = 99.99990
+    let item = LineItem::for_usage_rounded(
+        "Test",
+        dec!(300),
+        "kWh",
+        dec!(1) / dec!(3),
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    let stored_price = item.unit_price.as_ref().unwrap().value;
+    assert!(stored_price.scale() <= 6);
+    // net = 300 * stored_price rounded to 5dp
+    let expected_net = Amount::<5>::checked_from_decimal(stored_price * dec!(300)).unwrap();
+    assert_eq!(item.net_amount, expected_net);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-2 — LineItem::credit_for_usage
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn credit_for_usage_net_is_negative() {
+    let item =
+        LineItem::credit_for_usage("EEG Einspeisung", dec!(500), "kWh", dec!(0.0811), "EUR/kWh")
+            .build()
+            .unwrap();
+    assert_eq!(item.net_amount, Amount::<5>::parse("-40.55000").unwrap());
+    assert!(item.is_credit());
+    assert!(!item.is_debit());
+}
+
+#[test]
+fn credit_for_usage_in_document_reduces_net() {
+    let positions = vec![
+        LineItem::for_usage("Netzbezug", dec!(300), "kWh", dec!(0.30), "EUR/kWh")
+            .build()
+            .unwrap(),
+        LineItem::credit_for_usage("Einspeisung", dec!(200), "kWh", dec!(0.08), "EUR/kWh")
+            .build()
+            .unwrap(),
+    ];
+    let doc = BillingDocument::from_positions(DocumentMeta::default(), positions, vec![], vec![])
+        .unwrap();
+    assert_eq!(doc.net_total(), Amount::<5>::parse("74.00000").unwrap());
+    doc.assert_valid();
+}
+
+#[test]
+fn credit_for_usage_excluded_from_per_unit_levy() {
+    let positions = vec![
+        LineItem::for_usage("Bezug", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
+            .build()
+            .unwrap(),
+        LineItem::credit_for_usage("Einspeisung", dec!(400), "kWh", dec!(0.08), "EUR/kWh")
+            .build()
+            .unwrap(),
+    ];
+    let levy = billing::tax::PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh");
+    let doc = BillingDocument::from_positions(
+        DocumentMeta::default(),
+        positions,
+        vec![Box::new(levy)],
+        vec![],
+    )
+    .unwrap();
+    // Only 1000 kWh in levy base (credit excluded)
+    assert_eq!(doc.tax_total(), Amount::<5>::parse("20.50000").unwrap());
+    doc.assert_valid();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-4 — DocumentMeta.labels
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn document_meta_labels_default_empty() {
+    assert!(DocumentMeta::default().labels.is_empty());
+}
+
+#[test]
+fn document_meta_labels_round_trip() {
+    let meta = DocumentMeta {
+        invoice_number: "EEG-001".into(),
+        labels: [("malo_id".into(), "52435677816".into())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    assert_eq!(
+        meta.labels.get("malo_id").map(String::as_str),
+        Some("52435677816")
+    );
+}
+
+#[test]
+fn document_meta_labels_propagated_through_allocation() {
+    let pos = vec![
+        LineItem::fixed("C", Amount::parse("100.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let mut meta = DocumentMeta {
+        invoice_number: "INV-001".into(),
+        ..Default::default()
+    };
+    meta.labels.insert("malo_id".into(), "52435677816".into());
+    let doc = BillingDocument::from_positions(meta, pos, vec![], vec![]).unwrap();
+    let splits = EqualAllocation::new(2).allocate(&doc).unwrap();
+    for split in &splits {
+        assert_eq!(
+            split.meta.labels.get("malo_id").map(String::as_str),
+            Some("52435677816"),
+            "labels must survive allocation split"
+        );
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-7 — Amount::to_decimal()
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn to_decimal_equals_into_decimal() {
+    let a = Amount::<5>::parse("47.10000").unwrap();
+    assert_eq!(a.to_decimal(), a.into_decimal());
+}
+
+#[test]
+fn to_decimal_lossless_roundtrip() {
+    for s in &["0.00001", "99999.99999", "-12345.67890"] {
+        let a = Amount::<5>::parse(s).unwrap();
+        assert_eq!(
+            Amount::<5>::checked_from_decimal(a.to_decimal()).unwrap(),
+            a
+        );
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-5 — Mixed VAT rates via require_tag (documented pattern)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn mixed_vat_rates_require_tag_pattern() {
+    // PV feed-in (0%) + grid charge (19%) in one prosumer document.
+    let positions = vec![
+        LineItem::credit_for_usage("PV-Einspeisung", dec!(500), "kWh", dec!(0.0811), "EUR/kWh")
+            .tag("pv-feed-in")
+            .build()
+            .unwrap(),
+        LineItem::for_usage("Netzbezug", dec!(300), "kWh", dec!(0.085), "EUR/kWh")
+            .tag("grid-charge")
+            .build()
+            .unwrap(),
+    ];
+    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
+        FixedRateTax::new("MwSt 19%", dec!(0.19)).with_tag("grid-charge"),
+    )];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
+    // PV: -40.55, NNE: 25.50 → net = -15.05
+    assert_eq!(doc.net_total(), Amount::<5>::parse("-15.05000").unwrap());
+    // VAT only on grid-charge: 25.50 × 0.19 = 4.84500
+    assert_eq!(doc.tax_total(), Amount::<5>::parse("4.84500").unwrap());
+    doc.assert_valid();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUG-4 — RateLookup::build() returns Err (not panic) on empty table
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn rate_lookup_empty_builder_returns_err() {
+    let result = billing::RateLookup::builder().build();
+    assert!(result.is_err(), "empty builder must return Err");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-6 — RateLookup with Decimal-keyed capacity blocks
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn rate_lookup_decimal_boundaries() {
+    let lookup = billing::RateLookup::builder()
+        .at_most(dec!(10.0), Amount::parse("0.00811").unwrap())
+        .at_most(dec!(30.5), Amount::parse("0.00679").unwrap())
+        .fallback(Amount::parse("0.00556").unwrap())
+        .build()
+        .unwrap();
+    assert_eq!(
+        lookup.rate_for(dec!(10.0)).unwrap(),
+        Amount::parse("0.00811").unwrap()
+    );
+    assert_eq!(
+        lookup.rate_for(dec!(10.01)).unwrap(),
+        Amount::parse("0.00679").unwrap()
+    );
+    assert_eq!(
+        lookup.rate_for(dec!(30.5)).unwrap(),
+        Amount::parse("0.00679").unwrap()
+    );
+    assert_eq!(
+        lookup.rate_for(dec!(30.51)).unwrap(),
+        Amount::parse("0.00556").unwrap()
+    );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BillingError is Send + Sync (required for async use)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn billing_error_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BillingError>();
+}
+
+#[test]
+fn billing_error_implements_std_error_as_box() {
+    let err: Box<dyn std::error::Error> = Box::new(BillingError::InvalidInput {
+        reason: "test error".into(),
+    });
+    assert!(err.to_string().contains("invalid input"));
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Full EEG billing pipeline — end-to-end correctness
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn eeg_feed_in_billing_end_to_end() {
+    // Plant: 7 kWp → 8.11 ct/kWh; Production: 623.4 kWh
+    // Expected net: 623.4 × 0.00811 = 5.057754 → 5.05775 (5dp, MidpointAwayFromZero)
+    let lookup = billing::RateLookup::builder()
+        .at_most(dec!(10), Amount::parse("0.00811").unwrap())
+        .fallback(Amount::parse("0.00556").unwrap())
+        .build()
+        .unwrap();
+
+    let rate = lookup.rate_for(dec!(7)).unwrap();
+    let credit = LineItem::credit_for_usage(
+        "EEG Einspeisung",
+        dec!(623.4),
+        "kWh",
+        rate.into_decimal(),
+        "EUR/kWh",
+    )
+    .tag("eeg-feed-in")
+    .build()
+    .unwrap();
+
+    let meta = DocumentMeta {
+        invoice_number: "EEG-2026-07-001".into(),
+        labels: [("malo_id".into(), "52435677816".into())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+
+    let doc = BillingDocument::from_positions(meta, vec![credit], vec![], vec![]).unwrap();
+    assert_eq!(doc.net_total(), Amount::<5>::parse("-5.05577").unwrap());
+    assert_eq!(doc.gross_total(), doc.net_total()); // no tax
+    assert_eq!(
+        doc.meta.labels.get("malo_id").map(String::as_str),
+        Some("52435677816")
+    );
+    doc.assert_valid();
 }

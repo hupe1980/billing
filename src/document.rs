@@ -10,6 +10,9 @@ use crate::tax::{DiscountLayer, TaxLayer};
 ///
 /// All date/identifier fields are `Option<String>` to remain date-type-agnostic.
 /// Store ISO 8601 date strings (e.g. `"2026-07-01"`) for interoperability.
+///
+/// Fields may be extended in future versions — use struct-update syntax
+/// (`DocumentMeta { invoice_number: ..., ..Default::default() }`) to be forward-compatible.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DocumentMeta {
@@ -33,6 +36,12 @@ pub struct DocumentMeta {
     pub recipient_id: Option<String>,
     /// Optional free-text remarks printed on the document.
     pub notes: Option<String>,
+    /// Arbitrary domain-specific key-value labels.
+    ///
+    /// Use this bag to attach domain identifiers without encoding them into
+    /// other fields (e.g. `"malo_id"` → `"52435677816"`, `"billing_year"` → `"2026"`).
+    /// Keys and values are free-form strings; the billing engine does not interpret them.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 // ── BillingDocument ───────────────────────────────────────────────────────────
@@ -243,7 +252,7 @@ impl BillingDocument {
         )?;
         if computed_net != self.net_total {
             return Err(BillingError::ValidationFailed {
-                check: "net_total",
+                check: "net_total".into(),
                 actual: computed_net.to_string(),
                 expected: self.net_total.to_string(),
             });
@@ -253,7 +262,7 @@ impl BillingDocument {
         let computed_tax = Amount::checked_sum(self.tax_positions.iter().map(|p| p.net_amount))?;
         if computed_tax != self.tax_total {
             return Err(BillingError::ValidationFailed {
-                check: "tax_total",
+                check: "tax_total".into(),
                 actual: computed_tax.to_string(),
                 expected: self.tax_total.to_string(),
             });
@@ -263,7 +272,7 @@ impl BillingDocument {
         let expected_gross = self.net_total.checked_add(self.tax_total)?;
         if expected_gross != self.gross_total {
             return Err(BillingError::ValidationFailed {
-                check: "gross_total",
+                check: "gross_total".into(),
                 actual: expected_gross.to_string(),
                 expected: self.gross_total.to_string(),
             });
@@ -469,13 +478,14 @@ mod tests {
         // Manually corrupt net_total — check 1 should fire via validate().
         let mut bad = doc.clone();
         bad.net_total = Amount::parse("99.00000").unwrap();
+        let err = bad.validate().unwrap_err();
         assert!(matches!(
-            bad.validate(),
-            Err(crate::error::BillingError::ValidationFailed {
-                check: "net_total",
-                ..
-            })
+            err,
+            crate::error::BillingError::ValidationFailed { .. }
         ));
+        if let crate::error::BillingError::ValidationFailed { ref check, .. } = err {
+            assert_eq!(check, "net_total");
+        }
     }
 
     #[test]

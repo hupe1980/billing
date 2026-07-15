@@ -83,7 +83,7 @@ impl RateLookup {
             .find(|e| parameter <= e.upper_bound)
             .map(|e| e.rate)
             .ok_or(BillingError::InvalidInput {
-                reason: "no matching rate for parameter: add a .fallback() entry",
+                reason: "no matching rate for parameter: add a .fallback() entry".into(),
             })
     }
 }
@@ -150,7 +150,7 @@ impl RateLookupBuilder {
     pub fn build(mut self) -> Result<RateLookup, BillingError> {
         if self.entries.is_empty() {
             return Err(BillingError::InvalidSchedule {
-                reason: "RateLookup must have at least one entry",
+                reason: "RateLookup must have at least one entry".into(),
             });
         }
         // Sort ascending so rate_for finds the lowest matching upper_bound first.

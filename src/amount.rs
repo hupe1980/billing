@@ -238,7 +238,10 @@ impl<const P: u8> Amount<P> {
     /// assert_eq!(a, Amount::parse("1.23456").unwrap());
     /// ```
     pub fn checked_from_decimal(d: Decimal) -> Result<Self, BillingError> {
-        Self::from_decimal(d).ok_or(BillingError::MonetaryOverflow { precision: P })
+        Self::from_decimal(d).ok_or(BillingError::MonetaryOverflow {
+            precision: P,
+            input_value: Some(d),
+        })
     }
 
     /// Construct from a `rust_decimal::Decimal`. Returns `Err` on overflow.
@@ -249,9 +252,27 @@ impl<const P: u8> Amount<P> {
     }
 
     /// Convert to `rust_decimal::Decimal` (lossless, exact).
+    ///
+    /// Also available as [`Amount::to_decimal`] for use in non-consuming contexts.
     #[must_use]
     pub fn into_decimal(self) -> Decimal {
         Decimal::new(self.0, P as u32)
+    }
+
+    /// Convert to `rust_decimal::Decimal` (lossless, exact).
+    ///
+    /// Equivalent to [`Amount::into_decimal`]; provided as a non-consuming form
+    /// for use in method chains where `self` cannot be moved.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// let a = Amount::<5>::parse("1.23456").unwrap();
+    /// let d: rust_decimal::Decimal = a.to_decimal();
+    /// assert_eq!(d, rust_decimal::Decimal::from_str_exact("1.23456").unwrap());
+    /// ```
+    #[must_use]
+    pub fn to_decimal(self) -> Decimal {
+        self.into_decimal()
     }
 
     /// Checked addition. Returns `Err` on overflow.
@@ -259,7 +280,10 @@ impl<const P: u8> Amount<P> {
         self.0
             .checked_add(rhs.0)
             .map(Self)
-            .ok_or(BillingError::MonetaryOverflow { precision: P })
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })
     }
 
     /// Checked subtraction. Returns `Err` on overflow.
@@ -267,7 +291,10 @@ impl<const P: u8> Amount<P> {
         self.0
             .checked_sub(rhs.0)
             .map(Self)
-            .ok_or(BillingError::MonetaryOverflow { precision: P })
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })
     }
 
     /// Checked negation.
@@ -275,7 +302,10 @@ impl<const P: u8> Amount<P> {
         self.0
             .checked_neg()
             .map(Self)
-            .ok_or(BillingError::MonetaryOverflow { precision: P })
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: Some(self.into_decimal()),
+            })
     }
 
     /// Multiply a per-unit price by a quantity (`Decimal`).
@@ -301,7 +331,10 @@ impl<const P: u8> Amount<P> {
             P as u32,
             rust_decimal::RoundingStrategy::MidpointAwayFromZero,
         );
-        Self::from_decimal(product).ok_or(BillingError::MonetaryOverflow { precision: P })
+        Self::from_decimal(product).ok_or(BillingError::MonetaryOverflow {
+            precision: P,
+            input_value: None,
+        })
     }
 
     /// Round to a different precision.
@@ -334,7 +367,10 @@ impl<const P: u8> Amount<P> {
         let d = self
             .into_decimal()
             .round_dp_with_strategy(Q as u32, strategy.into());
-        Amount::<Q>::from_decimal(d).ok_or(BillingError::MonetaryOverflow { precision: Q })
+        Amount::<Q>::from_decimal(d).ok_or(BillingError::MonetaryOverflow {
+            precision: Q,
+            input_value: None,
+        })
     }
 
     /// Construct from an integer (exact, no rounding).
@@ -369,7 +405,10 @@ impl<const P: u8> Amount<P> {
     pub fn checked_from_int(n: i64) -> Result<Self, crate::error::BillingError> {
         n.checked_mul(Self::SCALE)
             .map(Self)
-            .ok_or(crate::error::BillingError::MonetaryOverflow { precision: P })
+            .ok_or(crate::error::BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })
     }
 
     /// Access the raw scaled `i64` representation.
@@ -455,7 +494,10 @@ impl<const P: u8> Amount<P> {
         self.0
             .checked_abs()
             .map(Self)
-            .ok_or(BillingError::MonetaryOverflow { precision: P })
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: Some(self.into_decimal()),
+            })
     }
 
     /// Returns `true` when `|self − expected| × 1_000_000 ≤ |expected| × ppm`.

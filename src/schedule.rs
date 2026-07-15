@@ -200,7 +200,7 @@ impl TariffSchedule {
     pub fn split(&self, quantity: Decimal) -> Result<Vec<LineItem>, BillingError> {
         if quantity < Decimal::ZERO {
             return Err(BillingError::InvalidInput {
-                reason: "quantity must be non-negative",
+                reason: "quantity must be non-negative".into(),
             });
         }
         match self.mode {
@@ -208,7 +208,7 @@ impl TariffSchedule {
             Mode::Volume => self.split_volume(quantity),
             Mode::Block => self.split_block(quantity),
             Mode::Capacity => Err(BillingError::InvalidInput {
-                reason: "Capacity schedule requires apply_peak(), not split()",
+                reason: "Capacity schedule requires apply_peak(), not split()".into(),
             }),
         }
     }
@@ -222,18 +222,18 @@ impl TariffSchedule {
     pub fn apply_peak(&self, peak: Decimal) -> Result<LineItem, BillingError> {
         if self.mode != Mode::Capacity {
             return Err(BillingError::InvalidInput {
-                reason: "apply_peak() is only valid for capacity schedules",
+                reason: "apply_peak() is only valid for capacity schedules".into(),
             });
         }
         if peak < Decimal::ZERO {
             return Err(BillingError::InvalidInput {
-                reason: "peak must be non-negative",
+                reason: "peak must be non-negative".into(),
             });
         }
         let price = self
             .find_tier_price(peak)
             .ok_or(BillingError::InvalidSchedule {
-                reason: "no tier covers the supplied peak value",
+                reason: "no tier covers the supplied peak value".into(),
             })?;
         LineItem::debit(format!("Capacity charge (peak {peak:.3} {})", self.unit))
             .fixed_amount(price)
@@ -278,7 +278,8 @@ impl TariffSchedule {
         // the full quantity. Return an explicit error rather than silently under-billing.
         if remaining > Decimal::ZERO {
             return Err(BillingError::InvalidInput {
-                reason: "quantity exceeds the schedule's coverage: add an open-ended top band",
+                reason: "quantity exceeds the schedule's coverage: add an open-ended top band"
+                    .into(),
             });
         }
         Ok(items)
@@ -291,7 +292,7 @@ impl TariffSchedule {
         let price = self
             .find_tier_price(quantity)
             .ok_or(BillingError::InvalidSchedule {
-                reason: "no tier covers the supplied quantity",
+                reason: "no tier covers the supplied quantity".into(),
             })?;
         let price_unit = format!("EUR/{}", self.unit);
         Ok(vec![
@@ -307,10 +308,10 @@ impl TariffSchedule {
             return Ok(vec![]);
         }
         let band = self.bands.first().ok_or(BillingError::InvalidSchedule {
-            reason: "block schedule requires at least one band",
+            reason: "block schedule requires at least one band".into(),
         })?;
         let block_size = band.block_size.ok_or(BillingError::InvalidSchedule {
-            reason: "block schedule band must have a block_size",
+            reason: "block schedule band must have a block_size".into(),
         })?;
         // Rounds UP — partial block is billed as a full block.
         let blocks = (quantity / block_size).ceil();
@@ -373,7 +374,7 @@ impl TariffScheduleBuilder {
     pub fn build(self) -> Result<TariffSchedule, BillingError> {
         if self.bands.is_empty() {
             return Err(BillingError::InvalidSchedule {
-                reason: "schedule must have at least one band",
+                reason: "schedule must have at least one band".into(),
             });
         }
 
@@ -381,7 +382,7 @@ impl TariffScheduleBuilder {
         // unserviceable (split_block only reads bands.first()).
         if self.mode == Mode::Block && self.bands.len() != 1 {
             return Err(BillingError::InvalidSchedule {
-                reason: "block schedule must have exactly one band",
+                reason: "block schedule must have exactly one band".into(),
             });
         }
 
@@ -389,43 +390,43 @@ impl TariffScheduleBuilder {
         for band in &self.bands {
             if band.price.is_negative() {
                 return Err(BillingError::InvalidSchedule {
-                    reason: "band price must be non-negative; use DiscountLayer for credits",
+                    reason: "band price must be non-negative; use DiscountLayer for credits".into(),
                 });
             }
             if band.lower.is_some_and(|l| l < Decimal::ZERO) {
                 return Err(BillingError::InvalidSchedule {
-                    reason: "band lower bound must be non-negative",
+                    reason: "band lower bound must be non-negative".into(),
                 });
             }
             if band.upper.is_some_and(|u| u <= Decimal::ZERO) {
                 return Err(BillingError::InvalidSchedule {
-                    reason: "band upper bound must be positive",
+                    reason: "band upper bound must be positive".into(),
                 });
             }
             // When both bounds are specified, lower must be strictly less than upper.
             if let (Some(lower), Some(upper)) = (band.lower, band.upper) {
                 if lower >= upper {
                     return Err(BillingError::InvalidSchedule {
-                        reason: "band lower bound must be strictly less than upper bound",
+                        reason: "band lower bound must be strictly less than upper bound".into(),
                     });
                 }
             }
             if let Some(bs) = band.block_size {
                 if bs <= Decimal::ZERO {
                     return Err(BillingError::InvalidSchedule {
-                        reason: "block_size must be positive (> 0)",
+                        reason: "block_size must be positive (> 0)".into(),
                     });
                 }
             }
             // Block bands must have a block_size; non-block bands must not.
             if self.mode == Mode::Block && band.block_size.is_none() {
                 return Err(BillingError::InvalidSchedule {
-                    reason: "block schedule band must specify block_size",
+                    reason: "block schedule band must specify block_size".into(),
                 });
             }
             if self.mode != Mode::Block && band.block_size.is_some() {
                 return Err(BillingError::InvalidSchedule {
-                    reason: "block_size is only valid in block mode schedules",
+                    reason: "block_size is only valid in block mode schedules".into(),
                 });
             }
         }
@@ -438,7 +439,7 @@ impl TariffScheduleBuilder {
                 if let Some(lower) = band.lower {
                     if lower != expected_lower {
                         return Err(BillingError::InvalidSchedule {
-                            reason: "bands must be contiguous: gap or overlap detected",
+                            reason: "bands must be contiguous: gap or overlap detected".into(),
                         });
                     }
                 }
@@ -448,7 +449,8 @@ impl TariffScheduleBuilder {
                         Some(u) => expected_lower = u,
                         None => {
                             return Err(BillingError::InvalidSchedule {
-                                reason: "only the last band may have an unlimited upper bound",
+                                reason: "only the last band may have an unlimited upper bound"
+                                    .into(),
                             });
                         }
                     }

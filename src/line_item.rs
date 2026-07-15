@@ -163,6 +163,81 @@ impl LineItem {
             .unit_price(UnitPrice::new(unit_price, price_unit))
     }
 
+    /// Convenience constructor for a **credit** usage position (negative quantity × rate).
+    ///
+    /// The symmetric counterpart of [`LineItem::for_usage`] for refund / feed-in credit
+    /// positions where the charge direction is `Credit` (e.g. EEG Einspeisevergütung,
+    /// Mindermengen-Gutschrift).  The resulting `net_amount` is automatically negated.
+    ///
+    /// Use `for_usage` (debit) when the unit price itself is already negative
+    /// (e.g. EPEX negative-price hours under §27 EEG 2023) so that `Sign::Debit`
+    /// is preserved for levy-base calculations.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount};
+    /// use rust_decimal_macros::dec;
+    ///
+    /// // EEG feed-in credit: 500 kWh × 0.0811 EUR/kWh → net = -40.55000
+    /// let credit = LineItem::credit_for_usage(
+    ///     "EEG Einspeisevergütung", dec!(500), "kWh", dec!(0.0811), "EUR/kWh",
+    /// ).build().unwrap();
+    /// assert_eq!(credit.net_amount, Amount::<5>::parse("-40.55000").unwrap());
+    /// assert!(credit.is_credit());
+    /// ```
+    #[must_use]
+    pub fn credit_for_usage(
+        description: impl Into<String>,
+        quantity: rust_decimal::Decimal,
+        quantity_unit: impl Into<String>,
+        unit_price: rust_decimal::Decimal,
+        price_unit: impl Into<String>,
+    ) -> LineItemBuilder {
+        use crate::quantity::{Quantity, UnitPrice};
+        LineItemBuilder::new(description.into(), Sign::Credit)
+            .quantity(Quantity::new(quantity, quantity_unit))
+            .unit_price(UnitPrice::new(unit_price, price_unit))
+    }
+
+    /// Convenience constructor for `quantity × unit_price` with explicit unit-price precision.
+    ///
+    /// Identical to [`LineItem::for_usage`] except that `unit_price` is rounded to
+    /// `price_scale` decimal places before being stored in the `LineItem`.  This prevents
+    /// silent precision drift when prices are derived from integer arithmetic
+    /// (e.g. `ct/kWh → EUR/kWh` division) that produces many non-zero decimal digits.
+    ///
+    /// Use `price_scale = 6` to match the BO4E `Preis.wert` 6-dp field definition.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount, RoundingStrategy};
+    /// use rust_decimal_macros::dec;
+    ///
+    /// // 811 ct/kWh → 0.00811 EUR/kWh (already exact); scale = 6 is a no-op here
+    /// let item = LineItem::for_usage_rounded(
+    ///     "Arbeit", dec!(500), "kWh",
+    ///     dec!(0.00811), "EUR/kWh",
+    ///     6, RoundingStrategy::MidpointAwayFromZero,
+    /// ).build().unwrap();
+    /// assert_eq!(item.net_amount, Amount::<5>::parse("4.05500").unwrap());
+    /// ```
+    #[must_use]
+    pub fn for_usage_rounded(
+        description: impl Into<String>,
+        quantity: rust_decimal::Decimal,
+        quantity_unit: impl Into<String>,
+        unit_price: rust_decimal::Decimal,
+        price_unit: impl Into<String>,
+        price_scale: u32,
+        strategy: crate::amount::RoundingStrategy,
+    ) -> LineItemBuilder {
+        use crate::quantity::{Quantity, UnitPrice};
+        let rounded_price = unit_price.round_dp_with_strategy(price_scale, strategy.into());
+        LineItemBuilder::new(description.into(), Sign::Debit)
+            .quantity(Quantity::new(quantity, quantity_unit))
+            .unit_price(UnitPrice::new(rounded_price, price_unit))
+    }
+
     /// Returns `true` if this position has the given tag.
     #[must_use]
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -324,7 +399,7 @@ impl LineItemBuilder {
         // A line item without a description is not auditable.
         if self.description.trim().is_empty() {
             return Err(BillingError::InvalidInput {
-                reason: "LineItem description must not be empty",
+                reason: "LineItem description must not be empty".into(),
             });
         }
         let net = if let Some(fixed) = self.fixed_amount {
@@ -335,7 +410,7 @@ impl LineItemBuilder {
             // by negating the quantity).
             if qty.value < rust_decimal::Decimal::ZERO {
                 return Err(BillingError::InvalidInput {
-                    reason: "LineItem quantity must be non-negative",
+                    reason: "LineItem quantity must be non-negative".into(),
                 });
             }
             // Negative unit_price is allowed — it produces a negative net amount.
@@ -343,11 +418,14 @@ impl LineItemBuilder {
             let raw = qty.value * price.value;
             let rounded =
                 raw.round_dp_with_strategy(5, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-            Amount::<5>::from_decimal(rounded)
-                .ok_or(BillingError::MonetaryOverflow { precision: 5 })?
+            Amount::<5>::from_decimal(rounded).ok_or(BillingError::MonetaryOverflow {
+                precision: 5,
+                input_value: None,
+            })?
         } else {
             return Err(BillingError::InvalidInput {
-                reason: "LineItem requires either fixed_amount or both quantity and unit_price",
+                reason: "LineItem requires either fixed_amount or both quantity and unit_price"
+                    .into(),
             });
         };
 

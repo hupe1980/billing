@@ -76,7 +76,7 @@ pub fn prorate(
     }
     if active_days > total_days {
         return Err(BillingError::InvalidInput {
-            reason: "active_days must not exceed total_days",
+            reason: "active_days must not exceed total_days".into(),
         });
     }
     let fraction = Decimal::from(active_days) / Decimal::from(total_days);
@@ -85,8 +85,10 @@ pub fn prorate(
     // which would silently override the strategy the caller specified.
     let raw = item.net_amount.into_decimal() * fraction;
     let rounded = raw.round_dp_with_strategy(5, strategy.into());
-    let prorated = Amount::<5>::from_decimal(rounded)
-        .ok_or(BillingError::MonetaryOverflow { precision: 5 })?;
+    let prorated = Amount::<5>::from_decimal(rounded).ok_or(BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    })?;
     let mut result = item.clone();
     result.net_amount = prorated;
     // Clear the period: the prorated item covers a SUB-period of the source,
@@ -118,14 +120,17 @@ pub fn prorate_amount(
     }
     if active_days > total_days {
         return Err(BillingError::InvalidInput {
-            reason: "active_days must not exceed total_days",
+            reason: "active_days must not exceed total_days".into(),
         });
     }
     let fraction = Decimal::from(active_days) / Decimal::from(total_days);
     // Apply strategy once on the raw product (same logic as prorate()).
     let raw = amount.into_decimal() * fraction;
     let rounded = raw.round_dp_with_strategy(5, strategy.into());
-    Amount::<5>::from_decimal(rounded).ok_or(BillingError::MonetaryOverflow { precision: 5 })
+    Amount::<5>::from_decimal(rounded).ok_or(BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    })
 }
 
 #[cfg(test)]

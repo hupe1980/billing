@@ -241,7 +241,7 @@ impl TaxLayer for PercentageCharge {
         if let (Some(min), Some(max)) = (self.min_amount, self.max_amount) {
             if min > max {
                 return Err(BillingError::InvalidInput {
-                    reason: "PercentageCharge: min_amount must not exceed max_amount",
+                    reason: "PercentageCharge: min_amount must not exceed max_amount".into(),
                 });
             }
         }

@@ -178,6 +178,7 @@ impl AllocationRule for ProportionalAllocation {
                     issuer_id: doc.meta.issuer_id.clone(),
                     recipient_id: doc.meta.recipient_id.clone(),
                     notes: doc.meta.notes.clone(),
+                    labels: doc.meta.labels.clone(),
                 },
                 net_positions,
                 tax_positions,
