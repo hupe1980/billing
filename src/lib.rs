@@ -18,7 +18,9 @@
 //! | [`DiscountLayer`] | Composable discount overlays |
 //! | [`Tariff`] | Primary extension point for domain-specific pricing |
 //! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
+//! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
 //! | [`AllocationRule`] | Proportional split across N recipients |
+//! | [`RateLookup`] | Capacity-based rate table (EEG §21 style) |
 //!
 //! ## Quick start
 //!

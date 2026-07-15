@@ -23,12 +23,17 @@ rounding — and leaves every domain decision to your crate.
 | [`TariffSchedule`](#-tariffschedule--four-pricing-modes) | Four modes: **graduated** / **volume** / **block** / **capacity** |
 | [`TimeOfUsePricing`](#-time-of-use-and-dynamic-pricing) | N named bands (peak / off-peak / …); caller supplies pre-aggregated consumption |
 | [`DynamicPricing`](#-time-of-use-and-dynamic-pricing) | Per-interval price sequence (spot, real-time) |
-| [`UsageAggregator<E>`](#-usage-aggregation) | 7 types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM |
+| [`UsageAggregator<E>`](#-usage-aggregation) | 6 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM |
 | [`TaxLayer`](#-tax-layers--compound-taxes) | Composable, **ordered** tax stack — each layer sees all prior layers in its base |
 | [`DiscountLayer`](#-discounts) | Percentage and fixed discounts |
 | [`PercentageCharge`](#-percentage-charge) | % of invoice total with min/max guard (platform fee, commission) |
 | [`AllocationRule`](#-allocation-across-n-recipients) | Exact proportional / equal split — `Σ(parts) == total`, penny-corrected |
 | [`BillingDocument`](#-billingdocument) | Self-validating document: three exact invariants checked at build time |
+| [`RateLookup`](https://docs.rs/billing) | Capacity-based rate table (EEG §21 style) — `at_most(kWp, rate)` + `fallback(rate)` |
+| [`DocumentMeta.labels`](https://docs.rs/billing) | Key-value domain annotation bag (`malo_id`, `billing_year`, …) |
+| `LineItem::credit_for_usage` | Symmetric credit counterpart of `for_usage` (feed-in, refunds) |
+| `LineItem::for_usage_rounded` | `for_usage` with explicit unit-price precision (prevents silent drift) |
+| `Amount::to_decimal()` | Non-consuming alias for `into_decimal()` — handy for BO4E `Betrag.wert` |
 | [`minimum_charge()`](https://docs.rs/billing) | Minimum-spend shortfall helper |
 | [`merge_period_documents()`](https://docs.rs/billing) | Merge two half-period documents (tariff change mid-period) |
 | [`prorate()`](https://docs.rs/billing) | Scale a fixed charge to a partial period |
@@ -40,7 +45,7 @@ rounding — and leaves every domain decision to your crate.
 ```toml
 # Cargo.toml
 [dependencies]
-billing             = "0.4"
+billing             = "0.5"
 rust_decimal_macros = "1"   # dec!() macro for constants
 ```
 
@@ -63,12 +68,12 @@ let doc = BillingDocument::from_positions(
     DocumentMeta {
         invoice_number: "WATER-2026-07".into(),
         period_label:   "July 2026".into(),
-        notes:          None,
+        ..Default::default()
     },
     items,
     vec![Box::new(FixedRateTax::new("VAT", dec!(0.10)))],
     vec![],
-)?;
+)?
 
 println!("Net:   {}", doc.net_total());    // 47.10000
 println!("VAT:   {}", doc.tax_total());    // 4.71000
@@ -307,10 +312,10 @@ let doc = SaasPlan { seats: 5, base_fee: 49 }
         billing::DocumentMeta {
             invoice_number: "INV-001".into(),
             period_label:   "2026-07".into(),
-            notes:          None,
+            ..Default::default()
         },
         &(),
-    )?;
+    )?
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -447,12 +452,12 @@ let doc = BillingDocument::from_positions(
     DocumentMeta {
         invoice_number: "INV-2026-001".into(),
         period_label:   "2026-06".into(),
-        notes:          None,
+        ..Default::default()
     },
     positions,
     tax_layers,
     discount_layers,
-)?;
+)?
 
 doc.assert_valid();                      // all three checks
 println!("Net:   {}", doc.net_total());
@@ -512,7 +517,7 @@ just test-msrv       # verify Rust 1.85 compatibility
 just lint            # cargo clippy -D warnings
 just doc             # build & open docs
 just examples        # run all three examples
-just release 0.4.0   # create an annotated git tag
+just release 0.5.0   # create an annotated git tag
 ```
 
 All available tasks: `just --list`
@@ -524,7 +529,7 @@ All available tasks: `just --list`
 | Crate | Role |
 |-------|------|
 | [`rust_decimal`](https://crates.io/crates/rust_decimal) | Exact base-10 arithmetic (no `f64`) |
-| [`thiserror`](https://crates.io/crates/thiserror) | Derive macro for error types |
+| [`thiserror`](https://crates.io/crates/thiserror) | Derive macro for `ParseAmountError`; `BillingError` uses manual `Display` impl |
 | [`serde`](https://crates.io/crates/serde) *(optional)* | `Serialize`/`Deserialize` on all public types |
 
 Total non-optional dependency tree: **2 crates** (`rust_decimal` + `thiserror`).

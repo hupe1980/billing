@@ -1,7 +1,8 @@
 //! Usage aggregators — reduce a slice of events to a billing scalar.
 //!
-//! Supports 7 aggregation types: `SUM`, `COUNT`, `UNIQUE_COUNT`,
-//! `MAX`, `LATEST`, `WEIGHTED_SUM`, plus custom via the [`UsageAggregator`] trait.
+//! Provides 6 built-in aggregation types — `SUM`, `COUNT`, `UNIQUE_COUNT`,
+//! `MAX`, `LATEST`, `WEIGHTED_SUM` — plus custom aggregators via the
+//! [`UsageAggregator`] trait.
 use rust_decimal::Decimal;
 
 // ── UsageAggregator trait ─────────────────────────────────────────────────────
@@ -11,7 +12,7 @@ use rust_decimal::Decimal;
 /// This is a pure function — no I/O, no state.  The result is passed to a
 /// `TariffSchedule` or `DynamicPricing` for billing.
 ///
-/// 7 built-in types: `SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST`, `WEIGHTED_SUM`.
+/// 6 built-in types: `SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST`, `WEIGHTED_SUM`.
 pub trait UsageAggregator<E> {
     /// Aggregate a slice of events into a single [`Decimal`] quantity.
     fn aggregate(&self, events: &[E]) -> Decimal;

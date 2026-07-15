@@ -14,18 +14,31 @@ pub struct ParseAmountError {
 /// All errors produced by the billing engine.
 ///
 /// This enum is `#[non_exhaustive]`: new variants may be added in **minor** releases
-/// without a semver-major bump.  Always include a `_ =>` arm when matching:
+/// without a semver-major bump.  Always include a `_ =>` arm when matching.
+///
+/// ## Error context
+///
+/// [`BillingError::MonetaryOverflow`] carries `input_value: Option<Decimal>` —
+/// the input that caused the overflow when known.  This lets callers log the
+/// offending value:
 ///
 /// ```rust
-/// use billing::BillingError;
-/// fn describe(e: &BillingError) -> &'static str {
-///     match e {
-///         BillingError::MonetaryOverflow { .. } => "overflow",
-///         BillingError::InvalidInput { .. }    => "bad input",
-///         _ => "other billing error",  // ← required; handles future variants
+/// use billing::{Amount, BillingError};
+/// use rust_decimal::Decimal;
+///
+/// let huge = Decimal::from(i64::MAX / 100_000 + 1);
+/// match Amount::<5>::checked_from_decimal(huge) {
+///     Ok(a)  => println!("ok: {a}"),
+///     Err(BillingError::MonetaryOverflow { input_value: Some(v), precision }) => {
+///         eprintln!("overflow: {v} does not fit in Amount<{precision}>");
 ///     }
+///     Err(e) => eprintln!("other error: {e}"),
 /// }
 /// ```
+///
+/// [`BillingError::InvalidInput`] and [`BillingError::InvalidSchedule`] carry a
+/// `reason: String` which accepts both `&'static str` literals (via `.into()`) and
+/// dynamic messages (`format!("{}", value)`).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum BillingError {
