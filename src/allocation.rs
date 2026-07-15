@@ -230,6 +230,148 @@ impl AllocationRule for EqualAllocation {
     }
 }
 
+// ── proportional_split ────────────────────────────────────────────────────────
+
+/// Split `total` into N parts proportional to `fractions`, with penny-correct
+/// rounding at `scale` decimal places.
+///
+/// Uses the **Largest-Remainder (Hamilton) method**:
+/// 1. Each part is floored to `scale` dp.
+/// 2. The under-allocation (deficit) is distributed one unit (`10⁻ˢᶜᵃˡᵉ`) at a
+///    time to the fractions with the largest fractional remainders.
+///
+/// # Guarantees
+///
+/// - `Σ(parts) == total.round_dp(scale)` — exact, no drift.
+/// - Each part is rounded to exactly `scale` dp.
+/// - No single part absorbs a disproportionate correction: at most one smallest
+///   unit of adjustment is applied per fraction.
+///
+/// # Use cases
+///
+/// Quantity splits that precede document creation — for example:
+/// - §42b GGV/EEG 2023: PV output split by building-occupant consumption fractions.
+/// - §24 CapacityBlock: proportional kWh per capacity tier.
+/// - Any domain where a raw `Decimal` quantity must be split proportionally without drift.
+///
+/// For monetary document splits, use [`ProportionalAllocation`] instead.
+///
+/// # Example
+///
+/// ```rust
+/// use billing::proportional_split;
+/// use rust_decimal_macros::dec;
+///
+/// // Split 100 kWh among three tenants (fractions sum to 1.0).
+/// let parts = proportional_split(
+///     dec!(100),
+///     &[dec!(0.333), dec!(0.333), dec!(0.334)],
+///     3,
+/// ).unwrap();
+///
+/// // Each part is rounded to 3 dp and the sum is exactly 100.000.
+/// let total: rust_decimal::Decimal = parts.iter().sum();
+/// assert_eq!(total, dec!(100));
+/// ```
+///
+/// # Errors
+///
+/// - [`BillingError::InvalidInput`] if `fractions` is empty, `total` is negative,
+///   or any fraction is negative.
+/// - [`BillingError::InvalidAllocationShares`] if `Σ(fractions) ≠ 1.0 ± 1e-9`.
+pub fn proportional_split(
+    total: Decimal,
+    fractions: &[Decimal],
+    scale: u32,
+) -> Result<Vec<Decimal>, BillingError> {
+    use rust_decimal::prelude::ToPrimitive as _;
+
+    if fractions.is_empty() {
+        return Err(BillingError::InvalidInput {
+            reason: "fractions must not be empty".into(),
+        });
+    }
+    if total < Decimal::ZERO {
+        return Err(BillingError::InvalidInput {
+            reason: "proportional_split: total must be non-negative".into(),
+        });
+    }
+    for &f in fractions {
+        if f < Decimal::ZERO {
+            return Err(BillingError::InvalidInput {
+                reason: "proportional_split: each fraction must be non-negative".into(),
+            });
+        }
+    }
+    let sum: Decimal = fractions.iter().sum();
+    if (sum - Decimal::ONE).abs() > Decimal::new(1, 9) {
+        return Err(BillingError::InvalidAllocationShares {
+            sum: sum.to_string(),
+        });
+    }
+
+    // Normalise total to `scale` dp so parts can exactly sum to it.
+    let total =
+        total.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+
+    // Step 1 — floor each ideal share to `scale` dp.
+    let unit = Decimal::new(1, scale); // 10^{-scale}
+    let mut parts: Vec<Decimal> = fractions
+        .iter()
+        .map(|&f| {
+            (total * f)
+                .round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::ToNegativeInfinity)
+        })
+        .collect();
+
+    // Step 2 — remainders (fractional parts discarded by the floor).
+    let remainders: Vec<Decimal> = fractions
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| total * f - parts[i])
+        .collect();
+
+    // Step 3 — compute deficit: how many extra units must be distributed.
+    //
+    // deficit = total − Σ(floored parts).
+    // Because floor(x) ≤ x and Σ(f_i) ≈ 1, deficit ≥ 0 always.
+    // In the rare case where floating-point precision produces a tiny negative
+    // deficit, it is safe to skip distribution (no over-allocation).
+    let floored_sum: Decimal = parts.iter().sum();
+    let deficit_raw = total - floored_sum;
+    if deficit_raw <= Decimal::ZERO {
+        return Ok(parts);
+    }
+
+    // Round deficit to `scale` dp (it should already be exact, but guard against
+    // any residual Decimal precision artefact).
+    let deficit = deficit_raw
+        .round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+
+    // Convert deficit to an integer count of `unit`s.
+    // deficit is always < fractions.len() × unit (sum of fractional remainders < n).
+    let n_units = (deficit / unit)
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        .to_usize()
+        .ok_or_else(|| BillingError::InvalidInput {
+            reason: "proportional_split: deficit unit count overflows usize".into(),
+        })?;
+
+    // Step 4 — Hamilton distribution: give one unit to each of the n_units
+    // fractions with the largest remainder.  Ties broken by original order
+    // (deterministic, no hidden randomness).
+    let mut order: Vec<usize> = (0..fractions.len()).collect();
+    order.sort_by(|&a, &b| {
+        remainders[b].cmp(&remainders[a]).then_with(|| a.cmp(&b)) // stable tie-break: earlier index first
+    });
+
+    for &idx in order.iter().take(n_units) {
+        parts[idx] += unit;
+    }
+
+    Ok(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

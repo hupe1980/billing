@@ -27,12 +27,15 @@ rounding — and leaves every domain decision to your crate.
 | [`TaxLayer`](#-tax-layers--compound-taxes) | Composable, **ordered** tax stack — each layer sees all prior layers in its base |
 | [`DiscountLayer`](#-discounts) | Percentage and fixed discounts |
 | [`PercentageCharge`](#-percentage-charge) | % of invoice total with min/max guard (platform fee, commission) |
-| [`AllocationRule`](#-allocation-across-n-recipients) | Exact proportional / equal split — `Σ(parts) == total`, penny-corrected |
+| [`AllocationRule`](#-allocation-across-n-recipients) | Exact proportional / equal split of a document — `Σ(parts) == total`, penny-corrected |
+| [`proportional_split()`](#-allocation-across-n-recipients) | Penny-correct Hamilton split of a raw `Decimal` quantity (kWh, capacity, …) |
 | [`BillingDocument`](#-billingdocument) | Self-validating document: three exact invariants checked at build time |
 | [`RateLookup`](https://docs.rs/billing) | Capacity-based rate table (EEG §21 style) — `at_most(kWp, rate)` + `fallback(rate)` |
 | [`DocumentMeta.labels`](https://docs.rs/billing) | Key-value domain annotation bag (`malo_id`, `billing_year`, …) |
 | `LineItem::credit_for_usage` | Symmetric credit counterpart of `for_usage` (feed-in, refunds) |
 | `LineItem::for_usage_rounded` | `for_usage` with explicit unit-price precision (prevents silent drift) |
+| `LineItem::credit_for_usage_rounded` | Credit counterpart of `for_usage_rounded` (EEG feed-in with precision rounding) |
+| `Period::from_display` | Construct a `Period` from any `Display` type — avoids `.to_string()` round-trip |
 | `Amount::to_decimal()` | Non-consuming alias for `into_decimal()` — handy for BO4E `Betrag.wert` |
 | [`minimum_charge()`](https://docs.rs/billing) | Minimum-spend shortfall helper |
 | [`merge_period_documents()`](https://docs.rs/billing) | Merge two half-period documents (tariff change mid-period) |
@@ -45,7 +48,7 @@ rounding — and leaves every domain decision to your crate.
 ```toml
 # Cargo.toml
 [dependencies]
-billing             = "0.5"
+billing             = "0.6"
 rust_decimal_macros = "1"   # dec!() macro for constants
 ```
 
@@ -430,6 +433,30 @@ for d in &tenant_docs { d.assert_valid(); }  // ✓ each doc is consistent
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Raw quantity split (`proportional_split`)
+
+For splits that happen *before* a document exists — e.g. distributing kWh
+among tenants, or splitting a capacity block — use `proportional_split`.
+It uses the **Largest-Remainder (Hamilton) method**, guaranteeing
+`Σ(parts) == total` with at most one unit of adjustment per fraction
+(no single entry absorbs the full deficit).
+
+```rust
+use billing::proportional_split;
+use rust_decimal_macros::dec;
+
+// §42b EEG 2023: 987.654 kWh split by occupant consumption fractions
+let kwh_parts = proportional_split(
+    dec!(987.654),
+    &[dec!(0.45), dec!(0.35), dec!(0.20)],
+    3,   // scale = 3 dp
+)?;
+
+let total: rust_decimal::Decimal = kwh_parts.iter().sum();
+assert_eq!(total, dec!(987.654));  // ✓ exact sum
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ---
 
 ## 📄 BillingDocument
@@ -517,7 +544,7 @@ just test-msrv       # verify Rust 1.85 compatibility
 just lint            # cargo clippy -D warnings
 just doc             # build & open docs
 just examples        # run all three examples
-just release 0.5.0   # create an annotated git tag
+just release 0.6.0   # create an annotated git tag
 ```
 
 All available tasks: `just --list`

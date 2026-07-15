@@ -6,10 +6,11 @@
 //!
 //! ## Core concepts
 //!
-//! | Type | Purpose |
-//! |------|---------|
+//! | Type / Function | Purpose |
+//! |-----------------|---------|
 //! | [`Amount<P>`] | Fixed-point monetary arithmetic with compile-time precision |
 //! | [`LineItem`] | Atomic billing unit: quantity × unit-price → net amount |
+//! | [`Period`] | Billing period — construct from strings or any `Display` type via [`Period::from_display`] |
 //! | [`TariffSchedule`] | Graduated / volume / block / capacity pricing |
 //! | [`TimeOfUsePricing`] | N-band time-of-use pricing (peak / off-peak / …) |
 //! | [`DynamicPricing`] | Per-interval price sequence (spot, real-time) |
@@ -19,7 +20,8 @@
 //! | [`Tariff`] | Primary extension point for domain-specific pricing |
 //! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
 //! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
-//! | [`AllocationRule`] | Proportional split across N recipients |
+//! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
+//! | [`proportional_split`] | Penny-correct proportional split of a raw `Decimal` quantity (kWh, capacity, …) |
 //! | [`RateLookup`] | Capacity-based rate table (EEG §21 style) |
 //!
 //! ## Quick start
@@ -80,7 +82,7 @@ pub use aggregation::{
     CountAggregator, LatestAggregator, MaxAggregator, SumAggregator, UniqueCountAggregator,
     UsageAggregator, WeightedSumAggregator,
 };
-pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation};
+pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
 pub use amount::{Amount, EuroAmount, InvoiceAmt, RoundingStrategy};
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
@@ -107,6 +109,6 @@ pub mod prelude {
         ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder, RoundingStrategy, Sign,
         SumAggregator, Tariff, TariffBand, TariffSchedule, TaxLayer, TimeOfUsePricing, TouBand,
         UniqueCountAggregator, UnitPrice, UsageAggregator, WeightedSumAggregator,
-        merge_period_documents, minimum_charge, prorate, prorate_amount,
+        merge_period_documents, minimum_charge, proportional_split, prorate, prorate_amount,
     };
 }

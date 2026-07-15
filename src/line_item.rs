@@ -32,11 +32,46 @@ pub struct Period {
 
 impl Period {
     /// Create a period from any `Into<String>` date strings.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::Period;
+    /// let p = Period::new("2026-06-01", "2026-06-30");
+    /// assert_eq!(p.from, "2026-06-01");
+    /// assert_eq!(p.to,   "2026-06-30");
+    /// ```
     #[must_use]
     pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
         Self {
             from: from.into(),
             to: to.into(),
+        }
+    }
+
+    /// Create a period from any values implementing [`std::fmt::Display`].
+    ///
+    /// More ergonomic than [`Period::new`] when working with date types that
+    /// implement [`std::fmt::Display`] but not [`Into<String>`] directly
+    /// (for example `time::Date`, `chrono::NaiveDate`, or any custom date type).
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::Period;
+    ///
+    /// // Works with anything that implements Display:
+    /// let p = Period::from_display("2026-06-01", "2026-06-30");
+    /// assert_eq!(p.from, "2026-06-01");
+    ///
+    /// // With a date type (e.g. time::Date would work here):
+    /// // let start: time::Date = ...;
+    /// // let end:   time::Date = ...;
+    /// // let p = Period::from_display(start, end);
+    /// ```
+    #[must_use]
+    pub fn from_display(from: impl std::fmt::Display, to: impl std::fmt::Display) -> Self {
+        Self {
+            from: from.to_string(),
+            to: to.to_string(),
         }
     }
 }
@@ -234,6 +269,45 @@ impl LineItem {
         use crate::quantity::{Quantity, UnitPrice};
         let rounded_price = unit_price.round_dp_with_strategy(price_scale, strategy.into());
         LineItemBuilder::new(description.into(), Sign::Debit)
+            .quantity(Quantity::new(quantity, quantity_unit))
+            .unit_price(UnitPrice::new(rounded_price, price_unit))
+    }
+
+    /// Convenience constructor for a **credit** usage position with explicit unit-price precision.
+    ///
+    /// The credit counterpart of [`LineItem::for_usage_rounded`]: rounds `unit_price` to
+    /// `price_scale` decimal places and sets `Sign::Credit` so the resulting
+    /// `net_amount` is automatically negated.
+    ///
+    /// Use `price_scale = 6` to match the BO4E `Preis.wert` 6-dp field definition.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount, RoundingStrategy};
+    /// use rust_decimal_macros::dec;
+    ///
+    /// // EEG feed-in: 500 kWh × 8.11 ct/kWh = 0.00811 EUR/kWh → net = -4.05500
+    /// let item = LineItem::credit_for_usage_rounded(
+    ///     "EEG Vergütung", dec!(500), "kWh",
+    ///     dec!(0.00811), "EUR/kWh",
+    ///     6, RoundingStrategy::MidpointAwayFromZero,
+    /// ).build().unwrap();
+    /// assert_eq!(item.net_amount, Amount::<5>::parse("-4.05500").unwrap());
+    /// assert!(item.is_credit());
+    /// ```
+    #[must_use]
+    pub fn credit_for_usage_rounded(
+        description: impl Into<String>,
+        quantity: rust_decimal::Decimal,
+        quantity_unit: impl Into<String>,
+        unit_price: rust_decimal::Decimal,
+        price_unit: impl Into<String>,
+        price_scale: u32,
+        strategy: crate::amount::RoundingStrategy,
+    ) -> LineItemBuilder {
+        use crate::quantity::{Quantity, UnitPrice};
+        let rounded_price = unit_price.round_dp_with_strategy(price_scale, strategy.into());
+        LineItemBuilder::new(description.into(), Sign::Credit)
             .quantity(Quantity::new(quantity, quantity_unit))
             .unit_price(UnitPrice::new(rounded_price, price_unit))
     }

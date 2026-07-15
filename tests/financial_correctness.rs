@@ -6,7 +6,9 @@
 
 use billing::prelude::*;
 use billing::tax::{FixedDiscount, PerUnitLevy, PercentageCharge, PercentageDiscount};
-use billing::{merge_period_documents, minimum_charge, prorate, prorate_amount};
+use billing::{
+    merge_period_documents, minimum_charge, proportional_split, prorate, prorate_amount,
+};
 use rust_decimal_macros::dec;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4883,4 +4885,383 @@ fn eeg_feed_in_billing_end_to_end() {
         Some("52435677816")
     );
     doc.assert_valid();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-3 — Period::from_display
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn period_from_display_string_slices() {
+    // &str implements Display; should behave identically to Period::new.
+    let p = Period::from_display("2026-07-01", "2026-07-31");
+    assert_eq!(p.from, "2026-07-01");
+    assert_eq!(p.to, "2026-07-31");
+}
+
+#[test]
+fn period_from_display_equals_period_new_for_strings() {
+    // from_display and new must produce identical values for string inputs.
+    let via_new = Period::new("2026-01-01", "2026-12-31");
+    let via_display = Period::from_display("2026-01-01", "2026-12-31");
+    assert_eq!(via_new, via_display);
+}
+
+#[test]
+fn period_from_display_with_format_args() {
+    // Demonstrates the ergonomic use case: any Display-implementing type works
+    // without an explicit .to_string() call at the call site.
+    let year = 2026u32;
+    let month = 7u32;
+    let p = Period::from_display(
+        format_args!("{year}-{month:02}-01"),
+        format_args!("{year}-{month:02}-31"),
+    );
+    assert_eq!(p.from, "2026-07-01");
+    assert_eq!(p.to, "2026-07-31");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// credit_for_usage_rounded — API symmetry with for_usage_rounded
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn credit_for_usage_rounded_net_is_negated() {
+    // EEG feed-in: 500 kWh × 0.00811 EUR/kWh (already 5dp-exact) → -4.05500
+    let item = LineItem::credit_for_usage_rounded(
+        "EEG Einspeisevergütung",
+        dec!(500),
+        "kWh",
+        dec!(0.00811),
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    assert_eq!(item.net_amount, Amount::<5>::parse("-4.05500").unwrap());
+    assert!(item.is_credit());
+}
+
+#[test]
+fn credit_for_usage_rounded_matches_for_usage_rounded_in_abs_value() {
+    // credit_for_usage_rounded and for_usage_rounded must give |net| == net respectively.
+    let debit = LineItem::for_usage_rounded(
+        "Arbeit",
+        dec!(1000),
+        "kWh",
+        dec!(0.0811001),
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    let credit = LineItem::credit_for_usage_rounded(
+        "Gutschrift",
+        dec!(1000),
+        "kWh",
+        dec!(0.0811001),
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    // credit.net_amount == -debit.net_amount exactly
+    assert_eq!(credit.net_amount, -debit.net_amount);
+}
+
+#[test]
+fn credit_for_usage_rounded_price_scale_applied() {
+    // 0.081157... rounded to 6dp = 0.081157; net = 500 × 0.081157 = 40.5785 → 40.57850
+    let item = LineItem::credit_for_usage_rounded(
+        "Gutschrift",
+        dec!(500),
+        "kWh",
+        dec!(0.0811579),
+        "EUR/kWh",
+        6,
+        RoundingStrategy::MidpointAwayFromZero,
+    )
+    .build()
+    .unwrap();
+    // rounded price = 0.081158 (6dp, MidpointAwayFromZero: 0.0811579 → 0.081158)
+    // 500 × 0.081158 = 40.57900
+    assert_eq!(item.net_amount, Amount::<5>::parse("-40.57900").unwrap());
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-8 — proportional_split
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Verify the key invariant: Σ(parts) == total (at given scale).
+fn assert_sum_exact(
+    parts: &[rust_decimal::Decimal],
+    expected_total: rust_decimal::Decimal,
+    scale: u32,
+) {
+    let sum: rust_decimal::Decimal = parts.iter().sum();
+    let rounded_total = expected_total
+        .round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+    assert_eq!(
+        sum, rounded_total,
+        "Σ(parts) must equal total rounded to {scale}dp"
+    );
+}
+
+#[test]
+fn proportional_split_sum_invariant_three_equal() {
+    // Classic 100/3 case — exercises Hamilton remainder distribution.
+    let parts = proportional_split(dec!(100), &[dec!(0.333), dec!(0.333), dec!(0.334)], 3).unwrap();
+    assert_eq!(parts.len(), 3);
+    assert_sum_exact(&parts, dec!(100), 3);
+    // Each part is at 3dp precision.
+    for p in &parts {
+        assert_eq!(p.scale(), 3, "each part must be at 3dp");
+    }
+}
+
+#[test]
+fn proportional_split_sum_invariant_seven_way() {
+    // 100 kWh split 7 ways: 1/7 each (classic penny-distribution test).
+    let fracs = vec![rust_decimal::Decimal::ONE / rust_decimal::Decimal::from(7u32); 7];
+    let parts = proportional_split(dec!(100), &fracs, 3).unwrap();
+    assert_sum_exact(&parts, dec!(100), 3);
+}
+
+#[test]
+fn proportional_split_sum_invariant_subunit_total() {
+    // Total with more dp than scale — should be rounded first.
+    // total = 0.1, scale = 2: rounds to 0.10; split [0.33, 0.34, 0.33]
+    let parts = proportional_split(dec!(0.1), &[dec!(0.33), dec!(0.34), dec!(0.33)], 2).unwrap();
+    assert_sum_exact(&parts, dec!(0.1), 2);
+}
+
+#[test]
+fn proportional_split_hamilton_not_last_absorbs_all() {
+    // If the implementation used "dump remainder on last", the last entry in
+    // [0.33, 0.33, 0.34] would absorb the full deficit for total=1.000 at scale=3:
+    //   floor: [0.330, 0.330, 0.340] → sum=1.000, no deficit — OK here.
+    // For total=10.000:
+    //   ideal:  [3.300, 3.300, 3.400]
+    //   floor:  [3.300, 3.300, 3.400] → sum=10.000 — OK.
+    // For total=10.001 at scale=2:
+    //   total.round(2) = 10.00
+    //   ideal:  [3.30, 3.30, 3.40]
+    //   floor:  [3.30, 3.30, 3.40] → sum=10.00 — OK.
+    // Use fractions [0.9, 0.05, 0.05] with total=1.000 at scale=1:
+    //   ideal:  [0.9, 0.05, 0.05]
+    //   floor:  [0.9, 0.0, 0.0] → sum=0.9, deficit=0.1 = 1 unit at scale=1
+    //   remainders: [0.0, 0.05, 0.05] → tie; index 1 (earlier) wins
+    //   result: [0.9, 0.1, 0.0]  NOT  [0.9, 0.0, 0.1]  (last-absorbs would give [0.9,0.0,0.1])
+    let parts = proportional_split(dec!(1), &[dec!(0.9), dec!(0.05), dec!(0.05)], 1).unwrap();
+    assert_sum_exact(&parts, dec!(1), 1);
+    // Hamilton: unit goes to index 1 (tie-break by index; both have remainder=0.05)
+    assert_eq!(parts[0], dec!(0.9));
+    assert_eq!(parts[1], dec!(0.1)); // first tie-winner
+    assert_eq!(parts[2], dec!(0.0));
+}
+
+#[test]
+fn proportional_split_two_way_exact() {
+    // 50/50 split — no deficit expected.
+    let parts = proportional_split(dec!(100), &[dec!(0.5), dec!(0.5)], 3).unwrap();
+    assert_eq!(parts[0], dec!(50.000));
+    assert_eq!(parts[1], dec!(50.000));
+    assert_sum_exact(&parts, dec!(100), 3);
+}
+
+#[test]
+fn proportional_split_zero_total_all_zero() {
+    let parts = proportional_split(dec!(0), &[dec!(0.5), dec!(0.5)], 3).unwrap();
+    assert_eq!(parts[0], dec!(0.000));
+    assert_eq!(parts[1], dec!(0.000));
+    assert_sum_exact(&parts, dec!(0), 3);
+}
+
+#[test]
+fn proportional_split_single_fraction_is_total() {
+    let parts = proportional_split(dec!(42.567), &[dec!(1)], 3).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_sum_exact(&parts, dec!(42.567), 3);
+}
+
+#[test]
+fn proportional_split_large_split_sum_invariant() {
+    // 1000 kWh among 100 tenants with equal shares (1/100 each).
+    let fracs = vec![rust_decimal::Decimal::ONE / rust_decimal::Decimal::from(100u32); 100];
+    let parts = proportional_split(dec!(1000), &fracs, 3).unwrap();
+    assert_eq!(parts.len(), 100);
+    assert_sum_exact(&parts, dec!(1000), 3);
+}
+
+#[test]
+fn proportional_split_error_empty_fractions() {
+    assert!(proportional_split(dec!(100), &[], 3).is_err());
+}
+
+#[test]
+fn proportional_split_error_negative_total() {
+    assert!(proportional_split(dec!(-1), &[dec!(1.0)], 3).is_err());
+}
+
+#[test]
+fn proportional_split_error_negative_fraction() {
+    let result = proportional_split(dec!(100), &[dec!(-0.1), dec!(1.1)], 3);
+    assert!(result.is_err());
+}
+
+#[test]
+fn proportional_split_error_fractions_do_not_sum_to_one() {
+    // 0.3 + 0.3 = 0.6 — far from 1.0
+    let result = proportional_split(dec!(100), &[dec!(0.3), dec!(0.3)], 3);
+    assert!(result.is_err());
+}
+
+#[test]
+fn proportional_split_scale_zero_integer_quantities() {
+    // scale=0 → whole-number splits.
+    let parts = proportional_split(dec!(10), &[dec!(0.333), dec!(0.333), dec!(0.334)], 0).unwrap();
+    assert_sum_exact(&parts, dec!(10), 0);
+    // All parts must be whole numbers.
+    for p in &parts {
+        assert_eq!(
+            p.fract(),
+            rust_decimal::Decimal::ZERO,
+            "each part must be a whole number"
+        );
+    }
+}
+
+/// §42b EEG 2023 scenario: PV output split by building-occupant consumption fractions.
+/// Total: 987.654 kWh; three tenants with shares 45%, 35%, 20%.
+/// Key invariant: sum must equal total; no single tenant absorbs a disproportionate correction.
+#[test]
+fn proportional_split_eeg_42b_scenario() {
+    let total_kwh = dec!(987.654);
+    let fracs = [dec!(0.45), dec!(0.35), dec!(0.20)];
+    let parts = proportional_split(total_kwh, &fracs, 3).unwrap();
+
+    assert_eq!(parts.len(), 3);
+    assert_sum_exact(&parts, total_kwh, 3);
+
+    // Sanity: each part is non-negative and within expected range.
+    for (i, (&f, &p)) in fracs.iter().zip(parts.iter()).enumerate() {
+        assert!(p >= dec!(0), "part[{i}] must be non-negative");
+        // Each part should be within 0.001 (one unit at scale=3) of its ideal value.
+        let ideal = (total_kwh * f)
+            .round_dp_with_strategy(3, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+        let diff = (p - ideal).abs();
+        assert!(
+            diff <= dec!(0.001),
+            "part[{i}] ({p}) deviates from ideal ({ideal}) by {diff}"
+        );
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FR-5 — mixed-rate tax document (tag-based tax exemption)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// German prosumer billing: 19% VAT on grid charges, 0% (exempt) on PV feed-in.
+/// Uses FixedRateTax::with_tag to restrict VAT to "grid"-tagged positions only.
+#[test]
+fn mixed_rate_vat_grid_and_feedin_in_one_document() {
+    let positions = vec![
+        // Grid charge: subject to 19% VAT.
+        LineItem::debit("Netzentgelt")
+            .fixed_amount(Amount::parse("100.00000").unwrap())
+            .tag("grid")
+            .build()
+            .unwrap(),
+        // PV feed-in credit: 0% VAT (§12 Abs. 3 Nr. 1 UStG / Photovoltaik).
+        LineItem::credit_for_usage(
+            "EEG Einspeisevergütung",
+            dec!(500),
+            "kWh",
+            dec!(0.0811),
+            "EUR/kWh",
+        )
+        .build()
+        .unwrap(), // No "grid" tag → excluded from VAT base.
+    ];
+
+    // 19% VAT applies ONLY to grid-tagged positions.
+    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
+        FixedRateTax::new("MwSt 19%", dec!(0.19)).with_tag("grid"),
+    )];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
+
+    // net = 100.00 (grid) + (-40.55) (feed-in) = 59.45
+    assert_eq!(doc.net_total(), Amount::parse("59.45000").unwrap());
+    // VAT base = only grid-tagged = 100.00; tax = 100 × 0.19 = 19.00
+    assert_eq!(doc.tax_total(), Amount::parse("19.00000").unwrap());
+    // gross = 59.45 + 19.00 = 78.45
+    assert_eq!(doc.gross_total(), Amount::parse("78.45000").unwrap());
+    doc.assert_valid();
+}
+
+/// Verify that untagged positions are completely invisible to a tagged TaxLayer.
+#[test]
+fn tagged_tax_layer_excludes_untagged_positions_exactly() {
+    let positions = vec![
+        LineItem::fixed("Tagged", Amount::parse("200.00000").unwrap())
+            .tag("commodity")
+            .build()
+            .unwrap(),
+        LineItem::fixed("Untagged", Amount::parse("300.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
+        FixedRateTax::new("VAT 10%", dec!(0.10)).with_tag("commodity"),
+    )];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
+    // Only 200 in base; VAT = 200 × 0.10 = 20.
+    assert_eq!(doc.tax_total(), Amount::parse("20.00000").unwrap());
+    doc.assert_valid();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUG-1 / BUG-4 regression guards — ensure fixes are not regressed
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// BUG-1: checked_from_decimal must return the offending input value on overflow.
+#[test]
+fn checked_from_decimal_overflow_carries_input_value() {
+    // Construct a Decimal that is just above Amount<5>::MAX.
+    // MAX raw = i64::MAX = 9_223_372_036_854_775_807 → display = 92233720368547.75807
+    // One extra fractional unit pushes it over.
+    let overflow_d = rust_decimal::Decimal::from_str_exact("92233720368547.75808").unwrap();
+    match Amount::<5>::checked_from_decimal(overflow_d) {
+        Err(BillingError::MonetaryOverflow {
+            input_value: Some(v),
+            precision: 5,
+        }) => {
+            assert_eq!(
+                v, overflow_d,
+                "input_value must carry the offending Decimal"
+            );
+        }
+        other => panic!("expected MonetaryOverflow with input_value, got {other:?}"),
+    }
+}
+
+/// BUG-4: RateLookup::builder().build() with zero entries must return Err, not panic.
+#[test]
+fn rate_lookup_empty_builder_returns_err_not_panics() {
+    let result = RateLookup::builder().build();
+    assert!(
+        result.is_err(),
+        "empty RateLookup builder must return Err(InvalidSchedule), not panic"
+    );
+    if let Err(BillingError::InvalidSchedule { reason }) = result {
+        assert!(
+            reason.contains("at least one entry"),
+            "error reason should explain the requirement"
+        );
+    }
 }

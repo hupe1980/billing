@@ -62,6 +62,42 @@ impl FixedRateTax {
 
     #[must_use]
     /// Restrict the tax base to positions carrying `tag`.
+    ///
+    /// Only positions tagged with `tag` contribute to this layer's tax base.
+    /// Positions without the tag are completely excluded — they are effectively
+    /// tax-exempt for this layer.
+    ///
+    /// # Mixed-rate documents (e.g. German prosumer billing)
+    ///
+    /// To apply different VAT rates to different line items in the same document,
+    /// tag items by their VAT treatment and add one `FixedRateTax` per applicable rate:
+    ///
+    /// ```rust
+    /// use billing::tax::FixedRateTax;
+    /// use billing::{LineItem, Amount, BillingDocument, DocumentMeta};
+    /// use rust_decimal_macros::dec;
+    ///
+    /// // Two positions: grid charges (19% VAT) + PV feed-in credit (0% / tax-exempt)
+    /// let positions = vec![
+    ///     LineItem::debit("Netzentgelt")
+    ///         .fixed_amount(Amount::parse("100.00000").unwrap())
+    ///         .tag("grid")
+    ///         .build().unwrap(),
+    ///     LineItem::credit_for_usage("EEG Einspeisevergütung", dec!(500), "kWh",
+    ///                                dec!(0.0811), "EUR/kWh")
+    ///         // No "grid" tag → excluded from the 19% VAT layer below.
+    ///         .build().unwrap(),
+    /// ];
+    /// // Only grid-tagged items are subject to 19% VAT:
+    /// let vat = FixedRateTax::new("MwSt 19%", dec!(0.19)).with_tag("grid");
+    /// // Items without "grid" tag contribute zero to the VAT base.
+    /// let taxes: Vec<Box<dyn billing::TaxLayer>> = vec![Box::new(vat)];
+    /// let doc = BillingDocument::from_positions(
+    ///     DocumentMeta::default(), positions, taxes, vec![],
+    /// ).unwrap();
+    /// // VAT = 100.00 × 0.19 = 19.00 (feed-in credit not in base)
+    /// assert_eq!(doc.tax_total(), Amount::parse("19.00000").unwrap());
+    /// ```
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.require_tag = Some(tag.into());
         self
