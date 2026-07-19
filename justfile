@@ -117,7 +117,7 @@ release-dry-run:
     cargo publish --dry-run --allow-dirty
 
 # Tag a new release. Creates an annotated git tag; push it to trigger CI+publish.
-# Usage: just release 0.9.0
+# Usage: just release 0.7.0
 release VERSION:
     @echo "Tagging v{{ VERSION }} …"
     @grep -q 'version.*=.*"{{ VERSION }}"' Cargo.toml \

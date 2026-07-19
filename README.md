@@ -61,7 +61,7 @@ rounding — and leaves every domain decision to your crate.
 ```toml
 # Cargo.toml
 [dependencies]
-billing = "0.9"
+billing = "0.7"
 
 [dev-dependencies]
 # `dec!` lives in rust_decimal itself behind the `macros` feature.
@@ -1163,7 +1163,7 @@ on any document carrying a VAT breakdown.
 Enable the `serde` feature for `Serialize`/`Deserialize` on all public types:
 
 ```toml
-billing = { version = "0.9", features = ["serde"] }
+billing = { version = "0.7", features = ["serde"] }
 ```
 
 Two properties matter for a monetary type:
@@ -1252,7 +1252,7 @@ just lint            # cargo clippy -D warnings
 just doc             # build & open docs
 just examples        # run all three examples
 just bench           # criterion benchmarks
-just release 0.9.0   # create an annotated git tag
+just release 0.7.0   # create an annotated git tag
 ```
 
 Correctness is covered at three levels: ~400 example-based tests, **property-based
