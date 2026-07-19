@@ -1,7 +1,7 @@
 //! [`Amount<P>`] — fixed-point monetary arithmetic with compile-time precision.
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 use crate::error::{BillingError, ParseAmountError};
@@ -9,7 +9,8 @@ use crate::error::{BillingError, ParseAmountError};
 // ── RoundingStrategy ─────────────────────────────────────────────────────────
 
 /// Explicit rounding strategy. Always required — no hidden defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoundingStrategy {
     /// Rounds midpoint 0.5 away from zero (also known as commercial or
     /// half-up rounding). The most common choice for invoicing.
@@ -70,10 +71,21 @@ impl From<RoundingStrategy> for rust_decimal::RoundingStrategy {
 /// let _: InvoiceAmt  = billing::Amount::parse("49.99").unwrap();   // 2 dp
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[must_use = "Amount is an immutable value; every operation returns a new one"]
 pub struct Amount<const P: u8>(i64);
 
 impl<const P: u8> Amount<P> {
+    /// Compile-time guard: `10^P` must fit in `i64`, so `P ≤ 18`.
+    ///
+    /// Referenced from [`Amount::SCALE`] so that any use of an out-of-range
+    /// precision fails during const evaluation with this message rather than
+    /// with a bare "attempt to compute `1000000000000000000_i64 * 10_i64`,
+    /// which would overflow".
+    const PRECISION_SUPPORTED: () = assert!(
+        P <= 18,
+        "Amount<P>: P must be <= 18 — 10^19 exceeds i64::MAX and cannot be represented"
+    );
+
     /// Zero amount.
     pub const ZERO: Self = Self(0);
 
@@ -89,6 +101,9 @@ impl<const P: u8> Amount<P> {
     pub const MIN: Self = Self(i64::MIN);
 
     pub(crate) const SCALE: i64 = {
+        // Force the precision assertion to evaluate before the multiplication
+        // below, so an out-of-range P reports the explanatory message.
+        let () = Self::PRECISION_SUPPORTED;
         let mut s = 1i64;
         let mut i = 0u8;
         while i < P {
@@ -211,15 +226,29 @@ impl<const P: u8> Amount<P> {
 
     /// Construct from a `rust_decimal::Decimal`. Returns `None` on overflow.
     ///
-    /// The value is first **rounded** to `P` decimal places using `MidpointAwayFromZero`,
-    /// then scaled. Returns `None` only when the scaled integer overflows `i64`.
+    /// The value is scaled by `10^P` and then rounded to an integer with
+    /// `MidpointAwayFromZero` — equivalent to rounding to `P` decimal places, but
+    /// note the scale-first order slightly narrows the accepted range near
+    /// `Decimal::MAX`. Returns `None` when the scaled integer overflows `i64`, or
+    /// when the intermediate `Decimal` multiplication overflows its 96-bit mantissa.
     ///
     /// For a `Result`-returning version that works with `?`, use
     /// [`Amount::checked_from_decimal`].
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// use rust_decimal::Decimal;
+    /// // Never panics, even at the extremes of Decimal's range.
+    /// assert_eq!(Amount::<5>::from_decimal(Decimal::MAX), None);
+    /// assert_eq!(Amount::<5>::from_decimal(Decimal::MIN), None);
+    /// ```
     #[must_use]
     pub fn from_decimal(d: Decimal) -> Option<Self> {
-        let scaled = d * Decimal::from(Self::SCALE);
-        scaled
+        // `Decimal`'s `Mul` impl PANICS on overflow rather than saturating, so the
+        // checked form is mandatory here: this constructor is documented as
+        // returning `None`, and `checked_from_decimal` / `checked_mul_qty` /
+        // `LineItem::build` all funnel their fallible paths through it.
+        d.checked_mul(Decimal::from(Self::SCALE))?
             .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
             .to_i64()
             .map(Self)
@@ -253,26 +282,18 @@ impl<const P: u8> Amount<P> {
 
     /// Convert to `rust_decimal::Decimal` (lossless, exact).
     ///
-    /// Also available as [`Amount::to_decimal`] for use in non-consuming contexts.
-    #[must_use]
-    pub fn into_decimal(self) -> Decimal {
-        Decimal::new(self.0, P as u32)
-    }
-
-    /// Convert to `rust_decimal::Decimal` (lossless, exact).
-    ///
-    /// Equivalent to [`Amount::into_decimal`]; provided as a non-consuming form
-    /// for use in method chains where `self` cannot be moved.
+    /// `Amount` is `Copy`, so this borrows nothing and consumes nothing despite the
+    /// `into_` prefix. `Decimal::from(amount)` is equivalent.
     ///
     /// ```rust
     /// use billing::Amount;
     /// let a = Amount::<5>::parse("1.23456").unwrap();
-    /// let d: rust_decimal::Decimal = a.to_decimal();
-    /// assert_eq!(d, rust_decimal::Decimal::from_str_exact("1.23456").unwrap());
+    /// assert_eq!(a.into_decimal(), rust_decimal::Decimal::from_str_exact("1.23456").unwrap());
+    /// assert_eq!(a.into_decimal(), a.into_decimal()); // Copy: usable repeatedly
     /// ```
     #[must_use]
-    pub fn to_decimal(self) -> Decimal {
-        self.into_decimal()
+    pub fn into_decimal(self) -> Decimal {
+        Decimal::new(self.0, P as u32)
     }
 
     /// Checked addition. Returns `Err` on overflow.
@@ -318,23 +339,270 @@ impl<const P: u8> Amount<P> {
     /// # Panics
     /// Panics if the result exceeds the representable `i64` range.
     /// Use [`Amount::checked_mul_qty`] for a fallible alternative.
-    #[must_use]
     pub fn mul_qty(self, qty: Decimal) -> Self {
         self.checked_mul_qty(qty)
             .expect("monetary overflow in mul_qty")
     }
 
     /// Multiply by a quantity, returning `Err` on overflow.
+    ///
+    /// Never panics — including when `qty` is at the extremes of `Decimal`'s range.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// use rust_decimal::Decimal;
+    /// let price = Amount::<5>::parse("1000000.00000").unwrap();
+    /// assert!(price.checked_mul_qty(Decimal::MAX).is_err());
+    /// ```
     pub fn checked_mul_qty(self, qty: Decimal) -> Result<Self, BillingError> {
-        let price_d = self.into_decimal();
-        let product = (price_d * qty).round_dp_with_strategy(
-            P as u32,
-            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-        );
+        // `Decimal * Decimal` panics on overflow, which would break this method's
+        // documented `Result` contract — use the checked form.
+        let product = self
+            .into_decimal()
+            .checked_mul(qty)
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })?
+            .round_dp_with_strategy(
+                P as u32,
+                rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+            );
         Self::from_decimal(product).ok_or(BillingError::MonetaryOverflow {
             precision: P,
             input_value: None,
         })
+    }
+
+    /// Divide by a `Decimal` divisor, returning `Err` on overflow or division by zero.
+    ///
+    /// The quotient is rounded to `P` decimal places with `MidpointAwayFromZero`.
+    /// Useful for deriving a unit price from a total (`total / quantity`).
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// use rust_decimal::dec;
+    /// let total = Amount::<5>::parse("100.00000").unwrap();
+    /// assert_eq!(total.checked_div(dec!(4)).unwrap(), Amount::parse("25.00000").unwrap());
+    /// assert!(total.checked_div(dec!(0)).is_err());
+    /// ```
+    pub fn checked_div(self, divisor: Decimal) -> Result<Self, BillingError> {
+        // `Decimal`'s `/` panics on both overflow and division by zero.
+        let q = self
+            .into_decimal()
+            .checked_div(divisor)
+            .ok_or(BillingError::InvalidInput {
+                reason: format!("division by zero or overflow: {self} / {divisor}"),
+            })?
+            .round_dp_with_strategy(
+                P as u32,
+                rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+            );
+        Self::from_decimal(q).ok_or(BillingError::MonetaryOverflow {
+            precision: P,
+            input_value: None,
+        })
+    }
+
+    /// Split into `n` parts that sum **exactly** back to `self`.
+    ///
+    /// The indivisible remainder is spread one smallest-unit at a time across the
+    /// leading parts, so parts differ by at most `10⁻ᴾ` and no part absorbs the
+    /// whole remainder. This is the monetary-allocation problem from Fowler's
+    /// *Patterns of Enterprise Application Architecture*; naive `total / n`
+    /// silently loses or invents money.
+    ///
+    /// For a negative `self` the remainder is distributed in the same direction,
+    /// so the sum still reconstructs the original exactly.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// // 0.10 split three ways: 0.04 + 0.03 + 0.03 — not 0.033... three times.
+    /// let parts = Amount::<2>::parse("0.10").unwrap().distribute(3).unwrap();
+    /// assert_eq!(parts.len(), 3);
+    /// assert_eq!(parts[0], Amount::<2>::parse("0.04").unwrap());
+    /// assert_eq!(parts[1], Amount::<2>::parse("0.03").unwrap());
+    /// let sum: Amount<2> = parts.into_iter().sum();
+    /// assert_eq!(sum, Amount::<2>::parse("0.10").unwrap());
+    /// ```
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if `n == 0`.
+    pub fn distribute(self, n: usize) -> Result<Vec<Self>, BillingError> {
+        if n == 0 {
+            return Err(BillingError::InvalidInput {
+                reason: "distribute requires n > 0".into(),
+            });
+        }
+        // `as` would truncate (and flip the sign of the division) for n >= 2^63.
+        // Unreachable in practice — the Vec allocation dies first — but an explicit
+        // bound is cheaper than the reasoning needed to prove that.
+        let n_i = i64::try_from(n).map_err(|_| BillingError::InvalidInput {
+            reason: format!("distribute: n = {n} is too large"),
+        })?;
+        // Truncating division plus an explicitly distributed remainder keeps the
+        // sum exact for both signs (Rust's `/` and `%` truncate toward zero, so
+        // `base * n + rem == self.0` always holds).
+        let base = self.0 / n_i;
+        let rem = self.0 % n_i;
+        let step = if rem >= 0 { 1 } else { -1 };
+        let extra = rem.unsigned_abs() as usize;
+        Ok((0..n)
+            .map(|i| Self(if i < extra { base + step } else { base }))
+            .collect())
+    }
+
+    /// Split proportionally to integer `ratios`, summing **exactly** back to `self`.
+    ///
+    /// Uses the largest-remainder method: each part gets `floor(self × ratio / Σratios)`
+    /// and the remaining smallest-units go to the parts with the largest fractional
+    /// remainders, ties broken by position.
+    ///
+    /// Prefer this over [`crate::proportional_split`] when the thing being split is
+    /// money rather than a physical quantity, and over `checked_mul_qty` with
+    /// fractional shares when the shares are naturally integral (seats, days, units).
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// // A 100.00 bill split 1:1:1 — someone has to take the extra cent.
+    /// let parts = Amount::<2>::parse("100.00").unwrap().allocate(&[1, 1, 1]).unwrap();
+    /// assert_eq!(parts[0], Amount::<2>::parse("33.34").unwrap());
+    /// assert_eq!(parts[1], Amount::<2>::parse("33.33").unwrap());
+    /// let sum: Amount<2> = parts.into_iter().sum();
+    /// assert_eq!(sum, Amount::<2>::parse("100.00").unwrap());
+    /// ```
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if `ratios` is empty or sums to zero.
+    pub fn allocate(self, ratios: &[u64]) -> Result<Vec<Self>, BillingError> {
+        if ratios.is_empty() {
+            return Err(BillingError::InvalidInput {
+                reason: "allocate requires at least one ratio".into(),
+            });
+        }
+        let total_ratio: u128 = ratios.iter().map(|r| *r as u128).sum();
+        if total_ratio == 0 {
+            return Err(BillingError::InvalidInput {
+                reason: "allocate requires the ratios to sum to more than zero".into(),
+            });
+        }
+        // Work on the magnitude in i128 so the sign is handled uniformly and the
+        // intermediate `raw × ratio` cannot overflow.
+        let neg = self.0 < 0;
+        let magnitude = (self.0 as i128).unsigned_abs();
+
+        let mut parts = Vec::with_capacity(ratios.len());
+        let mut remainders = Vec::with_capacity(ratios.len());
+        let mut allocated: u128 = 0;
+        for &r in ratios {
+            let numer = magnitude * r as u128;
+            let q = numer / total_ratio;
+            remainders.push(numer % total_ratio);
+            allocated += q;
+            parts.push(q);
+        }
+        // Hand out the shortfall one unit at a time, largest remainder first.
+        let mut order: Vec<usize> = (0..ratios.len()).collect();
+        order.sort_by(|&a, &b| remainders[b].cmp(&remainders[a]).then_with(|| a.cmp(&b)));
+        let mut shortfall = magnitude - allocated;
+        for &idx in order.iter() {
+            if shortfall == 0 {
+                break;
+            }
+            parts[idx] += 1;
+            shortfall -= 1;
+        }
+
+        parts
+            .into_iter()
+            .map(|p| {
+                let signed = if neg { -(p as i128) } else { p as i128 };
+                i64::try_from(signed)
+                    .map(Self)
+                    .map_err(|_| BillingError::MonetaryOverflow {
+                        precision: P,
+                        input_value: None,
+                    })
+            })
+            .collect()
+    }
+
+    /// Round to the nearest multiple of `increment` — cash rounding.
+    ///
+    /// Several jurisdictions require the *payable* total to be rounded to a coarser
+    /// step than the currency's minor unit, because the smallest coins were
+    /// withdrawn: Switzerland rounds to 0.05 CHF (*Rappenrundung*), Sweden and
+    /// Canada to their own 0.05 steps. Only the amount actually tendered is
+    /// rounded — line items and the VAT breakdown keep full precision.
+    ///
+    /// See [`crate::CashRounding`] for the document-level helper that also records
+    /// the rounding difference as its own line.
+    ///
+    /// ```rust
+    /// use billing::{Amount, RoundingStrategy};
+    /// let increment = Amount::<5>::parse("0.05000").unwrap();
+    /// let total     = Amount::<5>::parse("12.34000").unwrap();
+    /// assert_eq!(
+    ///     total.round_to_increment(increment, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+    ///     Amount::<5>::parse("12.35000").unwrap()
+    /// );
+    /// ```
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if `increment` is not strictly positive.
+    pub fn round_to_increment(
+        self,
+        increment: Self,
+        strategy: RoundingStrategy,
+    ) -> Result<Self, BillingError> {
+        if !increment.is_positive() {
+            return Err(BillingError::InvalidInput {
+                reason: format!("cash-rounding increment must be > 0, got {increment}"),
+            });
+        }
+        // Exact integer arithmetic in i128: no Decimal, no float, no overflow.
+        let value = self.0 as i128;
+        let step = increment.0 as i128;
+        let q = value.div_euclid(step);
+        let r = value.rem_euclid(step); // always in [0, step)
+
+        // `q` is the floor multiple and `r` the non-negative distance above it, so
+        // every strategy below is expressed as "do we take the next step up?".
+        let twice = r * 2;
+        let round_up = match strategy {
+            RoundingStrategy::Floor => false,
+            RoundingStrategy::Ceiling => r != 0,
+            RoundingStrategy::Truncate => {
+                // Toward zero: for negatives the floor multiple is further from
+                // zero, so truncation moves up; for positives it stays.
+                value < 0 && r != 0
+            }
+            RoundingStrategy::MidpointAwayFromZero => {
+                if value >= 0 {
+                    twice >= step
+                } else {
+                    twice > step
+                }
+            }
+            RoundingStrategy::MidpointToEven => match twice.cmp(&step) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => q.rem_euclid(2) != 0,
+            },
+        };
+        let multiple = if round_up { q + 1 } else { q };
+        let scaled = multiple
+            .checked_mul(step)
+            .ok_or(BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })?;
+        i64::try_from(scaled)
+            .map(Self)
+            .map_err(|_| BillingError::MonetaryOverflow {
+                precision: P,
+                input_value: None,
+            })
     }
 
     /// Round to a different precision.
@@ -343,7 +611,6 @@ impl<const P: u8> Amount<P> {
     /// Panics on overflow — see [`Amount::checked_round_to`] for a non-panicking version.
     /// Overflow can occur when converting to a **higher** precision (`Q > P`) for values
     /// near `Amount::<P>::MAX`.
-    #[must_use]
     pub fn round_to<const Q: u8>(self, strategy: RoundingStrategy) -> Amount<Q> {
         self.checked_round_to(strategy)
             .expect("monetary overflow in round_to: use checked_round_to for large values")
@@ -384,7 +651,6 @@ impl<const P: u8> Amount<P> {
     /// use billing::Amount;
     /// assert_eq!(Amount::<5>::from_int(49), Amount::parse("49.00000").unwrap());
     /// ```
-    #[must_use]
     pub fn from_int(n: i64) -> Self {
         Self(
             n.checked_mul(Self::SCALE)
@@ -433,7 +699,6 @@ impl<const P: u8> Amount<P> {
     /// let price = Amount::<5>::from_raw_units(3_456);
     /// assert_eq!(price, Amount::parse("0.03456").unwrap());
     /// ```
-    #[must_use]
     pub fn from_raw_units(n: i64) -> Self {
         Self(n)
     }
@@ -477,7 +742,6 @@ impl<const P: u8> Amount<P> {
     /// Panics if `self` equals `Amount(i64::MIN)` (the minimum value has no
     /// positive counterpart in `i64`). Use [`Amount::checked_abs`] for a
     /// non-panicking version.
-    #[must_use]
     pub fn abs(self) -> Self {
         Self(
             self.0
@@ -522,7 +786,7 @@ impl<const P: u8> Amount<P> {
     /// use billing::Amount;
     /// let stated   = Amount::<5>::parse("100.00000").unwrap();
     /// let computed = Amount::<5>::parse("100.50000").unwrap();
-    /// // 0.5 / 100.0 = 0.5 % = 5_000 ppm — within 10_000 ppm (1 %)
+    /// // |100.0 − 100.5| / 100.5 ≈ 0.4975 % ≈ 4_975 ppm — within 10_000 ppm (1 %)
     /// assert!(stated.within_tolerance_ppm(computed, 10_000).unwrap());
     /// // 0.5 % exceeds a 4_000 ppm (0.4 %) window
     /// assert!(!stated.within_tolerance_ppm(computed, 4_000).unwrap());
@@ -548,6 +812,48 @@ impl<const P: u8> Amount<P> {
     }
 }
 
+// ── serde ─────────────────────────────────────────────────────────────────────
+//
+// `Amount<P>` is serialised as a **decimal string** with exactly `P` fractional
+// digits (`"0.03456"`), not as its raw scaled `i64`.
+//
+// The derived tuple-struct impl would emit the raw integer (`3456`), which is
+// wrong in three ways for a monetary type:
+//   • it is meaningless without knowing P out-of-band — `3456` is 0.03456 at
+//     P=5 and 34.56 at P=2, so a change of precision silently rescales every
+//     stored value by 10^ΔP;
+//   • it does not interoperate with any invoice interchange format (BO4E, UBL,
+//     EDIFACT, JSON APIs) — all of which carry money as decimal text;
+//   • JSON numbers invite float round-tripping, which is exactly what a
+//     fixed-point monetary type exists to prevent.
+//
+// Deserialisation accepts strings only, and goes through `Amount::parse`, so
+// excess non-zero precision is rejected rather than silently truncated.
+
+#[cfg(feature = "serde")]
+impl<const P: u8> serde::Serialize for Amount<P> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, const P: u8> serde::Deserialize<'de> for Amount<P> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<const P: u8>;
+        impl<const P: u8> serde::de::Visitor<'_> for V<P> {
+            type Value = Amount<P>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a decimal string with at most {P} fractional digits")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Amount::<P>::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_str(V::<P>)
+    }
+}
+
 impl<const P: u8> fmt::Debug for Amount<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -560,9 +866,65 @@ impl<const P: u8> fmt::Debug for Amount<P> {
 }
 
 impl<const P: u8> fmt::Display for Amount<P> {
+    /// Renders with exactly `P` decimal places, honouring the formatter's
+    /// **width, fill and alignment** — so `{:>12}` and `{:*^14}` align invoice
+    /// columns as expected.
+    ///
+    /// Like the primitive integer types, and unlike `str`, an `Amount` defaults to
+    /// **right** alignment: numbers line up on their decimal point in a column.
+    ///
+    /// The formatter's *precision* (`{:.2}`) is deliberately ignored. The number of
+    /// decimals is part of the type, and honouring `{:.2}` would round without an
+    /// explicit [`RoundingStrategy`] — the one thing this crate never does
+    /// implicitly. Use [`Amount::round_to`] to change precision.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    /// let a = Amount::<5>::parse("4.00000").unwrap();
+    /// assert_eq!(format!("[{a:>12}]"), "[     4.00000]");
+    /// assert_eq!(format!("[{a:<12}]"), "[4.00000     ]");
+    /// assert_eq!(format!("[{a:*^13}]"), "[***4.00000***]");
+    /// assert_eq!(format!("[{a}]"), "[4.00000]");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:.prec$}", self.into_decimal(), prec = P as usize)
+        let body = format!("{:.prec$}", self.into_decimal(), prec = P as usize);
+        pad_numeric(f, &body)
     }
+}
+
+/// Pad `body` per the formatter's width, fill and alignment, defaulting to right
+/// alignment as the numeric primitives do.
+///
+/// `Formatter::pad` is not usable here: it defaults to *left* alignment and it
+/// truncates to the formatter's precision, which would mangle a number into
+/// something like `"4."`. Writing through `write!` with an inline precision — what
+/// this impl used to do — silently discards width, fill and alignment altogether,
+/// so `{:>12}` was a no-op and invoice columns never lined up.
+fn pad_numeric(f: &mut fmt::Formatter<'_>, body: &str) -> fmt::Result {
+    let width = match f.width() {
+        Some(w) => w,
+        None => return f.write_str(body),
+    };
+    let len = body.chars().count();
+    if len >= width {
+        return f.write_str(body);
+    }
+    let padding = width - len;
+    let fill = f.fill();
+    let (before, after) = match f.align() {
+        Some(fmt::Alignment::Left) => (0, padding),
+        Some(fmt::Alignment::Center) => (padding / 2, padding - padding / 2),
+        // Numbers default to right alignment, matching i64/f64.
+        Some(fmt::Alignment::Right) | None => (padding, 0),
+    };
+    for _ in 0..before {
+        f.write_char(fill)?;
+    }
+    f.write_str(body)?;
+    for _ in 0..after {
+        f.write_char(fill)?;
+    }
+    Ok(())
 }
 
 impl<const P: u8> std::ops::Neg for Amount<P> {

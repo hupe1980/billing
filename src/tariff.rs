@@ -21,7 +21,7 @@ use crate::tax::{DiscountLayer, TaxLayer};
 /// use billing::{Tariff, LineItem, Amount, TaxLayer, DiscountLayer};
 /// use billing::tax::FixedRateTax;
 /// use billing::document::DocumentMeta;
-/// use rust_decimal_macros::dec;
+/// use rust_decimal::dec;
 ///
 /// struct PlatformTariff { monthly_fee_eur: u32 }
 ///
@@ -38,7 +38,7 @@ use crate::tax::{DiscountLayer, TaxLayer};
 ///     }
 ///
 ///     fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
-///         vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))]
+///         vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())]
 ///     }
 /// }
 /// ```

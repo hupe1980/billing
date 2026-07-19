@@ -17,7 +17,7 @@
 //!
 //! ```rust
 //! use billing::{RateLookup, Amount};
-//! use rust_decimal_macros::dec;
+//! use rust_decimal::dec;
 //!
 //! let lookup = RateLookup::builder()
 //!     .at_most(dec!(10),  Amount::parse("0.00811").unwrap())
@@ -56,10 +56,37 @@ struct RateLookupEntry {
 ///
 /// # See also
 /// [`RateLookupBuilder`] — construct via [`RateLookup::builder`].
+///
+/// # Validation on deserialisation
+///
+/// `RateLookup` deserialises through [`RateLookupBuilder::build`], so a table
+/// loaded from config is sorted and validated identically to one built in code.
+/// Without this, unsorted deserialised entries would make `rate_for` return the
+/// wrong rate — a silent mispricing.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RateLookupRepr"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLookup {
     entries: Vec<RateLookupEntry>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RateLookupRepr {
+    entries: Vec<RateLookupEntry>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RateLookupRepr> for RateLookup {
+    type Error = BillingError;
+    fn try_from(r: RateLookupRepr) -> Result<Self, Self::Error> {
+        RateLookupBuilder {
+            entries: r.entries,
+            has_fallback: false,
+            duplicate_fallback: false,
+        }
+        .build()
+    }
 }
 
 impl RateLookup {
@@ -99,6 +126,7 @@ impl RateLookup {
 pub struct RateLookupBuilder {
     entries: Vec<RateLookupEntry>,
     has_fallback: bool,
+    duplicate_fallback: bool,
 }
 
 impl RateLookupBuilder {
@@ -107,14 +135,11 @@ impl RateLookupBuilder {
     /// Entries should be added in **ascending** `upper_bound` order for
     /// clarity, but [`build`](RateLookupBuilder::build) sorts them automatically.
     ///
-    /// # Panics
-    /// Panics if `upper_bound <= 0` (non-positive capacity makes no sense).
+    /// Invalid bounds are reported by [`build`](RateLookupBuilder::build) as an
+    /// `Err`, not by panicking here — a rate table is frequently assembled from
+    /// external configuration, where a bad value must be a recoverable error.
     #[must_use]
     pub fn at_most(mut self, upper_bound: Decimal, rate: Amount<5>) -> Self {
-        assert!(
-            upper_bound > Decimal::ZERO,
-            "RateLookup upper_bound must be positive (got {upper_bound})"
-        );
         self.entries.push(RateLookupEntry { upper_bound, rate });
         self
     }
@@ -122,16 +147,14 @@ impl RateLookupBuilder {
     /// Add a catch-all entry that matches any parameter not covered by
     /// previous `at_most` entries. Equivalent to `at_most(Decimal::MAX, rate)`.
     ///
-    /// Only one fallback is allowed; calling this twice panics.
-    ///
-    /// # Panics
-    /// Panics if called more than once.
+    /// Only one fallback is allowed; a second call is reported by
+    /// [`build`](RateLookupBuilder::build) as an `Err`.
     #[must_use]
     pub fn fallback(mut self, rate: Amount<5>) -> Self {
-        assert!(
-            !self.has_fallback,
-            "RateLookup: fallback() may only be called once"
-        );
+        if self.has_fallback {
+            // Mark the duplicate with a sentinel the build() check detects.
+            self.duplicate_fallback = true;
+        }
         self.has_fallback = true;
         self.entries.push(RateLookupEntry {
             upper_bound: Decimal::MAX,
@@ -146,19 +169,52 @@ impl RateLookupBuilder {
     /// the most specific (lowest) matching bound.
     ///
     /// # Errors
-    /// [`BillingError::InvalidSchedule`] if no entries have been added.
+    /// [`BillingError::InvalidSchedule`] if:
+    /// - no entries have been added,
+    /// - any `upper_bound` is non-positive,
+    /// - two entries share an `upper_bound` (the later one is unreachable), or
+    /// - [`fallback`](RateLookupBuilder::fallback) was called more than once.
     pub fn build(mut self) -> Result<RateLookup, BillingError> {
         if self.entries.is_empty() {
             return Err(BillingError::InvalidSchedule {
                 reason: "RateLookup must have at least one entry".into(),
             });
         }
+        if self.duplicate_fallback {
+            return Err(BillingError::InvalidSchedule {
+                reason: "RateLookup: fallback() may only be called once".into(),
+            });
+        }
+        for e in &self.entries {
+            if e.upper_bound <= Decimal::ZERO {
+                return Err(BillingError::InvalidSchedule {
+                    reason: format!(
+                        "RateLookup upper_bound must be positive, got {}",
+                        e.upper_bound
+                    ),
+                });
+            }
+        }
         // Sort ascending so rate_for finds the lowest matching upper_bound first.
-        self.entries.sort_by(|a, b| {
-            a.upper_bound
-                .partial_cmp(&b.upper_bound)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // `Decimal: Ord`, so a total ordering is available — the previous
+        // `partial_cmp(..).unwrap_or(Equal)` silently treated incomparable pairs
+        // as equal, which for a total order was dead code hiding intent.
+        // `sort_by_key` is valid here because `Decimal` is `Copy`.
+        self.entries.sort_by_key(|e| e.upper_bound);
+        // A duplicate bound makes the second entry unreachable — almost always a
+        // config error, and silently ignoring it would misprice that band.
+        if let Some(w) = self
+            .entries
+            .windows(2)
+            .find(|w| w[0].upper_bound == w[1].upper_bound)
+        {
+            return Err(BillingError::InvalidSchedule {
+                reason: format!(
+                    "RateLookup has duplicate upper_bound {} — the second entry is unreachable",
+                    w[0].upper_bound
+                ),
+            });
+        }
         Ok(RateLookup {
             entries: self.entries,
         })
@@ -170,7 +226,7 @@ impl RateLookupBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use rust_decimal::dec;
 
     fn eeg_lookup() -> RateLookup {
         RateLookup::builder()

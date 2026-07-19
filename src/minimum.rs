@@ -13,17 +13,44 @@ use crate::line_item::LineItem;
 ///
 /// The returned `LineItem` is tagged `"minimum-charge"`.
 ///
-/// # Usage pattern
+/// # Usage pattern — settle the minimum *before* taxing
+///
+/// A shortfall is part of the consideration and is therefore taxable. Compute it
+/// against the net positions, add it to them, and let the tax layers see the
+/// final base:
 ///
 /// ```rust
-/// # use billing::{BillingDocument, DocumentMeta, Amount, minimum_charge};
-/// # let mut doc = BillingDocument::from_positions(
-/// #     DocumentMeta::default(), vec![], vec![], vec![]).unwrap();
-/// let minimum = Amount::parse("500.00000").unwrap();
-/// if let Some(shortfall) = minimum_charge(&doc, minimum, "Mindestentgelt").unwrap() {
-///     doc = doc.with_extra_position(shortfall).unwrap();
+/// use billing::{Amount, BillingDocument, Currency, DocumentMeta, FixedRateTax,
+///               LineItem, TaxLayer, minimum_charge};
+/// use rust_decimal::dec;
+///
+/// let mut positions = vec![
+///     LineItem::fixed("Verbrauch", Amount::parse("100.00000")?).build()?,
+/// ];
+///
+/// // 1. Settle the minimum against the untaxed net.
+/// let net_only = BillingDocument::from_positions(
+///     DocumentMeta::default(), positions.clone(), vec![], vec![])?;
+/// if let Some(shortfall) =
+///     minimum_charge(&net_only, Amount::parse("110.00000")?, "Mindestentgelt")?
+/// {
+///     positions.push(shortfall);
 /// }
+///
+/// // 2. Now build the real document, so VAT applies to the shortfall too.
+/// let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)];
+/// let doc = BillingDocument::from_positions(
+///     DocumentMeta { currency: Currency::EUR, ..Default::default() },
+///     positions, taxes, vec![])?;
+///
+/// assert_eq!(doc.net_total(), Amount::parse("110.00000")?);
+/// assert_eq!(doc.tax_total(), Amount::parse("20.90000")?);   // 110 × 19%, not 100 × 19%
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// Appending the shortfall afterwards with
+/// [`BillingDocument::with_extra_position`] would leave it **untaxed**, and is
+/// refused outright on a document that carries a VAT breakdown.
 pub fn minimum_charge(
     doc: &BillingDocument,
     minimum: Amount<5>,

@@ -4,77 +4,8 @@ use std::collections::HashMap;
 
 use crate::amount::Amount;
 use crate::error::BillingError;
+use crate::period::Period;
 use crate::quantity::{Quantity, UnitPrice};
-
-// ── Period ───────────────────────────────────────────────────────────────────
-
-/// An inclusive billing period: a start/end date pair stored as ISO 8601 strings.
-///
-/// The library is date-type-agnostic: dates are `String` values and are **not parsed
-/// or validated** by the engine. Store `"YYYY-MM-DD"` dates for maximum interoperability
-/// with BO4E, EDIFACT, UBL, and German energy market standards (UStG §14, MessZV §22).
-///
-/// # Example
-/// ```rust
-/// use billing::Period;
-/// let p = Period::new("2026-06-01", "2026-06-30");
-/// assert_eq!(p.from, "2026-06-01");
-/// assert_eq!(p.to,   "2026-06-30");
-/// ```
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Period {
-    /// Start of the period (inclusive), e.g. `"2026-06-01"`.
-    pub from: String,
-    /// End of the period (inclusive), e.g. `"2026-06-30"`.
-    pub to: String,
-}
-
-impl Period {
-    /// Create a period from any `Into<String>` date strings.
-    ///
-    /// # Example
-    /// ```rust
-    /// use billing::Period;
-    /// let p = Period::new("2026-06-01", "2026-06-30");
-    /// assert_eq!(p.from, "2026-06-01");
-    /// assert_eq!(p.to,   "2026-06-30");
-    /// ```
-    #[must_use]
-    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-        }
-    }
-
-    /// Create a period from any values implementing [`std::fmt::Display`].
-    ///
-    /// More ergonomic than [`Period::new`] when working with date types that
-    /// implement [`std::fmt::Display`] but not [`Into<String>`] directly
-    /// (for example `time::Date`, `chrono::NaiveDate`, or any custom date type).
-    ///
-    /// # Example
-    /// ```rust
-    /// use billing::Period;
-    ///
-    /// // Works with anything that implements Display:
-    /// let p = Period::from_display("2026-06-01", "2026-06-30");
-    /// assert_eq!(p.from, "2026-06-01");
-    ///
-    /// // With a date type (e.g. time::Date would work here):
-    /// // let start: time::Date = ...;
-    /// // let end:   time::Date = ...;
-    /// // let p = Period::from_display(start, end);
-    /// ```
-    #[must_use]
-    pub fn from_display(from: impl std::fmt::Display, to: impl std::fmt::Display) -> Self {
-        Self {
-            from: from.to_string(),
-            to: to.to_string(),
-        }
-    }
-}
 
 /// The atomic billing unit: a single charge or credit position.
 ///
@@ -87,7 +18,20 @@ impl Period {
 /// `Sign::Credit` for credits and refunds.  Tax/discount layers should use `sign` to
 /// distinguish consumption from return positions rather than testing `net_amount < 0`,
 /// which is ambiguous after the introduction of negative unit prices.
+///
+/// # Fields are public — validation is your responsibility after mutation
+///
+/// Unlike the tax and schedule types, `LineItem`'s fields are public: it is a
+/// data record, and callers legitimately need to retag, annotate or re-period an
+/// item after construction. The invariants that [`LineItemBuilder::build`]
+/// enforces are therefore **not** guaranteed for an item built by struct literal
+/// or mutated afterwards. Call [`LineItem::validate`] if you have done either.
+///
+/// Deserialisation *is* checked: `LineItem` re-runs [`LineItem::validate`] via
+/// `#[serde(try_from)]`, so untrusted JSON cannot introduce a description-less,
+/// negative-quantity or sign-inconsistent position.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "LineItemRepr"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     /// Human-readable description shown on the invoice.
@@ -113,7 +57,129 @@ pub struct LineItem {
     pub metadata: HashMap<String, String>,
 }
 
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct LineItemRepr {
+    description: String,
+    #[serde(default)]
+    quantity: Option<Quantity>,
+    #[serde(default)]
+    unit_price: Option<UnitPrice>,
+    net_amount: Amount<5>,
+    sign: Sign,
+    #[serde(default)]
+    period: Option<Period>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LineItemRepr> for LineItem {
+    type Error = BillingError;
+    fn try_from(r: LineItemRepr) -> Result<Self, Self::Error> {
+        let item = LineItem {
+            description: r.description,
+            quantity: r.quantity,
+            unit_price: r.unit_price,
+            net_amount: r.net_amount,
+            sign: r.sign,
+            period: r.period,
+            tags: r.tags,
+            metadata: r.metadata,
+        };
+        item.validate()?;
+        Ok(item)
+    }
+}
+
+/// Round a unit price, clamping the scale to `Decimal`'s maximum.
+///
+/// `round_dp_with_strategy` silently no-ops above scale 28, which would leave the
+/// price unrounded while the caller was promised `price_scale` decimals. Clamping
+/// keeps the promise as closely as the type allows.
+fn round_price(
+    price: Decimal,
+    price_scale: u32,
+    strategy: crate::amount::RoundingStrategy,
+) -> Decimal {
+    /// `Decimal`'s maximum representable scale.
+    const MAX_DECIMAL_SCALE: u32 = 28;
+    price.round_dp_with_strategy(price_scale.min(MAX_DECIMAL_SCALE), strategy.into())
+}
+
 impl LineItem {
+    /// Set [`LineItem::sign`] to match the sign of `net_amount`.
+    ///
+    /// Positive → [`Sign::Debit`], negative → [`Sign::Credit`], zero → unchanged
+    /// (the direction of a zero-amount position carries no information).
+    ///
+    /// Needed wherever an amount is transformed in a way that can cross zero —
+    /// reversal, and the penny correction in allocation. Without it a `Credit`
+    /// line can end up with a positive `net_amount`, which
+    /// [`LineItem::validate`] rejects and which corrupts the sign-based filtering
+    /// that tax and discount layers rely on.
+    pub fn normalize_sign(&mut self) {
+        if self.net_amount.is_positive() {
+            self.sign = Sign::Debit;
+        } else if self.net_amount.is_negative() {
+            self.sign = Sign::Credit;
+        }
+    }
+
+    /// Re-check the invariants [`LineItemBuilder::build`] enforces.
+    ///
+    /// Because `LineItem`'s fields are public, an item can be constructed by
+    /// struct literal or mutated after building, bypassing those checks. This
+    /// method re-establishes them; it runs automatically on deserialisation.
+    ///
+    /// Checks:
+    /// 1. `description` is not empty or whitespace-only (an unlabelled position
+    ///    is not auditable).
+    /// 2. `quantity.value` is non-negative (refunds are modelled with
+    ///    [`Sign::Credit`], not with a negative quantity).
+    /// 3. A [`Sign::Credit`] position does not carry a positive `net_amount` —
+    ///    tax and discount layers filter on `sign`, so a "credit" that adds to
+    ///    the total would corrupt their bases.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] naming the violated invariant.
+    ///
+    /// ```rust
+    /// use billing::{LineItem, Amount};
+    /// let item = LineItem::fixed("Grundpreis", Amount::<5>::parse("8.50000").unwrap())
+    ///     .build().unwrap();
+    /// assert!(item.validate().is_ok());
+    ///
+    /// let mut broken = item.clone();
+    /// broken.description = "   ".into();
+    /// assert!(broken.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), BillingError> {
+        if self.description.trim().is_empty() {
+            return Err(BillingError::InvalidInput {
+                reason: "LineItem description must not be empty".into(),
+            });
+        }
+        if let Some(q) = &self.quantity {
+            if q.value < Decimal::ZERO {
+                return Err(BillingError::InvalidInput {
+                    reason: format!("LineItem quantity must be non-negative, got {}", q.value),
+                });
+            }
+        }
+        if self.sign == Sign::Credit && self.net_amount.is_positive() {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "LineItem with Sign::Credit must not have a positive net_amount (got {})",
+                    self.net_amount
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Start building a debit (charge) position.
     #[must_use]
     pub fn debit(description: impl Into<String>) -> LineItemBuilder {
@@ -172,7 +238,7 @@ impl LineItem {
     /// # Example
     /// ```rust
     /// use billing::{LineItem, Amount};
-    /// use rust_decimal_macros::dec;
+    /// use rust_decimal::dec;
     ///
     /// // Normal positive EPEX price
     /// let pos = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.289), "EUR/kWh")
@@ -211,7 +277,7 @@ impl LineItem {
     /// # Example
     /// ```rust
     /// use billing::{LineItem, Amount};
-    /// use rust_decimal_macros::dec;
+    /// use rust_decimal::dec;
     ///
     /// // EEG feed-in credit: 500 kWh × 0.0811 EUR/kWh → net = -40.55000
     /// let credit = LineItem::credit_for_usage(
@@ -241,12 +307,12 @@ impl LineItem {
     /// silent precision drift when prices are derived from integer arithmetic
     /// (e.g. `ct/kWh → EUR/kWh` division) that produces many non-zero decimal digits.
     ///
-    /// Use `price_scale = 6` to match the BO4E `Preis.wert` 6-dp field definition.
+    /// `price_scale` is clamped to 28, `Decimal`'s maximum scale.
     ///
     /// # Example
     /// ```rust
     /// use billing::{LineItem, Amount, RoundingStrategy};
-    /// use rust_decimal_macros::dec;
+    /// use rust_decimal::dec;
     ///
     /// // 811 ct/kWh → 0.00811 EUR/kWh (already exact); scale = 6 is a no-op here
     /// let item = LineItem::for_usage_rounded(
@@ -267,7 +333,7 @@ impl LineItem {
         strategy: crate::amount::RoundingStrategy,
     ) -> LineItemBuilder {
         use crate::quantity::{Quantity, UnitPrice};
-        let rounded_price = unit_price.round_dp_with_strategy(price_scale, strategy.into());
+        let rounded_price = round_price(unit_price, price_scale, strategy);
         LineItemBuilder::new(description.into(), Sign::Debit)
             .quantity(Quantity::new(quantity, quantity_unit))
             .unit_price(UnitPrice::new(rounded_price, price_unit))
@@ -279,12 +345,12 @@ impl LineItem {
     /// `price_scale` decimal places and sets `Sign::Credit` so the resulting
     /// `net_amount` is automatically negated.
     ///
-    /// Use `price_scale = 6` to match the BO4E `Preis.wert` 6-dp field definition.
+    /// `price_scale` is clamped to 28, `Decimal`'s maximum scale.
     ///
     /// # Example
     /// ```rust
     /// use billing::{LineItem, Amount, RoundingStrategy};
-    /// use rust_decimal_macros::dec;
+    /// use rust_decimal::dec;
     ///
     /// // EEG feed-in: 500 kWh × 8.11 ct/kWh = 0.00811 EUR/kWh → net = -4.05500
     /// let item = LineItem::credit_for_usage_rounded(
@@ -306,7 +372,7 @@ impl LineItem {
         strategy: crate::amount::RoundingStrategy,
     ) -> LineItemBuilder {
         use crate::quantity::{Quantity, UnitPrice};
-        let rounded_price = unit_price.round_dp_with_strategy(price_scale, strategy.into());
+        let rounded_price = round_price(unit_price, price_scale, strategy);
         LineItemBuilder::new(description.into(), Sign::Credit)
             .quantity(Quantity::new(quantity, quantity_unit))
             .unit_price(UnitPrice::new(rounded_price, price_unit))
@@ -344,6 +410,72 @@ impl LineItem {
     #[must_use]
     pub fn get_meta(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Scale this position by `factor`, keeping it internally consistent.
+    ///
+    /// Both `net_amount` **and** `quantity` are multiplied by `factor`; `unit_price`
+    /// is left untouched.  This preserves the invoice-line identity
+    /// `quantity × unit_price ≈ net_amount`, which naive net-only scaling breaks.
+    ///
+    /// `net_amount` is rounded to 5 dp with `strategy`.  `quantity` is scaled
+    /// exactly (no rounding) so that the displayed quantity keeps full precision.
+    ///
+    /// Used by [`crate::prorate`] and by the [`crate::AllocationRule`]
+    /// implementations.  The `description` is left unchanged — callers annotate it.
+    ///
+    /// # Example
+    /// ```rust
+    /// use billing::{LineItem, Amount, RoundingStrategy};
+    /// use rust_decimal::dec;
+    ///
+    /// let full = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
+    ///     .build().unwrap();
+    /// let half = full.scaled(dec!(0.5), RoundingStrategy::MidpointAwayFromZero).unwrap();
+    ///
+    /// // Quantity is scaled too — the line still reads correctly.
+    /// assert_eq!(half.quantity_value(), Some(dec!(500)));
+    /// assert_eq!(half.net_amount, Amount::<5>::parse("150.00000").unwrap());
+    /// ```
+    ///
+    /// # Errors
+    /// [`BillingError::MonetaryOverflow`] if the scaled amount or quantity overflows.
+    pub fn scaled(
+        &self,
+        factor: Decimal,
+        strategy: crate::amount::RoundingStrategy,
+    ) -> Result<Self, BillingError> {
+        let overflow = || BillingError::MonetaryOverflow {
+            precision: 5,
+            input_value: None,
+        };
+        let scaled_net = self
+            .net_amount
+            .into_decimal()
+            .checked_mul(factor)
+            .ok_or_else(overflow)?
+            .round_dp_with_strategy(5, strategy.into());
+        let mut out = self.clone();
+        out.net_amount = Amount::<5>::from_decimal(scaled_net).ok_or_else(overflow)?;
+        if let Some(q) = out.quantity.as_mut() {
+            // Bound the scale of the scaled quantity. An exact product such as
+            // 1000 × (1/3) carries 28 significant decimals, which both renders
+            // absurdly on an invoice ("99.99999999999999999999999999 kWh") and
+            // walks the value toward Decimal's 28-digit ceiling under repeated
+            // scaling. `QUANTITY_SCALE` is far beyond any real metering precision,
+            // so this never loses meaningful information.
+            const QUANTITY_SCALE: u32 = 12;
+            q.value = q
+                .value
+                .checked_mul(factor)
+                .ok_or_else(overflow)?
+                .round_dp_with_strategy(
+                    QUANTITY_SCALE,
+                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                )
+                .normalize();
+        }
+        Ok(out)
     }
 
     /// Returns the quantity value if present.
@@ -489,7 +621,16 @@ impl LineItemBuilder {
             }
             // Negative unit_price is allowed — it produces a negative net amount.
             // This is correct for spot-market negative prices (e.g. EPEX §27 EEG 2023).
-            let raw = qty.value * price.value;
+            //
+            // `Decimal * Decimal` panics on overflow, so the checked form is required
+            // to honour this method's `Result` contract for extreme quantities/prices.
+            let raw = qty
+                .value
+                .checked_mul(price.value)
+                .ok_or(BillingError::MonetaryOverflow {
+                    precision: 5,
+                    input_value: None,
+                })?;
             let rounded =
                 raw.round_dp_with_strategy(5, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
             Amount::<5>::from_decimal(rounded).ok_or(BillingError::MonetaryOverflow {
@@ -525,7 +666,7 @@ impl LineItemBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use rust_decimal::dec;
 
     #[test]
     fn debit_position() {

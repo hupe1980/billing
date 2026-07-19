@@ -72,8 +72,11 @@ pub enum BillingError {
 
     /// [`crate::BillingDocument::assert_valid`] detected an arithmetic inconsistency.
     ///
-    /// The `check` field identifies which invariant failed
-    /// (`"net_total"`, `"tax_total"`, or `"gross_total"`).
+    /// The `check` field identifies which invariant failed — one of
+    /// `"net_total"`, `"tax_total"`, `"gross_total"`, `"discount_total"`,
+    /// `"tax_breakdown"`, `"tax_breakdown_total"`, `"discount_positions"`,
+    /// `"prepaid"`, `"rounding"`, `"prepaid_vs_advances"`, `"net_positions"` or
+    /// `"tax_positions"`.
     ValidationFailed {
         /// Which consistency check failed.
         check: String,
@@ -97,6 +100,24 @@ pub enum BillingError {
         /// Human-readable explanation from the layer implementation.
         reason: String,
     },
+
+    /// Two amounts or documents in different currencies were combined.
+    ///
+    /// Produced by [`crate::merge_period_documents`]. Adding amounts across
+    /// currencies is never meaningful, so the engine refuses rather than silently
+    /// producing a nonsense total.
+    CurrencyMismatch {
+        /// The currency of the left-hand / first operand.
+        left: crate::currency::Currency,
+        /// The currency of the right-hand / second operand.
+        right: crate::currency::Currency,
+    },
+
+    /// An [`crate::Amount`] could not be parsed from its textual form.
+    ///
+    /// Wraps [`ParseAmountError`] so that parsing composes with `?` inside
+    /// functions returning [`BillingError`].
+    Parse(ParseAmountError),
 }
 
 impl fmt::Display for BillingError {
@@ -132,11 +153,29 @@ impl fmt::Display for BillingError {
             ),
             Self::ZeroPeriod => write!(f, "proration requires total_days > 0"),
             Self::LayerError { reason } => write!(f, "tax or discount layer error: {reason}"),
+            Self::CurrencyMismatch { left, right } => {
+                write!(f, "currency mismatch: cannot combine {left} with {right}")
+            }
+            Self::Parse(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for BillingError {}
+impl std::error::Error for BillingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Lets `Amount::parse(..)?` compose inside functions returning [`BillingError`].
+impl From<ParseAmountError> for BillingError {
+    fn from(e: ParseAmountError) -> Self {
+        Self::Parse(e)
+    }
+}
 
 /// `Infallible` → `BillingError` conversion needed when `Tariff::Error = Infallible`.
 impl From<std::convert::Infallible> for BillingError {

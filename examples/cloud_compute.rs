@@ -3,14 +3,14 @@
 //! Demonstrates:
 //! - `WeightedSumAggregator` for CPU-hours (VMs active for fractions of period)
 //! - `MaxAggregator` + `TariffSchedule::capacity()` for peak-bandwidth billing
-//! - `DynamicPricing` with `.with_unit("GB")` for spot-priced storage
+//! - `DynamicPricing` with `.with_unit("GB")?` for spot-priced storage
 //! - `BillingDocument::builder()` with extra tax layer
 //! - Domain-specific unit labels (`"CPU-h"`, `"Mbps"`, `"GB"`)
 
 use billing::aggregation::{MaxAggregator, UsageAggregator, WeightedSumAggregator};
 use billing::prelude::*;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rust_decimal::dec;
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
@@ -50,6 +50,7 @@ fn main() {
 
     let cpu_schedule = TariffSchedule::graduated()
         .unit("CPU-h")
+        .currency(Currency::EUR)
         .band(TariffBand::free_up_to(dec!(1000)).with_description("Free tier (first 1 000 CPU-h)"))
         .band(
             TariffBand::between(dec!(1000), dec!(5000), Amount::parse("0.04800").unwrap())
@@ -77,6 +78,7 @@ fn main() {
 
     let bandwidth_schedule = TariffSchedule::capacity()
         .unit("Mbps")
+        .currency(Currency::EUR)
         .band(
             TariffBand::up_to(dec!(100), Amount::parse("50.00000").unwrap())
                 .with_description("Up to 100 Mbps"),
@@ -100,9 +102,12 @@ fn main() {
         (dec!(120.0), Amount::parse("0.02100").unwrap()), // day 11–20: spot down
         (dec!(115.0), Amount::parse("0.02500").unwrap()), // day 21–31: spot up
     ];
-    let storage_item = DynamicPricing::from_intervals(storage_intervals)
+    let storage_item = DynamicPricing::builder()
+        .unit("GB")
+        .currency(Currency::EUR)
+        .intervals(storage_intervals)
+        .build()
         .unwrap()
-        .with_unit("GB")
         .calculate()
         .unwrap();
 
@@ -114,11 +119,12 @@ fn main() {
     let doc = BillingDocument::builder()
         .meta(DocumentMeta {
             invoice_number: "CLOUD-2026-07".into(),
+            currency: Currency::EUR,
             period_label: "July 2026".into(),
             ..Default::default()
         })
         .positions(all_positions)
-        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.20))))
+        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap()))
         .build()
         .unwrap();
 

@@ -1,17 +1,20 @@
 //! Water utility tiered billing example.
 //!
 //! Demonstrates:
-//! - Graduated pricing with a domain-specific unit (`"m³"`)
+//! - Graduated pricing with a domain-specific unit (`"m³"`) and an explicit currency
 //! - Minimum charge
 //! - ProportionalAllocation for shared-meter billing
 
 use billing::prelude::*;
-use rust_decimal_macros::dec;
+use rust_decimal::dec;
 
 fn main() {
     // Three-tier graduated water tariff — unit is m³, not kWh
     let schedule = TariffSchedule::graduated()
         .unit("m³")
+        // Without this, generated unit-price labels read "XXX/m³" — the ISO 4217
+        // "no currency" code. The engine never assumes a currency.
+        .currency(Currency::EUR)
         .band(TariffBand::up_to(
             dec!(5),
             Amount::parse("0.80000").unwrap(),
@@ -34,6 +37,7 @@ fn main() {
     let meta = DocumentMeta {
         invoice_number: "WATER-2026-07-001".into(),
         period_label: "July 2026".into(),
+        currency: Currency::EUR,
         ..Default::default()
     };
 
@@ -48,10 +52,20 @@ fn main() {
     println!("=== Water Invoice ({consumption_m3} m³) ===");
     println!();
     for pos in doc.all_positions() {
-        println!("  {:40} {:>12}", pos.description, pos.net_amount);
+        println!(
+            "  {:40} {:>12} {}",
+            pos.description,
+            pos.net_amount,
+            doc.currency()
+        );
     }
     println!();
-    println!("  {:40} {:>12}", "TOTAL", doc.net_total());
+    println!(
+        "  {:40} {:>12} {}",
+        "TOTAL",
+        doc.net_total(),
+        doc.currency()
+    );
 
     doc.assert_valid();
     println!("✓ Document validation passed");

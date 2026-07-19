@@ -2,6 +2,7 @@
 use rust_decimal::Decimal;
 
 use crate::amount::Amount;
+use crate::currency::Currency;
 use crate::error::BillingError;
 use crate::line_item::LineItem;
 use crate::quantity::{Quantity, UnitPrice};
@@ -103,6 +104,9 @@ impl TariffBand {
 // ── Schedule mode ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// The module docs advertise loading schedules from JSON/YAML with lowercase mode
+// names; without this the derived names are TitleCase and `"graduated"` fails.
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Graduated,
@@ -127,12 +131,45 @@ enum Mode {
 /// Call `.unit("kWh")` (or `"seats"`, `"GB"`, `"m³"`, …) on the builder to
 /// propagate the correct unit into all generated `LineItem` quantity / price labels.
 /// Defaults to `"units"` when not set.
+///
+/// # Validation on deserialisation
+///
+/// `TariffSchedule` deserialises through [`TariffScheduleBuilder::build`], so a
+/// schedule loaded from JSON/YAML is subject to exactly the same band-contiguity,
+/// price and block-size checks as one built in code. An invalid schedule is a
+/// deserialisation error, never a silently-mispricing value.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "TariffScheduleRepr"))]
 #[derive(Debug, Clone)]
 pub struct TariffSchedule {
     mode: Mode,
     bands: Vec<TariffBand>,
     unit: String,
+    currency: Currency,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct TariffScheduleRepr {
+    mode: Mode,
+    bands: Vec<TariffBand>,
+    unit: String,
+    #[serde(default)]
+    currency: Currency,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<TariffScheduleRepr> for TariffSchedule {
+    type Error = BillingError;
+    fn try_from(r: TariffScheduleRepr) -> Result<Self, Self::Error> {
+        TariffScheduleBuilder {
+            mode: r.mode,
+            bands: r.bands,
+            unit: r.unit,
+            currency: r.currency,
+        }
+        .build()
+    }
 }
 
 /// Builder for [`TariffSchedule`]. Obtained via `TariffSchedule::graduated()` etc.
@@ -140,6 +177,7 @@ pub struct TariffScheduleBuilder {
     mode: Mode,
     bands: Vec<TariffBand>,
     unit: String,
+    currency: Currency,
 }
 
 impl TariffSchedule {
@@ -150,6 +188,7 @@ impl TariffSchedule {
             mode: Mode::Graduated,
             bands: vec![],
             unit: "units".into(),
+            currency: Currency::XXX,
         }
     }
 
@@ -160,6 +199,7 @@ impl TariffSchedule {
             mode: Mode::Volume,
             bands: vec![],
             unit: "units".into(),
+            currency: Currency::XXX,
         }
     }
 
@@ -170,6 +210,7 @@ impl TariffSchedule {
             mode: Mode::Block,
             bands: vec![],
             unit: "units".into(),
+            currency: Currency::XXX,
         }
     }
 
@@ -180,6 +221,7 @@ impl TariffSchedule {
             mode: Mode::Capacity,
             bands: vec![],
             unit: "units".into(),
+            currency: Currency::XXX,
         }
     }
 
@@ -189,6 +231,12 @@ impl TariffSchedule {
         &self.unit
     }
 
+    /// The currency used in generated unit-price labels.
+    #[must_use]
+    pub fn currency(&self) -> Currency {
+        self.currency
+    }
+
     /// Split a cumulative quantity across this schedule.
     ///
     /// - `graduated`: returns N `LineItem`s, one per band.
@@ -196,7 +244,10 @@ impl TariffSchedule {
     /// - `capacity`: use [`TariffSchedule::apply_peak`] instead.
     ///
     /// # Errors
-    /// Returns `Err` if `quantity < 0`.
+    /// - `quantity < 0`.
+    /// - the schedule is in `capacity` mode (use [`TariffSchedule::apply_peak`]).
+    /// - `quantity` exceeds the schedule's coverage — the top band is bounded and
+    ///   the value is above it.
     pub fn split(&self, quantity: Decimal) -> Result<Vec<LineItem>, BillingError> {
         if quantity < Decimal::ZERO {
             return Err(BillingError::InvalidInput {
@@ -232,8 +283,11 @@ impl TariffSchedule {
         }
         let price = self
             .find_tier_price(peak)
-            .ok_or(BillingError::InvalidSchedule {
-                reason: "no tier covers the supplied peak value".into(),
+            .ok_or_else(|| BillingError::InvalidSchedule {
+                reason: format!(
+                    "no tier covers peak {peak}: add an open-ended top band \
+                     (TariffBand::over) to cover values above the highest bound"
+                ),
             })?;
         LineItem::debit(format!("Capacity charge (peak {peak:.3} {})", self.unit))
             .fixed_amount(price)
@@ -245,7 +299,7 @@ impl TariffSchedule {
     fn split_graduated(&self, mut remaining: Decimal) -> Result<Vec<LineItem>, BillingError> {
         let mut items = Vec::with_capacity(self.bands.len());
         let mut prev_upper = Decimal::ZERO;
-        let price_unit = format!("EUR/{}", self.unit);
+        let price_unit = format!("{}/{}", self.currency, self.unit);
 
         for (tier, band) in self.bands.iter().enumerate() {
             let tier_num = tier + 1;
@@ -289,12 +343,15 @@ impl TariffSchedule {
         if quantity.is_zero() {
             return Ok(vec![]);
         }
-        let price = self
-            .find_tier_price(quantity)
-            .ok_or(BillingError::InvalidSchedule {
-                reason: "no tier covers the supplied quantity".into(),
-            })?;
-        let price_unit = format!("EUR/{}", self.unit);
+        let price =
+            self.find_tier_price(quantity)
+                .ok_or_else(|| BillingError::InvalidSchedule {
+                    reason: format!(
+                        "no tier covers quantity {quantity}: add an open-ended top band \
+                     (TariffBand::over) to cover values above the highest bound"
+                    ),
+                })?;
+        let price_unit = format!("{}/{}", self.currency, self.unit);
         Ok(vec![
             LineItem::debit(format!("Usage charge ({} volume)", self.unit))
                 .quantity(Quantity::new(quantity, &self.unit))
@@ -314,9 +371,19 @@ impl TariffSchedule {
             reason: "block schedule band must have a block_size".into(),
         })?;
         // Rounds UP — partial block is billed as a full block.
-        let blocks = (quantity / block_size).ceil();
+        // `checked_div`: `Decimal`'s `/` panics on overflow, and `block_size` is only
+        // validated as `> 0` — a very small block size (e.g. 1e-28) against a large
+        // quantity overflows, which would abort inside a `Result`-returning method.
+        let blocks = quantity
+            .checked_div(block_size)
+            .ok_or_else(|| BillingError::InvalidSchedule {
+                reason: format!(
+                    "block schedule: quantity {quantity} / block_size {block_size} overflows"
+                ),
+            })?
+            .ceil();
         let block_label = format!("{}-{}-block", block_size, self.unit);
-        let price_unit = format!("EUR/{block_label}");
+        let price_unit = format!("{}/{block_label}", self.currency);
         Ok(vec![
             LineItem::debit(format!(
                 "Usage charge (block, {block_size} {}/block)",
@@ -330,8 +397,16 @@ impl TariffSchedule {
 
     /// Find the price for the tier that covers `quantity`.
     ///
-    /// Returns the first band whose `upper >= quantity`, or the last (unlimited)
-    /// band's price if all finite upper bounds are exceeded.
+    /// Returns the first band whose `upper >= quantity`, or an open-ended band's
+    /// price. Returns `None` when `quantity` exceeds every finite bound and no
+    /// open-ended band exists — i.e. the schedule does not cover the value.
+    ///
+    /// The trailing `self.bands.last()` fallback that used to sit here made this
+    /// function total, which silently priced anything above a bounded top band at
+    /// the top-band rate and rendered the "no tier covers …" errors in
+    /// [`TariffSchedule::split`] and [`TariffSchedule::apply_peak`] unreachable.
+    /// `graduated` mode already errored on the same input; the three modes now
+    /// agree.
     fn find_tier_price(&self, quantity: Decimal) -> Option<Amount<5>> {
         for band in &self.bands {
             match band.upper {
@@ -340,7 +415,7 @@ impl TariffSchedule {
                 None => return Some(band.price),
             }
         }
-        self.bands.last().map(|b| b.price)
+        None
     }
 }
 
@@ -359,6 +434,16 @@ impl TariffScheduleBuilder {
     #[must_use]
     pub fn unit(mut self, unit: impl Into<String>) -> Self {
         self.unit = unit.into();
+        self
+    }
+
+    /// Set the currency used in generated unit-price labels (e.g. `"EUR/kWh"`).
+    ///
+    /// Defaults to [`Currency::XXX`] — a schedule whose labels read `XXX/kWh`
+    /// was never given a currency.
+    #[must_use]
+    pub fn currency(mut self, currency: Currency) -> Self {
+        self.currency = currency;
         self
     }
 
@@ -431,8 +516,15 @@ impl TariffScheduleBuilder {
             }
         }
 
-        // Validate contiguity for multi-band non-block schedules.
-        if self.bands.len() > 1 && self.mode != Mode::Block {
+        // Validate contiguity for non-block schedules.
+        //
+        // This runs for single-band schedules too. Gating it on `len() > 1` left a
+        // hole exactly where a config typo is least likely to be noticed: a lone
+        // `between(500, 1000)` band built successfully and then billed from zero,
+        // because `split_graduated` derives the lower bound from the previous
+        // band's upper and starts at 0. The identical shape with a second band was
+        // correctly rejected.
+        if self.mode != Mode::Block {
             let mut expected_lower = Decimal::ZERO;
             for (i, band) in self.bands.iter().enumerate() {
                 // Check declared lower matches expected position.
@@ -440,6 +532,24 @@ impl TariffScheduleBuilder {
                     if lower != expected_lower {
                         return Err(BillingError::InvalidSchedule {
                             reason: "bands must be contiguous: gap or overlap detected".into(),
+                        });
+                    }
+                }
+                // Upper bounds must be strictly increasing.
+                //
+                // The declared-`lower` check above cannot catch this on its own:
+                // `TariffBand::up_to` and `free_up_to` leave `lower` as `None`, so a
+                // schedule like `[up_to(100), up_to(50)]` used to build successfully
+                // and then either mis-price or fail late inside `split()` with a
+                // misleading "quantity exceeds coverage" error.
+                if let Some(u) = band.upper {
+                    if u <= expected_lower {
+                        return Err(BillingError::InvalidSchedule {
+                            reason: format!(
+                                "band upper bounds must be strictly increasing: \
+                                 band {} has upper {u} but the previous band ends at {expected_lower}",
+                                i + 1
+                            ),
                         });
                     }
                 }
@@ -460,7 +570,8 @@ impl TariffScheduleBuilder {
         Ok(TariffSchedule {
             mode: self.mode,
             bands: self.bands,
-            unit: self.unit,
+            unit: crate::validate_unit(self.unit)?,
+            currency: self.currency,
         })
     }
 }
@@ -468,7 +579,7 @@ impl TariffScheduleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use rust_decimal::dec;
 
     #[test]
     fn graduated_two_tiers_with_unit() {

@@ -89,7 +89,7 @@ jobs:
       - name: Test — default features
         run: cargo test --all-targets
       - name: Test — all features
-        run: cargo test --all-targets --all-features
+        run: cargo test --lib --tests --all-features
       - name: Test — no default features
         run: cargo test --all-targets --no-default-features
 
@@ -118,3 +118,26 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: Run cargo-deny
         run: cargo deny --all-features check
+
+  # ── Semver ──────────────────────────────────────────────────────────────────
+  # Catches API changes that are breaking for the declared version bump. It is a
+  # linter, not a prover: behavioural breakage (a changed rounding rule) is
+  # invisible to it and is covered by the property tests instead.
+  semver:
+    name: Semver compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  # ── Benchmarks ──────────────────────────────────────────────────────────────
+  # Compile-only: benchmark timings are too noisy on shared runners to gate on,
+  # but a benchmark that no longer builds is a real break.
+  bench:
+    name: Benchmarks compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --no-run

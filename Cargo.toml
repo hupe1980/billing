@@ -1,6 +1,6 @@
 [package]
 name        = "billing"
-version     = "0.6.0"
+version     = "0.9.0"
 edition     = "2024"
 rust-version = "1.85"
 authors     = ["hupe1980"]
@@ -16,16 +16,44 @@ license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/hupe1980/billing"
 readme      = "README.md"
 
+# docs.rs builds with default features unless told otherwise, which would hide
+# every serde-gated item from the published documentation. `all-features` shows
+# them, and the `docsrs` cfg enables the feature badges on gated items.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 ## Enable serde Serialize / Deserialize on all public types.
-serde = ["dep:serde", "rust_decimal/serde-with-str"]
+##
+## `Amount<P>` serialises as a decimal string ("0.03456"), never as a float or a
+## raw scaled integer. Types carrying invariants (schedules, allocations, rate
+## lookups, tax layers, documents) re-run their validation on deserialisation.
+serde = ["dep:serde", "rust_decimal/serde"]
 
 [dependencies]
-rust_decimal        = "1"
-rust_decimal_macros = "1"
-thiserror           = "2"
-serde               = { version = "1", features = ["derive"], optional = true }
+# `default-features = false` drops rust_decimal's own default `serde` feature, so a
+# downstream build without our `serde` feature does not pull serde in at all.
+# Our `serde` feature re-enables `rust_decimal/serde` explicitly (see above).
+rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
+thiserror    = "2"
+serde        = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-rust_decimal_macros = "1"
+# Pinned to 0.7 rather than 0.8: criterion 0.8 requires rustc 1.86, which would
+# raise this crate's MSRV for a dev-only benchmarking tool that downstream users
+# never compile. 0.7 is the newest release compatible with rust-version = 1.85.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
+# `dec!` moved into rust_decimal proper behind the `macros` feature in 1.34.
+# The standalone `rust_decimal_macros` crate has not been republished since 1.40.0,
+# so depending on it invites version skew against rust_decimal 1.42. Declaring the
+# `macros` feature dev-only keeps the proc-macro out of downstream dependency trees
+# while still making `dec!` available to tests, examples and doctests.
+rust_decimal = { version = "1.42", features = ["macros"] }
+serde_json   = "1"
+
+[[bench]]
+name = "billing"
+harness = false

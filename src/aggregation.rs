@@ -34,6 +34,12 @@ pub trait UsageAggregator<E> {
 /// let total = agg.aggregate(&[ApiEvent { bytes: 100 }, ApiEvent { bytes: 200 }]);
 /// assert_eq!(total, Decimal::from(300u32));
 /// ```
+/// # Panics
+/// `Decimal`'s `Sum` panics on overflow. Aggregating values whose total exceeds
+/// `Decimal`'s 96-bit mantissa (~7.9e28) aborts rather than returning an error —
+/// the [`UsageAggregator`] trait returns a bare `Decimal`, so there is no error
+/// channel. Pre-filter untrusted event streams if that bound is reachable.
+#[derive(Clone, Copy)]
 pub struct SumAggregator<E, F: Fn(&E) -> Decimal> {
     value_fn: F,
     _marker: std::marker::PhantomData<E>,
@@ -60,6 +66,7 @@ impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for SumAggregator<E, F> {
 /// Count of all events in the period.
 ///
 /// Use case: number of transactions, number of API requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CountAggregator;
 
 impl<E> UsageAggregator<E> for CountAggregator {
@@ -94,6 +101,7 @@ impl<E> UsageAggregator<E> for CountAggregator {
 /// ]);
 /// assert_eq!(count, rust_decimal::Decimal::from(2u32));
 /// ```
+#[derive(Clone, Copy)]
 pub struct UniqueCountAggregator<E, K, F>
 where
     K: std::hash::Hash + Eq,
@@ -135,6 +143,7 @@ where
 ///
 /// Use case: peak active seats, peak bandwidth (Mbps).
 /// Pairs well with `TariffSchedule::capacity()`.
+#[derive(Clone, Copy)]
 pub struct MaxAggregator<E, F: Fn(&E) -> Decimal> {
     value_fn: F,
     _marker: std::marker::PhantomData<E>,
@@ -165,6 +174,7 @@ impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for MaxAggregator<E, F> {
 /// Most recent value of a numeric field (last event in slice order).
 ///
 /// Use case: current storage GB at end of period (snapshot billing).
+#[derive(Clone, Copy)]
 pub struct LatestAggregator<E, F: Fn(&E) -> Decimal> {
     value_fn: F,
     _marker: std::marker::PhantomData<E>,
@@ -198,6 +208,9 @@ impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for LatestAggregator<E, F> {
 ///
 /// `duration_fn` should return a fraction between 0.0 and 1.0
 /// (e.g. `uptime_seconds / total_period_seconds`).
+/// # Panics
+/// `Decimal`'s `Mul` and `Sum` panic on overflow — see [`SumAggregator`].
+#[derive(Clone, Copy)]
 pub struct WeightedSumAggregator<E, F: Fn(&E) -> Decimal, G: Fn(&E) -> Decimal> {
     /// Closure that extracts the numeric value from an event.
     pub value_fn: F,
@@ -231,7 +244,7 @@ impl<E, F: Fn(&E) -> Decimal, G: Fn(&E) -> Decimal> UsageAggregator<E>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use rust_decimal::dec;
 
     struct Event {
         value: u64,

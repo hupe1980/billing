@@ -9,7 +9,7 @@
 
 use billing::prelude::*;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rust_decimal::dec;
 
 struct SaasUsage {
     seats: u32,
@@ -52,6 +52,7 @@ impl Tariff for SaasTariff {
         // Both bands are kept so the document shows what was included vs. charged.
         let api_schedule = TariffSchedule::graduated()
             .unit("calls")
+            .currency(Currency::EUR)
             .band(TariffBand::free_up_to(free).with_description(format!(
                 "API calls (free tier, first {} incl.)",
                 self.free_api_calls
@@ -87,9 +88,10 @@ impl Tariff for SaasTariff {
             // Applied before VAT so it's included in the VAT base.
             Box::new(
                 PercentageCharge::new("Platform commission", dec!(0.03))
+                    .unwrap()
                     .with_min(Amount::parse("2.00000").unwrap()),
             ),
-            Box::new(FixedRateTax::new("VAT", dec!(0.20))),
+            Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap()),
         ]
     }
 }
@@ -108,6 +110,7 @@ fn main() {
 
     let meta = DocumentMeta {
         invoice_number: "SaaS-2026-07-001".into(),
+        currency: Currency::EUR,
         period_label: "July 2026".into(),
         notes: Some("Includes 350k API overage calls".into()),
         ..Default::default()

@@ -9,7 +9,7 @@ use billing::tax::{FixedDiscount, PerUnitLevy, PercentageCharge, PercentageDisco
 use billing::{
     merge_period_documents, minimum_charge, proportional_split, prorate, prorate_amount,
 };
-use rust_decimal_macros::dec;
+use rust_decimal::dec;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Amount<P> — arithmetic precision
@@ -481,11 +481,12 @@ fn apply_peak_negative_is_error() {
 
 #[test]
 fn tou_zero_quantity_band_skipped() {
-    let tou = TimeOfUsePricing::new(vec![
-        TouBand::new("peak", Amount::parse("0.32000").unwrap()),
-        TouBand::new("off-peak", Amount::parse("0.18000").unwrap()),
-    ])
-    .with_unit("kWh");
+    let tou = TimeOfUsePricing::builder()
+        .unit("kWh")
+        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TouBand::new("off-peak", Amount::parse("0.18000").unwrap()))
+        .build()
+        .unwrap();
     // Zero quantity in "off-peak" → should be omitted
     let items = tou
         .calculate(&[("peak", dec!(100)), ("off-peak", dec!(0))])
@@ -495,16 +496,29 @@ fn tou_zero_quantity_band_skipped() {
 }
 
 #[test]
-fn tou_unknown_band_silently_skipped() {
-    let tou = TimeOfUsePricing::new(vec![TouBand::new(
-        "peak",
-        Amount::parse("0.32000").unwrap(),
-    )])
-    .with_unit("kWh");
-    let items = tou
-        .calculate(&[("peak", dec!(100)), ("unknown", dec!(999))])
+fn tou_unknown_band_is_an_error_not_a_silent_skip() {
+    // Regression: an unknown band name used to be skipped silently, which meant a
+    // typo'd or renamed band dropped real consumption off the invoice with no
+    // signal at all — systematic under-billing. It is now a hard error.
+    let tou = TimeOfUsePricing::builder()
+        .unit("kWh")
+        .currency(Currency::EUR)
+        .band(TouBand::new("HT", Amount::parse("0.32000").unwrap()))
+        .band(TouBand::new("NT", Amount::parse("0.18000").unwrap()))
+        .build()
         .unwrap();
-    assert_eq!(items.len(), 1);
+
+    let err = tou
+        .calculate(&[("HT", dec!(100)), ("SUPERPEAK", dec!(50))])
+        .unwrap_err();
+    assert!(matches!(err, BillingError::InvalidInput { .. }));
+    // The message names the offending band and lists the valid ones.
+    let msg = err.to_string();
+    assert!(msg.contains("SUPERPEAK"), "{msg}");
+    assert!(msg.contains("HT"), "{msg}");
+
+    // Case differences are caught too — they are the most common real typo.
+    assert!(tou.calculate(&[("ht", dec!(100))]).is_err());
 }
 
 #[test]
@@ -513,12 +527,12 @@ fn dynamic_pricing_net_is_exact_not_qty_times_avg() {
     // Total: 100 × 0.10 + 200 × 0.20 = 10 + 40 = 50.00000 exactly.
     // avg_price = 50/300 = 0.16666... (repeating).
     // 300 × 0.16666... ≠ 50.00000 in general.
-    let dp = DynamicPricing::from_intervals(vec![
-        (dec!(100), Amount::parse("0.10000").unwrap()),
-        (dec!(200), Amount::parse("0.20000").unwrap()),
-    ])
-    .unwrap()
-    .with_unit("kWh");
+    let dp = DynamicPricing::builder()
+        .unit("kWh")
+        .interval(dec!(100), Amount::parse("0.10000").unwrap())
+        .interval(dec!(200), Amount::parse("0.20000").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     // The net_amount must be exactly 50.00000, not an approximation.
     assert_eq!(item.net_amount, Amount::parse("50.00000").unwrap());
@@ -526,8 +540,10 @@ fn dynamic_pricing_net_is_exact_not_qty_times_avg() {
 
 #[test]
 fn dynamic_pricing_single_interval_exact() {
-    let dp =
-        DynamicPricing::from_intervals(vec![(dec!(7), Amount::parse("0.33333").unwrap())]).unwrap();
+    let dp = DynamicPricing::builder()
+        .interval(dec!(7), Amount::parse("0.33333").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     // 7 × 0.33333 = 2.33331 (rounded to 5dp by mul_qty)
     assert_eq!(item.net_amount, Amount::parse("2.33331").unwrap());
@@ -538,12 +554,12 @@ fn dynamic_pricing_three_equal_intervals_net_exact() {
     // 3 intervals of (100 units, 1/3 EUR/unit): each = 33.33333 (truncated 5dp)
     // total = 99.99999 — NOT 100.
     // This verifies that total_net accumulates per-interval net, not qty × avg.
-    let dp = DynamicPricing::from_intervals(vec![
-        (dec!(100), Amount::parse("0.33333").unwrap()),
-        (dec!(100), Amount::parse("0.33333").unwrap()),
-        (dec!(100), Amount::parse("0.33333").unwrap()),
-    ])
-    .unwrap();
+    let dp = DynamicPricing::builder()
+        .interval(dec!(100), Amount::parse("0.33333").unwrap())
+        .interval(dec!(100), Amount::parse("0.33333").unwrap())
+        .interval(dec!(100), Amount::parse("0.33333").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     // 3 × (100 × 0.33333) = 3 × 33.33300 = 99.99900
     assert_eq!(item.net_amount, Amount::parse("99.99900").unwrap());
@@ -575,7 +591,8 @@ fn fixed_rate_tax_on_net_including_credits() {
             .build()
             .unwrap(),
     ];
-    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.19)))];
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.19)).unwrap())];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // net = 100 - 40 = 60; VAT = 60 × 0.19 = 11.40000
     assert_eq!(doc.net_total(), Amount::parse("60.00000").unwrap());
@@ -595,7 +612,9 @@ fn fixed_rate_tax_with_tag_filter_excludes_untagged() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        FixedRateTax::new("VAT", dec!(0.20)).with_tag("vat-liable"),
+        FixedRateTax::new("VAT", dec!(0.20))
+            .unwrap()
+            .with_tag("vat-liable"),
     )];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // Only 100 in base; VAT = 100 × 0.20 = 20.
@@ -618,7 +637,7 @@ fn per_unit_levy_excludes_credit_positions() {
             .build()
             .unwrap(),
     ];
-    let levy = PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(levy)];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // Only 1000 kWh in levy base (credit excluded); levy = 1000 × 0.02050 = 20.50000
@@ -641,8 +660,9 @@ fn per_unit_levy_with_require_tag() {
             .build()
             .unwrap(),
     ];
-    let levy =
-        PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh").with_tag("metered");
+    let levy = PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh")
+        .unwrap()
+        .with_tag("metered");
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(levy)];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // Only 500 kWh (tagged "metered"); levy = 500 × 0.02050 = 10.25000
@@ -659,9 +679,9 @@ fn compound_tax_three_layers() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
-        Box::new(PercentageCharge::new("L1 5%", dec!(0.05))),
-        Box::new(PercentageCharge::new("L2 2%", dec!(0.02))),
-        Box::new(FixedRateTax::new("L3 VAT 19%", dec!(0.19))),
+        Box::new(PercentageCharge::new("L1 5%", dec!(0.05)).unwrap()),
+        Box::new(PercentageCharge::new("L2 2%", dec!(0.02)).unwrap()),
+        Box::new(FixedRateTax::new("L3 VAT 19%", dec!(0.19)).unwrap()),
     ];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
@@ -682,11 +702,11 @@ fn percentage_discount_reduces_taxable_base() {
             .build()
             .unwrap(),
     ];
-    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
-    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(PercentageDiscount::new(
-        "10% discount",
-        dec!(0.10),
-    ))];
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
+    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(
+        PercentageDiscount::new("10% discount", dec!(0.10)).unwrap(),
+    )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, discounts).unwrap();
     assert_eq!(doc.net_total(), Amount::parse("90.00000").unwrap());
@@ -702,10 +722,9 @@ fn fixed_discount_reduces_net() {
             .build()
             .unwrap(),
     ];
-    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(FixedDiscount::new(
-        "Voucher -20",
-        Amount::parse("20.00000").unwrap(),
-    ))];
+    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(
+        FixedDiscount::new("Voucher -20", Amount::parse("20.00000").unwrap()).unwrap(),
+    )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
     assert_eq!(doc.net_total(), Amount::parse("80.00000").unwrap());
@@ -721,7 +740,9 @@ fn percentage_charge_min_floor_applied() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        PercentageCharge::new("Fee 3%", dec!(0.03)).with_min(Amount::parse("0.50000").unwrap()),
+        PercentageCharge::new("Fee 3%", dec!(0.03))
+            .unwrap()
+            .with_min(Amount::parse("0.50000").unwrap()),
     )];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // 1.00 × 0.03 = 0.03 < 0.50 → min floor = 0.50
@@ -736,7 +757,9 @@ fn percentage_charge_max_ceiling_applied() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        PercentageCharge::new("Fee 5%", dec!(0.05)).with_max(Amount::parse("100.00000").unwrap()),
+        PercentageCharge::new("Fee 5%", dec!(0.05))
+            .unwrap()
+            .with_max(Amount::parse("100.00000").unwrap()),
     )];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     // 10000 × 0.05 = 500 > 100 → ceiling = 100
@@ -801,7 +824,7 @@ fn builder_with_tariff_then_extra_tax() {
         .meta(DocumentMeta::default())
         .tariff(&FlatTariff, &())
         .unwrap()
-        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.10))))
+        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.10)).unwrap()))
         .build()
         .unwrap();
     assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
@@ -816,7 +839,7 @@ fn builder_with_tariff_then_extra_tax() {
 #[test]
 fn allocation_single_recipient_is_identity() {
     let doc = doc_with_charge("47.12345");
-    let docs = EqualAllocation::new(1).allocate(&doc).unwrap();
+    let docs = EqualAllocation::new(1).unwrap().allocate(&doc).unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].net_total(), doc.net_total());
     docs[0].assert_valid();
@@ -829,15 +852,14 @@ fn allocation_with_discounts_preserves_assert_valid() {
             .build()
             .unwrap(),
     ];
-    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(FixedDiscount::new(
-        "Rebate",
-        Amount::parse("10.00000").unwrap(),
-    ))];
+    let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(
+        FixedDiscount::new("Rebate", Amount::parse("10.00000").unwrap()).unwrap(),
+    )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
     assert_eq!(doc.net_total(), Amount::parse("90.00000").unwrap());
 
-    let docs = EqualAllocation::new(2).allocate(&doc).unwrap();
+    let docs = EqualAllocation::new(2).unwrap().allocate(&doc).unwrap();
     for d in &docs {
         d.assert_valid();
     }
@@ -849,7 +871,7 @@ fn allocation_with_discounts_preserves_assert_valid() {
 fn allocation_penny_test_seven_way() {
     // 100 / 7 = 14.28571428... — classic penny test with many recipients.
     let doc = doc_with_charge("100.00000");
-    let docs = EqualAllocation::new(7).allocate(&doc).unwrap();
+    let docs = EqualAllocation::new(7).unwrap().allocate(&doc).unwrap();
     let total: Amount<5> = docs.iter().map(|d| d.net_total()).sum();
     assert_eq!(total, doc.net_total(), "7-way split must not lose a penny");
     for d in &docs {
@@ -967,7 +989,8 @@ fn merge_preserves_tax_totals() {
                 .build()
                 .unwrap(),
         ];
-        let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
+        let taxes: Vec<Box<dyn TaxLayer>> =
+            vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
         BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap()
     }
     let a = taxed_doc("100.00000"); // tax = 20
@@ -1058,9 +1081,10 @@ fn integration_saas_invoice() {
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
         Box::new(
             PercentageCharge::new("Commission 3%", dec!(0.03))
+                .unwrap()
                 .with_min(Amount::parse("2.00000").unwrap()),
         ),
-        Box::new(FixedRateTax::new("VAT 20%", dec!(0.20))),
+        Box::new(FixedRateTax::new("VAT 20%", dec!(0.20)).unwrap()),
     ];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
     assert_eq!(doc.net_total(), Amount::parse("179.00000").unwrap());
@@ -1178,15 +1202,18 @@ fn parse_valid_signs_work() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
-#[should_panic(expected = "FixedRateTax rate must be >= 0")]
-fn fixed_rate_tax_negative_rate_panics() {
-    let _ = FixedRateTax::new("Bad tax", dec!(-0.19));
+fn fixed_rate_tax_negative_rate_is_err() {
+    // A negative rate is a recoverable configuration error, not a panic:
+    // rates routinely come from config files and databases.
+    let err = FixedRateTax::new("Bad tax", dec!(-0.19)).unwrap_err();
+    assert!(matches!(err, BillingError::InvalidInput { .. }));
+    assert!(err.to_string().contains("must be >= 0"));
 }
 
 #[test]
 fn fixed_rate_tax_zero_rate_ok() {
     // Zero-rate tax (e.g. zero-rated VAT) is valid.
-    let tax = FixedRateTax::new("Zero-rated", dec!(0));
+    let tax = FixedRateTax::new("Zero-rated", dec!(0)).unwrap();
     let pos = vec![
         LineItem::fixed("Item", Amount::parse("100.00000").unwrap())
             .build()
@@ -1197,28 +1224,27 @@ fn fixed_rate_tax_zero_rate_ok() {
 }
 
 #[test]
-#[should_panic(expected = "PercentageCharge rate must be >= 0")]
-fn percentage_charge_negative_rate_panics() {
-    let _ = PercentageCharge::new("Bad charge", dec!(-0.05));
+fn percentage_charge_negative_rate_is_err() {
+    let err = PercentageCharge::new("Bad charge", dec!(-0.05)).unwrap_err();
+    assert!(matches!(err, BillingError::InvalidInput { .. }));
 }
 
 #[test]
-#[should_panic(expected = "PercentageDiscount rate must be in [0, 1]")]
-fn percentage_discount_rate_above_one_panics() {
+fn percentage_discount_rate_above_one_is_err() {
     // 150% discount would produce a net charge — clearly wrong.
-    let _ = PercentageDiscount::new("Extreme", dec!(1.5));
+    let err = PercentageDiscount::new("Extreme", dec!(1.5)).unwrap_err();
+    assert!(matches!(err, BillingError::InvalidInput { .. }));
 }
 
 #[test]
-#[should_panic(expected = "PercentageDiscount rate must be in [0, 1]")]
-fn percentage_discount_negative_rate_panics() {
-    let _ = PercentageDiscount::new("Negative", dec!(-0.10));
+fn percentage_discount_negative_rate_is_err() {
+    assert!(PercentageDiscount::new("Negative", dec!(-0.10)).is_err());
 }
 
 #[test]
 fn percentage_discount_one_hundred_percent_ok() {
     // 100% discount is valid (full rebate).
-    let disc = PercentageDiscount::new("Full rebate", dec!(1));
+    let disc = PercentageDiscount::new("Full rebate", dec!(1)).unwrap();
     let pos = vec![
         LineItem::fixed("Item", Amount::parse("50.00000").unwrap())
             .build()
@@ -1229,15 +1255,14 @@ fn percentage_discount_one_hundred_percent_ok() {
 }
 
 #[test]
-#[should_panic(expected = "PerUnitLevy rate must be >= 0")]
-fn per_unit_levy_negative_rate_panics() {
-    let _ = PerUnitLevy::new("Bad levy", Amount::parse("-0.02050").unwrap(), "kWh");
+fn per_unit_levy_negative_rate_is_err() {
+    assert!(PerUnitLevy::new("Bad levy", Amount::parse("-0.02050").unwrap(), "kWh").is_err());
 }
 
 #[test]
 fn per_unit_levy_zero_rate_ok() {
     // Zero-rate levy is unusual but valid.
-    let levy = PerUnitLevy::new("Zero levy", Amount::ZERO, "kWh");
+    let levy = PerUnitLevy::new("Zero levy", Amount::ZERO, "kWh").unwrap();
     let pos = vec![
         LineItem::debit("Usage")
             .quantity(Quantity::new(dec!(1000), "kWh"))
@@ -1415,25 +1440,28 @@ fn amount_p0_arithmetic() {
 #[test]
 fn dynamic_pricing_negative_qty_rejected() {
     // Negative interval quantity is physically meaningless and now rejected.
-    let result =
-        DynamicPricing::from_intervals(vec![(dec!(-100), Amount::parse("0.10000").unwrap())]);
+    let result = DynamicPricing::builder()
+        .interval(dec!(-100), Amount::parse("0.10000").unwrap())
+        .build();
     assert!(result.is_err(), "negative interval qty must be rejected");
 }
 
 #[test]
 fn dynamic_pricing_zero_qty_rejected() {
     // Zero quantity contributes nothing; reject to keep intervals meaningful.
-    let result = DynamicPricing::from_intervals(vec![(dec!(0), Amount::parse("0.10000").unwrap())]);
+    let result = DynamicPricing::builder()
+        .interval(dec!(0), Amount::parse("0.10000").unwrap())
+        .build();
     assert!(result.is_err(), "zero interval qty must be rejected");
 }
 
 #[test]
 fn dynamic_pricing_valid_intervals_ok() {
-    let dp = DynamicPricing::from_intervals(vec![
-        (dec!(100), Amount::parse("0.10000").unwrap()),
-        (dec!(200), Amount::parse("0.20000").unwrap()),
-    ])
-    .unwrap();
+    let dp = DynamicPricing::builder()
+        .interval(dec!(100), Amount::parse("0.10000").unwrap())
+        .interval(dec!(200), Amount::parse("0.20000").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     assert_eq!(item.net_amount, Amount::parse("50.00000").unwrap());
 }
@@ -1499,7 +1527,7 @@ fn fixed_rate_tax_checked_on_extreme_base() {
     )
     .build()
     .unwrap();
-    let tax = FixedRateTax::new("HighTax", dec!(10)); // 1000% tax — product overflows
+    let tax = FixedRateTax::new("HighTax", dec!(10)).unwrap(); // 1000% tax — product overflows
     let result = tax.compute(&[max_item]);
     assert!(
         result.is_err(),
@@ -1519,7 +1547,7 @@ fn fixed_rate_tax_label_shows_exact_rate() {
             .build()
             .unwrap(),
     ];
-    let tax = FixedRateTax::new("SpecialTax", dec!(0.195));
+    let tax = FixedRateTax::new("SpecialTax", dec!(0.195)).unwrap();
     let item = tax.compute(&pos).unwrap();
     assert!(
         item.description.contains("19.5%"),
@@ -1541,7 +1569,7 @@ fn fixed_rate_tax_label_no_trailing_zeros() {
             .build()
             .unwrap(),
     ];
-    let tax = FixedRateTax::new("VAT", dec!(0.19));
+    let tax = FixedRateTax::new("VAT", dec!(0.19)).unwrap();
     let item = tax.compute(&pos).unwrap();
     // Should show "19%" not "19.00%" or "19.0%"
     assert!(
@@ -1558,7 +1586,7 @@ fn percentage_charge_label_exact_rate() {
             .build()
             .unwrap(),
     ];
-    let charge = PercentageCharge::new("Fee", dec!(0.025)); // 2.5%
+    let charge = PercentageCharge::new("Fee", dec!(0.025)).unwrap(); // 2.5%
     let item = charge.compute(&pos).unwrap();
     assert!(
         item.description.contains("2.5%"),
@@ -1574,7 +1602,7 @@ fn percentage_discount_label_exact_rate() {
             .build()
             .unwrap(),
     ];
-    let disc = PercentageDiscount::new("Rebate", dec!(0.075)); // 7.5%
+    let disc = PercentageDiscount::new("Rebate", dec!(0.075)).unwrap(); // 7.5%
     let item = disc.compute(&pos).unwrap();
     assert!(
         item.description.contains("7.5%"),
@@ -1703,6 +1731,7 @@ fn percentage_charge_min_exceeds_max_returns_err() {
             .unwrap(),
     ];
     let charge = PercentageCharge::new("Fee", dec!(0.04))
+        .unwrap()
         .with_min(Amount::parse("5.00000").unwrap())
         .with_max(Amount::parse("3.00000").unwrap()); // min > max
     let result = charge.compute(&pos);
@@ -1718,6 +1747,7 @@ fn percentage_charge_min_equals_max_ok() {
             .unwrap(),
     ];
     let charge = PercentageCharge::new("Flat fee", dec!(0.04))
+        .unwrap()
         .with_min(Amount::parse("4.00000").unwrap())
         .with_max(Amount::parse("4.00000").unwrap()); // min == max
     let item = charge.compute(&pos).unwrap();
@@ -1733,6 +1763,7 @@ fn percentage_charge_min_less_than_max_ok() {
             .unwrap(),
     ];
     let charge = PercentageCharge::new("Commission", dec!(0.05))
+        .unwrap()
         .with_min(Amount::parse("2.00000").unwrap())
         .with_max(Amount::parse("10.00000").unwrap());
     let item = charge.compute(&pos).unwrap();
@@ -1748,11 +1779,11 @@ fn percentage_charge_min_less_than_max_ok() {
 fn tou_negative_quantity_returns_err() {
     // Before the fix, negative quantities were silently skipped; now they
     // propagate as Err so the caller can detect bad meter readings.
-    let tou = TimeOfUsePricing::new(vec![TouBand::new(
-        "peak",
-        Amount::parse("0.32000").unwrap(),
-    )])
-    .with_unit("kWh");
+    let tou = TimeOfUsePricing::builder()
+        .unit("kWh")
+        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .build()
+        .unwrap();
     let result = tou.calculate(&[("peak", dec!(-100))]);
     assert!(result.is_err(), "negative usage qty must be Err");
 }
@@ -1761,10 +1792,10 @@ fn tou_negative_quantity_returns_err() {
 fn tou_negative_quantity_on_unknown_band_also_err() {
     // Even if the band name is unknown, a negative quantity must error before
     // the unknown-band skip logic is reached.
-    let tou = TimeOfUsePricing::new(vec![TouBand::new(
-        "peak",
-        Amount::parse("0.32000").unwrap(),
-    )]);
+    let tou = TimeOfUsePricing::builder()
+        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .build()
+        .unwrap();
     let result = tou.calculate(&[("unknown-band", dec!(-50))]);
     assert!(result.is_err(), "negative qty on unknown band must be Err");
 }
@@ -1772,11 +1803,11 @@ fn tou_negative_quantity_on_unknown_band_also_err() {
 #[test]
 fn tou_zero_quantity_on_known_band_skipped_ok() {
     // Zero quantity for a known band is valid — no line item emitted.
-    let tou = TimeOfUsePricing::new(vec![TouBand::new(
-        "peak",
-        Amount::parse("0.32000").unwrap(),
-    )])
-    .with_unit("kWh");
+    let tou = TimeOfUsePricing::builder()
+        .unit("kWh")
+        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .build()
+        .unwrap();
     let items = tou.calculate(&[("peak", dec!(0))]).unwrap();
     assert!(items.is_empty(), "zero usage produces no line item");
 }
@@ -1784,11 +1815,12 @@ fn tou_zero_quantity_on_known_band_skipped_ok() {
 #[test]
 fn tou_mixed_valid_and_valid_quantities_ok() {
     // One zero-qty band (skipped) and one positive-qty band (billed).
-    let tou = TimeOfUsePricing::new(vec![
-        TouBand::new("peak", Amount::parse("0.32000").unwrap()),
-        TouBand::new("off-peak", Amount::parse("0.18000").unwrap()),
-    ])
-    .with_unit("kWh");
+    let tou = TimeOfUsePricing::builder()
+        .unit("kWh")
+        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TouBand::new("off-peak", Amount::parse("0.18000").unwrap()))
+        .build()
+        .unwrap();
     let items = tou
         .calculate(&[("peak", dec!(0)), ("off-peak", dec!(500))])
         .unwrap();
@@ -1865,7 +1897,7 @@ fn fixed_rate_tax_base_overflow_returns_err() {
         LineItem::fixed("A", big).build().unwrap(),
         LineItem::fixed("B", big).build().unwrap(),
     ];
-    let tax = FixedRateTax::new("VAT", dec!(0.20));
+    let tax = FixedRateTax::new("VAT", dec!(0.20)).unwrap();
     let result = tax.compute(&pos);
     assert!(result.is_err(), "overflow in tax base sum must return Err");
 }
@@ -1877,7 +1909,7 @@ fn percentage_discount_base_overflow_returns_err() {
         LineItem::fixed("A", big).build().unwrap(),
         LineItem::fixed("B", big).build().unwrap(),
     ];
-    let disc = PercentageDiscount::new("Rebate", dec!(0.10));
+    let disc = PercentageDiscount::new("Rebate", dec!(0.10)).unwrap();
     let result = disc.compute(&pos);
     assert!(
         result.is_err(),
@@ -2113,7 +2145,7 @@ fn proportional_allocation_empty_shares_rejected() {
 #[test]
 fn equal_allocation_single_recipient_is_identity() {
     let doc = doc_with_charge("100.00000");
-    let docs = EqualAllocation::new(1).allocate(&doc).unwrap();
+    let docs = EqualAllocation::new(1).unwrap().allocate(&doc).unwrap();
     assert_eq!(docs[0].net_total(), doc.net_total());
     docs[0].assert_valid();
 }
@@ -2138,8 +2170,10 @@ fn merge_period_documents_assert_valid_passes() {
 fn merge_with_tax_layers_preserves_gross() {
     use billing::merge_period_documents;
 
-    let taxes_a: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
-    let taxes_b: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
+    let taxes_a: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
+    let taxes_b: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
 
     let pos_a = vec![
         LineItem::fixed("Charge A", Amount::parse("100.00000").unwrap())
@@ -2171,14 +2205,14 @@ fn merge_with_tax_layers_preserves_gross() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
-fn with_extra_position_preserves_three_invariants() {
+fn with_extra_position_preserves_invariants_on_an_untaxed_document() {
     let pos = vec![
         LineItem::fixed("Base", Amount::parse("100.00000").unwrap())
             .build()
             .unwrap(),
     ];
-    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
-    let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
 
     let min_item = LineItem::fixed("Min charge", Amount::parse("10.00000").unwrap())
         .tag("minimum-charge")
@@ -2186,11 +2220,70 @@ fn with_extra_position_preserves_three_invariants() {
         .unwrap();
     let doc2 = doc.with_extra_position(min_item).unwrap();
 
-    // Tax is NOT recomputed (by design), but all three invariants must still hold.
     assert_eq!(doc2.net_total(), Amount::parse("110.00000").unwrap());
-    // gross = net + tax (tax unchanged = 20)
-    assert_eq!(doc2.gross_total(), Amount::parse("130.00000").unwrap());
+    assert_eq!(doc2.gross_total(), Amount::parse("110.00000").unwrap());
     doc2.assert_valid();
+}
+
+#[test]
+fn with_extra_position_is_refused_on_a_document_carrying_a_vat_breakdown() {
+    // Adding to the net without re-running the tax layers leaves the VAT breakdown
+    // describing a smaller base than the document reports — and under-bills VAT.
+    // The old behaviour silently produced net 110 with tax still 20 (correct: 22).
+    let pos = vec![
+        LineItem::fixed("Base", Amount::parse("100.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
+    let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
+
+    let extra = LineItem::fixed("Min charge", Amount::parse("10.00000").unwrap())
+        .build()
+        .unwrap();
+    assert!(doc.with_extra_position(extra).is_err());
+}
+
+#[test]
+fn minimum_charge_is_taxed_when_added_before_the_tax_layers() {
+    // The correct order: settle the net positions (including any shortfall), then
+    // let the tax layers see the final base.
+    let positions = vec![
+        LineItem::fixed("Base", Amount::parse("100.00000").unwrap())
+            .build()
+            .unwrap(),
+    ];
+    let untaxed =
+        BillingDocument::from_positions(DocumentMeta::default(), positions.clone(), vec![], vec![])
+            .unwrap();
+
+    let mut final_positions = positions;
+    if let Some(shortfall) = minimum_charge(
+        &untaxed,
+        Amount::parse("110.00000").unwrap(),
+        "Minimum spend",
+    )
+    .unwrap()
+    {
+        final_positions.push(shortfall);
+    }
+
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
+    let doc =
+        BillingDocument::from_positions(DocumentMeta::default(), final_positions, taxes, vec![])
+            .unwrap();
+
+    assert_eq!(doc.net_total(), Amount::parse("110.00000").unwrap());
+    // VAT now applies to the shortfall too: 110 × 20% = 22, not 20.
+    assert_eq!(doc.tax_total(), Amount::parse("22.00000").unwrap());
+    assert_eq!(doc.gross_total(), Amount::parse("132.00000").unwrap());
+    assert_eq!(
+        doc.tax_breakdown()[0].taxable_base,
+        Amount::parse("110.00000").unwrap()
+    );
+    doc.assert_valid();
 }
 
 #[test]
@@ -2212,12 +2305,12 @@ fn with_extra_credit_reduces_net() {
 #[test]
 fn dynamic_pricing_all_zero_price_intervals_net_is_zero() {
     // All intervals have zero price → net must be zero.
-    let dp = DynamicPricing::from_intervals(vec![
-        (dec!(100), Amount::parse("0.00000").unwrap()),
-        (dec!(200), Amount::parse("0.00000").unwrap()),
-    ])
-    .unwrap()
-    .with_unit("kWh");
+    let dp = DynamicPricing::builder()
+        .unit("kWh")
+        .interval(dec!(100), Amount::parse("0.00000").unwrap())
+        .interval(dec!(200), Amount::parse("0.00000").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     assert!(item.net_amount.is_zero());
     assert_eq!(item.quantity_value(), Some(dec!(300)));
@@ -2226,9 +2319,11 @@ fn dynamic_pricing_all_zero_price_intervals_net_is_zero() {
 #[test]
 fn dynamic_pricing_single_interval_exact_pipeline() {
     // Single interval: net = qty × price (no averaging).
-    let dp = DynamicPricing::from_intervals(vec![(dec!(1000), Amount::parse("0.32000").unwrap())])
-        .unwrap()
-        .with_unit("kWh");
+    let dp = DynamicPricing::builder()
+        .unit("kWh")
+        .interval(dec!(1000), Amount::parse("0.32000").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     assert_eq!(item.net_amount, Amount::parse("320.00000").unwrap());
 }
@@ -2314,7 +2409,7 @@ fn per_unit_levy_only_counts_matching_unit() {
             .build()
             .unwrap(),
     ];
-    let levy = PerUnitLevy::new("kWh levy", Amount::parse("0.02000").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("kWh levy", Amount::parse("0.02000").unwrap(), "kWh").unwrap();
     let item = levy.compute(&pos).unwrap();
     // 1000 kWh × 0.02000 = 20.00000 (m³ ignored)
     assert_eq!(item.net_amount, Amount::parse("20.00000").unwrap());
@@ -2328,7 +2423,7 @@ fn per_unit_levy_zero_matching_units_produces_zero_levy() {
             .build()
             .unwrap(),
     ];
-    let levy = PerUnitLevy::new("kWh levy", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("kWh levy", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let item = levy.compute(&pos).unwrap();
     assert!(item.net_amount.is_zero());
 }
@@ -2355,9 +2450,21 @@ fn full_pipeline_graduated_tou_minimum_allocation() {
         .build()
         .unwrap();
 
-    let items = graduated.split(dec!(1234.5)).unwrap();
-    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
-    let mut doc = BillingDocument::from_positions(
+    let mut items = graduated.split(dec!(1234.5)).unwrap();
+
+    // Settle the minimum charge against the NET positions first, so the tax layers
+    // see the final base. Adding it after taxation would under-bill VAT.
+    let net_only =
+        BillingDocument::from_positions(DocumentMeta::default(), items.clone(), vec![], vec![])
+            .unwrap();
+    let min = Amount::parse("400.00000").unwrap();
+    if let Some(shortfall) = minimum_charge(&net_only, min, "Minimum spend").unwrap() {
+        items.push(shortfall);
+    }
+
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
+    let doc = BillingDocument::from_positions(
         DocumentMeta {
             invoice_number: "INV-PIPELINE-001".into(),
             period_label: "2026-07".into(),
@@ -2368,13 +2475,6 @@ fn full_pipeline_graduated_tou_minimum_allocation() {
         vec![],
     )
     .unwrap();
-    doc.assert_valid();
-
-    // Apply minimum charge.
-    let min = Amount::parse("400.00000").unwrap();
-    if let Some(shortfall) = minimum_charge(&doc, min, "Minimum spend").unwrap() {
-        doc = doc.with_extra_position(shortfall).unwrap();
-    }
     doc.assert_valid();
 
     // Allocate 60/40 between two tenants.
@@ -2510,9 +2610,10 @@ fn all_positions_order_net_then_discounts_then_taxes() {
             .build()
             .unwrap(),
     ];
-    let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
+    let taxes: Vec<Box<dyn TaxLayer>> =
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
     let discounts: Vec<Box<dyn DiscountLayer>> = vec![Box::new(
-        billing::tax::PercentageDiscount::new("Discount", dec!(0.10)),
+        billing::tax::PercentageDiscount::new("Discount", dec!(0.10)).unwrap(),
     )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, discounts).unwrap();
@@ -2557,8 +2658,8 @@ fn all_positions_is_zero_allocation_iterator() {
 #[test]
 fn all_positions_count_correct() {
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
-        Box::new(FixedRateTax::new("T1", dec!(0.10))),
-        Box::new(FixedRateTax::new("T2", dec!(0.05))),
+        Box::new(FixedRateTax::new("T1", dec!(0.10)).unwrap()),
+        Box::new(FixedRateTax::new("T2", dec!(0.05)).unwrap()),
     ];
     let doc = BillingDocument::from_positions(
         DocumentMeta::default(),
@@ -2724,8 +2825,8 @@ fn from_positions_with_many_positions_and_layers_valid() {
 
     // Sum = 10+20+...+100 = 550
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
-        Box::new(PercentageCharge::new("Fee 1%", dec!(0.01))),
-        Box::new(FixedRateTax::new("VAT 20%", dec!(0.20))),
+        Box::new(PercentageCharge::new("Fee 1%", dec!(0.01)).unwrap()),
+        Box::new(FixedRateTax::new("VAT 20%", dec!(0.20)).unwrap()),
     ];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
@@ -2925,15 +3026,15 @@ fn line_item_fixed_empty_description_rejected() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
-#[should_panic(expected = "EqualAllocation requires n > 0")]
-fn equal_allocation_new_zero_panics() {
-    // Fail fast at construction, not silently at allocate() time.
-    let _ = EqualAllocation::new(0);
+fn equal_allocation_new_zero_is_err() {
+    // n=0 is rejected at construction rather than dividing by zero in allocate().
+    let err = EqualAllocation::new(0).unwrap_err();
+    assert!(matches!(err, BillingError::InvalidInput { .. }));
 }
 
 #[test]
 fn equal_allocation_new_one_ok() {
-    let a = EqualAllocation::new(1);
+    let a = EqualAllocation::new(1).unwrap();
     assert_eq!(a.n(), 1);
 }
 
@@ -2943,7 +3044,7 @@ fn equal_allocation_fail_fast_before_allocate() {
     // when allocate() was called. Callers could hold an invalid EqualAllocation
     // instance for a long time before the error surfaced.
     // Now the panic is immediate at construction.
-    let result = std::panic::catch_unwind(|| EqualAllocation::new(0));
+    let result = std::panic::catch_unwind(|| EqualAllocation::new(0).unwrap());
     assert!(result.is_err(), "new(0) must panic immediately");
 }
 
@@ -2988,7 +3089,7 @@ fn try_from_i64_then_line_item_then_allocate() {
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
     assert_eq!(doc.net_total(), Amount::<5>::from_int(100));
 
-    let alloc = EqualAllocation::new(4);
+    let alloc = EqualAllocation::new(4).unwrap();
     let parts = alloc.allocate(&doc).unwrap();
     let total: Amount<5> = parts.iter().map(|d| d.net_total()).sum();
     assert_eq!(total, doc.net_total()); // exact, no drift
@@ -3172,11 +3273,8 @@ fn discount_total_matches_sum_of_discount_positions() {
             .unwrap(),
     ];
     let discounts: Vec<Box<dyn billing::DiscountLayer>> = vec![
-        Box::new(FixedDiscount::new(
-            "Voucher",
-            Amount::parse("20.00000").unwrap(),
-        )),
-        Box::new(PercentageDiscount::new("Loyalty 5%", dec!(0.05))),
+        Box::new(FixedDiscount::new("Voucher", Amount::parse("20.00000").unwrap()).unwrap()),
+        Box::new(PercentageDiscount::new("Loyalty 5%", dec!(0.05)).unwrap()),
     ];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
@@ -3199,10 +3297,9 @@ fn discount_total_plus_net_positions_equals_net_total() {
             .build()
             .unwrap(),
     ];
-    let discounts: Vec<Box<dyn billing::DiscountLayer>> = vec![Box::new(FixedDiscount::new(
-        "Rebate",
-        Amount::parse("30.00000").unwrap(),
-    ))];
+    let discounts: Vec<Box<dyn billing::DiscountLayer>> = vec![Box::new(
+        FixedDiscount::new("Rebate", Amount::parse("30.00000").unwrap()).unwrap(),
+    )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], discounts).unwrap();
 
@@ -3259,7 +3356,7 @@ fn positions_by_tag_searches_tax_positions_too() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn billing::TaxLayer>> =
-        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)))];
+        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap())];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), pos, taxes, vec![]).unwrap();
 
     // Tax positions are tagged "tax" by FixedRateTax
@@ -3741,7 +3838,7 @@ fn per_unit_levy_includes_debit_at_negative_price() {
     assert!(epex_position.is_debit());
     assert!(epex_position.net_amount.is_negative());
 
-    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let tax_item = levy.compute(&[epex_position]).unwrap();
     // 1000 kWh × 0.02050 = 20.50 EUR — the levy applies to physical consumption
     assert_eq!(tax_item.net_amount, Amount::parse("20.50000").unwrap());
@@ -3758,7 +3855,7 @@ fn per_unit_levy_excludes_credit_positions_sign_field_regression() {
         .unwrap();
     assert!(feed_in.is_credit());
 
-    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let tax_item = levy.compute(&[feed_in]).unwrap();
     // Sign::Credit → excluded → 0 kWh × 0.02050 = 0
     assert!(tax_item.net_amount.is_zero());
@@ -3785,7 +3882,7 @@ fn per_unit_levy_mixed_sign_positions() {
         .build()
         .unwrap();
 
-    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let tax_item = levy
         .compute(&[consumption, negative_epex, feed_in])
         .unwrap();
@@ -3913,7 +4010,7 @@ fn percentage_charge_includes_debit_at_negative_price() {
     assert!(epex.is_debit());
     assert!(epex.net_amount.is_negative()); // net = -10.00
 
-    let charge = PercentageCharge::new("Commission", dec!(0.05));
+    let charge = PercentageCharge::new("Commission", dec!(0.05)).unwrap();
     let fee = charge.compute(&[epex]).unwrap();
     // Base = -10.00 (debit at negative price included), fee = -10.00 × 0.05 = -0.50
     assert_eq!(fee.net_amount, Amount::parse("-0.50000").unwrap());
@@ -3930,7 +4027,7 @@ fn percentage_discount_excludes_credit_positions() {
         .unwrap();
     assert!(credit.is_credit());
 
-    let disc = PercentageDiscount::new("Loyalty", dec!(0.10));
+    let disc = PercentageDiscount::new("Loyalty", dec!(0.10)).unwrap();
     // Base = only the debit position (100), credit excluded
     let item = disc.compute(&[debit, credit]).unwrap();
     // 100 × 0.10 = 10 → credit → -10
@@ -4100,11 +4197,11 @@ fn allocation_position_scaling_exact() {
 fn dynamic_pricing_no_panic_on_large_price_and_qty() {
     use billing::DynamicPricing;
     // Large qty × price that is within i64 bounds
-    let dp = DynamicPricing::from_intervals(vec![
-        (dec!(1_000_000), Amount::parse("0.00001").unwrap()), // net = 10.00000
-    ])
-    .unwrap()
-    .with_unit("kWh");
+    let dp = DynamicPricing::builder()
+        .unit("kWh")
+        .interval(dec!(1_000_000), Amount::parse("0.00001").unwrap()) // net = 10.00000
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     assert_eq!(item.net_amount, Amount::parse("10.00000").unwrap());
 }
@@ -4113,9 +4210,11 @@ fn dynamic_pricing_no_panic_on_large_price_and_qty() {
 fn dynamic_pricing_negative_epex_price() {
     use billing::DynamicPricing;
     // EPEX negative price: qty=500 kWh × -0.005 EUR/kWh = -2.50000
-    let dp = DynamicPricing::from_intervals(vec![(dec!(500), Amount::parse("-0.00500").unwrap())])
-        .unwrap()
-        .with_unit("kWh");
+    let dp = DynamicPricing::builder()
+        .unit("kWh")
+        .interval(dec!(500), Amount::parse("-0.00500").unwrap())
+        .build()
+        .unwrap();
     let item = dp.calculate().unwrap();
     assert_eq!(item.net_amount, Amount::parse("-2.50000").unwrap());
     // Sign is Debit even though net is negative (negative EPEX scenario)
@@ -4358,7 +4457,10 @@ fn fixed_rate_tax_zero_rate_creates_zero_item() {
             .build()
             .unwrap(),
     ];
-    let item = FixedRateTax::new("ZeroTax", dec!(0)).compute(&pos).unwrap();
+    let item = FixedRateTax::new("ZeroTax", dec!(0))
+        .unwrap()
+        .compute(&pos)
+        .unwrap();
     assert!(item.net_amount.is_zero());
     assert!(item.has_tag("tax"));
 }
@@ -4372,6 +4474,7 @@ fn percentage_discount_rate_zero_creates_zero_credit() {
             .unwrap(),
     ];
     let item = PercentageDiscount::new("NoDiscount", dec!(0))
+        .unwrap()
         .compute(&pos)
         .unwrap();
     assert!(item.net_amount.is_zero());
@@ -4387,6 +4490,7 @@ fn percentage_discount_rate_one_hundred_percent() {
             .unwrap(),
     ];
     let item = PercentageDiscount::new("Full", dec!(1))
+        .unwrap()
         .compute(&pos)
         .unwrap();
     assert_eq!(item.net_amount, Amount::parse("-100.00000").unwrap());
@@ -4421,7 +4525,10 @@ fn equal_allocation_single_recipient() {
     ];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
-    let docs = billing::EqualAllocation::new(1).allocate(&doc).unwrap();
+    let docs = billing::EqualAllocation::new(1)
+        .unwrap()
+        .allocate(&doc)
+        .unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].net_total(), doc.net_total());
 }
@@ -4675,7 +4782,8 @@ fn credit_for_usage_excluded_from_per_unit_levy() {
             .build()
             .unwrap(),
     ];
-    let levy = billing::tax::PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh");
+    let levy =
+        billing::tax::PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
     let doc = BillingDocument::from_positions(
         DocumentMeta::default(),
         positions,
@@ -4725,7 +4833,7 @@ fn document_meta_labels_propagated_through_allocation() {
     };
     meta.labels.insert("malo_id".into(), "52435677816".into());
     let doc = BillingDocument::from_positions(meta, pos, vec![], vec![]).unwrap();
-    let splits = EqualAllocation::new(2).allocate(&doc).unwrap();
+    let splits = EqualAllocation::new(2).unwrap().allocate(&doc).unwrap();
     for split in &splits {
         assert_eq!(
             split.meta.labels.get("malo_id").map(String::as_str),
@@ -4742,7 +4850,7 @@ fn document_meta_labels_propagated_through_allocation() {
 #[test]
 fn to_decimal_equals_into_decimal() {
     let a = Amount::<5>::parse("47.10000").unwrap();
-    assert_eq!(a.to_decimal(), a.into_decimal());
+    assert_eq!(a.into_decimal(), rust_decimal::Decimal::from(a));
 }
 
 #[test]
@@ -4750,7 +4858,7 @@ fn to_decimal_lossless_roundtrip() {
     for s in &["0.00001", "99999.99999", "-12345.67890"] {
         let a = Amount::<5>::parse(s).unwrap();
         assert_eq!(
-            Amount::<5>::checked_from_decimal(a.to_decimal()).unwrap(),
+            Amount::<5>::checked_from_decimal(a.into_decimal()).unwrap(),
             a
         );
     }
@@ -4774,7 +4882,9 @@ fn mixed_vat_rates_require_tag_pattern() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        FixedRateTax::new("MwSt 19%", dec!(0.19)).with_tag("grid-charge"),
+        FixedRateTax::new("MwSt 19%", dec!(0.19))
+            .unwrap()
+            .with_tag("grid-charge"),
     )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
@@ -5189,7 +5299,9 @@ fn mixed_rate_vat_grid_and_feedin_in_one_document() {
 
     // 19% VAT applies ONLY to grid-tagged positions.
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        FixedRateTax::new("MwSt 19%", dec!(0.19)).with_tag("grid"),
+        FixedRateTax::new("MwSt 19%", dec!(0.19))
+            .unwrap()
+            .with_tag("grid"),
     )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();
@@ -5216,7 +5328,9 @@ fn tagged_tax_layer_excludes_untagged_positions_exactly() {
             .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
-        FixedRateTax::new("VAT 10%", dec!(0.10)).with_tag("commodity"),
+        FixedRateTax::new("VAT 10%", dec!(0.10))
+            .unwrap()
+            .with_tag("commodity"),
     )];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), positions, taxes, vec![]).unwrap();

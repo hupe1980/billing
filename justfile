@@ -39,6 +39,7 @@ test-no-features:
     RUSTFLAGS="-D warnings" cargo test --all-targets --no-default-features
 
 # Test against the declared MSRV (requires `rustup toolchain install 1.85`).
+#
 test-msrv:
     cargo +1.85 test --all-targets --all-features
 
@@ -73,18 +74,41 @@ doc:
 doc-build:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+
+# Run criterion benchmarks.
+bench *ARGS:
+    cargo bench {{ ARGS }}
+
+# Save the current benchmark results as the comparison baseline.
+bench-baseline NAME="main":
+    cargo bench -- --save-baseline {{ NAME }}
+
+# Compare current performance against a saved baseline.
+bench-compare NAME="main":
+    cargo bench -- --baseline {{ NAME }}
+
 # ── Security ──────────────────────────────────────────────────────────────────
 
 # Audit dependencies for known vulnerabilities (requires `cargo install cargo-audit`).
 audit:
     cargo audit
 
+# Check for accidental semver-breaking API changes
+# (requires `cargo install cargo-semver-checks`).
+semver:
+    cargo semver-checks check-release
+
 # ── Full CI (mirrors GitHub Actions) ──────────────────────────────────────────
 
 # Run every gate that CI runs: format → lint → docs → tests → examples.
-ci: fmt-check lint doc-build test-all test-no-features test-msrv examples
+ci: fmt-check lint doc-build test-all test-no-features test-msrv bench-check examples
     @echo ""
     @echo "✓ All CI gates passed locally"
+
+# Verify benchmarks still compile (they are not run in CI — too slow and noisy).
+bench-check:
+    cargo bench --no-run
 
 # ── Release ───────────────────────────────────────────────────────────────────
 
@@ -93,7 +117,7 @@ release-dry-run:
     cargo publish --dry-run --allow-dirty
 
 # Tag a new release. Creates an annotated git tag; push it to trigger CI+publish.
-# Usage: just release 0.2.0
+# Usage: just release 0.9.0
 release VERSION:
     @echo "Tagging v{{ VERSION }} …"
     @grep -q 'version.*=.*"{{ VERSION }}"' Cargo.toml \
