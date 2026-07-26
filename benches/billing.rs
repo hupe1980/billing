@@ -74,10 +74,8 @@ fn build_document(n: usize) -> BillingDocument {
         .map(|i| {
             LineItem::for_usage(
                 format!("Position {i}"),
-                Decimal::from(i as u64 + 1) * dec!(10),
-                "kWh",
-                dec!(0.2891),
-                "EUR/kWh",
+                Quantity::new(Decimal::from(i as u64 + 1) * dec!(10), "kWh"),
+                UnitPrice::new(dec!(0.2891), "EUR/kWh"),
             )
             .tag("commodity")
             .build()

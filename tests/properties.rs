@@ -63,7 +63,9 @@ proptest! {
     #[test]
     fn decimal_conversion_roundtrips_exactly(raw in any::<i64>()) {
         let a = Amount::<5>::from_raw_units(raw);
-        prop_assert_eq!(Amount::<5>::from_decimal(a.into_decimal()), Some(a));
+        // `into_decimal` never produces more than P digits, so the *exact*
+        // constructor must accept every value — no rounding involved.
+        prop_assert_eq!(Amount::<5>::checked_from_decimal(a.into_decimal()), Ok(a));
     }
 
     #[test]

@@ -162,9 +162,13 @@ fn non_vat_layers_contribute_nothing_to_the_breakdown() {
     // A platform commission and a per-unit excise are not VAT: the commission is a
     // commercial charge and the excise is part of the VAT *base*, not a VAT.
     let positions = vec![
-        LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Arbeit",
+            Quantity::new(dec!(1000), "kWh"),
+            UnitPrice::new(dec!(0.30), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
         Box::new(
@@ -363,9 +367,13 @@ fn credit_note_negates_everything_and_settles_to_zero() {
     let inv = BillingDocument::from_positions(
         meta("INV-9"),
         vec![
-            LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-                .build()
-                .unwrap(),
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
         ],
         vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
         vec![],
@@ -556,9 +564,13 @@ fn reversing_a_negative_debit_does_not_mint_an_invalid_credit_line() {
     let doc = BillingDocument::from_positions(
         meta("INV-X3"),
         vec![
-            LineItem::for_usage("EPEX negativ", dec!(1000), "kWh", dec!(-0.04), "EUR/kWh")
-                .build()
-                .unwrap(),
+            LineItem::for_usage(
+                "EPEX negativ",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(-0.04), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
         ],
         vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
         vec![],
@@ -733,4 +745,583 @@ fn with_extra_position_is_refused_when_it_would_stale_the_breakdown() {
         .build()
         .unwrap();
     assert!(doc.with_extra_position(extra).is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EN 16931 amount precision — BR-DEC-* decimal limits and BR-CO-* identities
+//
+// Every monetary amount an EN 16931 invoice carries is capped at two decimals
+// (BR-DEC-09/12/13/14/16/17/18/19/20 and BR-DEC-23 for the line amount), while the
+// totals identities must still hold exactly at that precision (BR-CO-10/13/14/15/16
+// and BR-CO-17). A serialiser cannot satisfy both by rounding on the way out; the
+// leaves have to be rounded and the aggregates recomputed from them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rounding the finished totals independently — what a serialiser would do —
+/// breaks the identities EN 16931 also checks. Both counterexamples come from
+/// ordinary inputs, and both are why `amount_scale` exists.
+#[test]
+fn rounding_a_finished_document_breaks_the_en16931_identities() {
+    let r2 = |a: Amount<5>| a.round_to::<2>(RoundingStrategy::MidpointAwayFromZero);
+
+    // BR-CO-10: Σ line net amounts (BT-131) = BT-106.
+    let positions: Vec<LineItem> = ["0.00500", "0.00500", "0.00500"]
+        .iter()
+        .map(|a| {
+            LineItem::fixed("x", Amount::parse(a).unwrap())
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let doc = BillingDocument::from_positions(meta("BR-CO-10"), positions, vec![], vec![]).unwrap();
+    let sum_of_rounded: Amount<2> = doc.net_positions().iter().map(|p| r2(p.net_amount)).sum();
+    assert_ne!(
+        sum_of_rounded,
+        r2(doc.net_total()),
+        "0.005 × 3 must expose the BR-CO-10 break that motivates leaf rounding"
+    );
+
+    // BR-CO-15: BT-112 = BT-109 + BT-110.
+    let doc = BillingDocument::from_positions(
+        meta("BR-CO-15"),
+        vec![
+            LineItem::fixed("x", Amount::parse("0.00420").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()],
+        vec![],
+    )
+    .unwrap();
+    assert_ne!(
+        r2(doc.net_total()) + r2(doc.tax_total()),
+        r2(doc.gross_total()),
+        "0.0042 at 19% must expose the BR-CO-15 break"
+    );
+}
+
+/// Assert every EN 16931 rule that constrains amounts, for one document.
+///
+/// `scale` is the policy the document was assembled under; BR-CO-17 is checked
+/// against a **single** rounding of the exact product, which is how a validator
+/// recomputes it.
+fn assert_amounts_conform(doc: &BillingDocument, scale: AmountScale) {
+    let d = scale.decimals();
+    // BR-DEC-09/12/13/14/16/17/18/19/20/23 — nothing carries more decimals than the
+    // format allows.
+    assert!(
+        doc.fits_amount_scale(d),
+        "BR-DEC violation: {:?}",
+        doc.amount_scale_violation(d)
+    );
+    // BR-CO-10: the positions sum to the net total.
+    let sum: Amount<5> = doc
+        .net_positions()
+        .iter()
+        .chain(doc.discount_positions())
+        .map(|p| p.net_amount)
+        .sum();
+    assert_eq!(sum, doc.net_total(), "BR-CO-10/13");
+    // BR-CO-14: the VAT total is the sum of the per-category tax amounts. Non-VAT
+    // layers add to tax_total without a breakdown entry, so this holds as equality
+    // only when every layer is a VAT layer — the caller's own check.
+    // BR-CO-15: gross = net + tax.
+    assert_eq!(
+        doc.net_total() + doc.tax_total(),
+        doc.gross_total(),
+        "BR-CO-15"
+    );
+    // BR-CO-16: amount due = gross - prepaid + rounding.
+    assert_eq!(
+        doc.gross_total() - doc.prepaid() + doc.rounding(),
+        doc.amount_due().unwrap(),
+        "BR-CO-16"
+    );
+    // BR-CO-17: each category's tax = base × rate, in ONE rounding of the exact
+    // product. Rounding an already-rounded tax answers a different question and can
+    // differ by a whole minor unit, so this recomputes the way a validator does.
+    for e in doc.tax_breakdown() {
+        let expected = scale
+            .apply_decimal(e.taxable_base.into_decimal() * e.rate)
+            .unwrap();
+        assert_eq!(e.tax_amount, expected, "BR-CO-17 for rate {}", e.rate);
+    }
+    // BR-CO-14: the declared VAT total is the sum of the per-category tax amounts.
+    // Equality holds when every layer is a VAT layer; non-VAT layers (a commission,
+    // a per-unit excise) add to `tax_total` without a breakdown entry, so the
+    // breakdown can only ever be a component.
+    let breakdown_tax: Amount<5> = doc.tax_breakdown().iter().map(|e| e.tax_amount).sum();
+    assert!(
+        breakdown_tax.abs() <= doc.tax_total().abs(),
+        "BR-CO-14: breakdown {breakdown_tax} exceeds declared tax {}",
+        doc.tax_total()
+    );
+    // BT-131 = BT-129 × BT-146 for every position derived from a quantity and a
+    // unit price. EN 16931 validators check this per line (at warning severity), and
+    // it only holds if the reduction rounded the exact product rather than an
+    // already-rounded amount.
+    for p in doc.all_positions() {
+        let (Some(q), Some(up)) = (p.quantity.as_ref(), p.unit_price.as_ref()) else {
+            continue;
+        };
+        let mut expected = scale.apply_decimal(q.value * up.value).unwrap();
+        if p.is_credit() && expected.is_positive() {
+            expected = expected.checked_neg().unwrap();
+        }
+        assert_eq!(
+            p.net_amount, expected,
+            "BT-131 = quantity × unit_price for {:?}",
+            p.description
+        );
+    }
+    // And the document's own eleven invariants still hold.
+    doc.assert_valid();
+}
+
+/// The scaled construction satisfies every amount rule across a wide input sweep —
+/// including VAT rates with four decimals, where naive double rounding would drift.
+#[test]
+fn amount_scale_satisfies_en16931_across_a_sweep() {
+    // Rates with 2, 3 and 4 decimals. The 4-decimal ones (a real US sales-tax
+    // shape) are the case where rounding a 5-decimal intermediate a second time
+    // could land a minor unit away from what a validator recomputes for BR-CO-17.
+    let rates = [
+        dec!(0.19),
+        dec!(0.07),
+        dec!(0.081),
+        dec!(0.0825),
+        dec!(0.0625),
+        dec!(0),
+    ];
+    let mut checked = 0;
+    for rate in rates {
+        // Sweep raw net amounts through every 10⁻⁵ residue class, so each rounding
+        // boundary (including exact midpoints) is hit.
+        for raw in (1..4_000i64).chain([49_999, 50_000, 50_001, 149_999, 150_000, 150_001]) {
+            let doc = BillingDocument::builder()
+                .meta(meta("SWEEP"))
+                .amount_scale(AmountScale::EN16931)
+                .positions(vec![
+                    LineItem::fixed("x", Amount::<5>::from_raw_units(raw))
+                        .build()
+                        .unwrap(),
+                ])
+                .extra_tax(FixedRateTax::new("VAT", rate).unwrap().boxed())
+                .build()
+                .unwrap();
+            assert_amounts_conform(&doc, AmountScale::EN16931);
+            checked += 1;
+        }
+    }
+    assert!(checked > 20_000, "sweep should be broad, ran {checked}");
+}
+
+/// The realistic metered line: five decimals in, two decimals out, still valid.
+#[test]
+fn amount_scale_makes_a_metered_invoice_emittable() {
+    let positions = || {
+        vec![
+            // 1234.567 kWh × 0.28901 EUR/kWh = 356.80221 — five decimals.
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1234.567), "kWh"),
+                UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+            LineItem::fixed("Grundpreis", Amount::parse("8.50000").unwrap())
+                .build()
+                .unwrap(),
+        ]
+    };
+
+    // Without the policy the document is arithmetically correct but not emittable.
+    let raw = BillingDocument::from_positions(
+        meta("RAW"),
+        positions(),
+        vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()],
+        vec![],
+    )
+    .unwrap();
+    raw.assert_valid();
+    assert!(!raw.fits_amount_scale(2));
+    let (what, value) = raw.amount_scale_violation(2).unwrap();
+    assert!(what.contains("position[0]"), "{what}");
+    assert_eq!(value, Amount::parse("356.80221").unwrap());
+
+    // With it, every amount fits and every identity still holds.
+    let scaled = BillingDocument::builder()
+        .meta(meta("SCALED"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(positions())
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert_amounts_conform(&scaled, AmountScale::EN16931);
+    assert_eq!(
+        scaled.net_positions()[0].net_amount,
+        Amount::parse("356.80000").unwrap()
+    );
+    assert_eq!(scaled.net_total(), Amount::parse("365.30000").unwrap());
+    assert_eq!(scaled.tax_total(), Amount::parse("69.41000").unwrap());
+    assert_eq!(scaled.gross_total(), Amount::parse("434.71000").unwrap());
+}
+
+/// A full stack — discounts, a per-unit levy, compound VAT, a mixed-rate breakdown
+/// and a prepayment — all reduced consistently.
+#[test]
+fn amount_scale_holds_for_a_full_document_stack() {
+    let doc = BillingDocument::builder()
+        .meta(meta("STACK"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(3333.333), "kWh"),
+                UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+            )
+            .tag("standard")
+            .build()
+            .unwrap(),
+            LineItem::fixed("Reduziert", Amount::parse("77.77700").unwrap())
+                .tag("reduced")
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            PercentageDiscount::new("Treuerabatt", dec!(0.033))
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .with_currency(Currency::EUR)
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("MwSt 19%", dec!(0.19))
+                .unwrap()
+                .with_tag("standard")
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("MwSt 7%", dec!(0.07))
+                .unwrap()
+                .with_tag("reduced")
+                .boxed(),
+        )
+        .build()
+        .unwrap()
+        .with_prepaid(Amount::parse("100.00000").unwrap())
+        .unwrap();
+
+    assert_amounts_conform(&doc, AmountScale::EN16931);
+    assert_eq!(
+        doc.tax_breakdown().len(),
+        2,
+        "one entry per rate (BR-CO-18)"
+    );
+}
+
+/// A scale of 0 (whole units — JPY, KRW) works the same way.
+#[test]
+fn amount_scale_supports_zero_decimal_currencies() {
+    let doc = BillingDocument::builder()
+        .meta(DocumentMeta {
+            currency: Currency::JPY,
+            ..meta("JPY")
+        })
+        .amount_scale(AmountScale::new(0, RoundingStrategy::MidpointAwayFromZero).unwrap())
+        .positions(vec![
+            LineItem::fixed("Item", Amount::parse("1234.56700").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("JCT", dec!(0.10)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert!(doc.fits_amount_scale(0));
+    assert_eq!(doc.net_total(), Amount::parse("1235.00000").unwrap());
+    assert_eq!(doc.tax_total(), Amount::parse("124.00000").unwrap());
+    assert_eq!(doc.gross_total(), Amount::parse("1359.00000").unwrap());
+    doc.assert_valid();
+}
+
+/// The scale policy refuses a precision it cannot deliver.
+#[test]
+fn amount_scale_rejects_a_scale_beyond_line_item_precision() {
+    assert!(AmountScale::new(6, RoundingStrategy::MidpointAwayFromZero).is_err());
+    assert!(AmountScale::new(5, RoundingStrategy::MidpointAwayFromZero).is_ok());
+    assert_eq!(AmountScale::EN16931.decimals(), 2);
+}
+
+/// Regression: the declared VAT total and the VAT breakdown must never disagree.
+///
+/// `TaxLayer::compute` rounds its product to the engine's five decimals with
+/// commercial rounding before the document ever sees it. Reducing *that* to the
+/// reporting scale rounds twice, by a different route than BR-CO-17's single
+/// rounding of the exact product — so with any strategy other than
+/// half-away-from-zero, or any rate whose product exceeds five decimals, the
+/// charged VAT and the reported VAT drifted apart. `0.10 × 0.0999999` is the
+/// smallest case: `0.01` charged against `0.00` declared, violating BR-CO-14.
+#[test]
+fn declared_vat_and_vat_breakdown_agree_for_every_strategy() {
+    let strategies = [
+        RoundingStrategy::MidpointAwayFromZero,
+        RoundingStrategy::MidpointToEven,
+        RoundingStrategy::Ceiling,
+        RoundingStrategy::Floor,
+        RoundingStrategy::Truncate,
+    ];
+    // Rates whose product with a two-decimal base exceeds the engine's five
+    // decimals — where the second rounding can move the result.
+    let rates = [
+        dec!(0.19),
+        dec!(0.0825),
+        dec!(0.06125),
+        dec!(0.190625),
+        dec!(0.0999999),
+        dec!(0.123456),
+    ];
+    let mut checked = 0usize;
+    for strategy in strategies {
+        let scale = AmountScale::new(2, strategy).unwrap();
+        for rate in rates {
+            for cents in 1..600i64 {
+                let doc = BillingDocument::builder()
+                    .meta(meta("BR-CO-14"))
+                    .amount_scale(scale)
+                    .positions(vec![
+                        LineItem::fixed("x", Amount::<5>::from_raw_units(cents * 1_000))
+                            .build()
+                            .unwrap(),
+                    ])
+                    .extra_tax(FixedRateTax::new("VAT", rate).unwrap().boxed())
+                    .build()
+                    .unwrap();
+
+                // The whole point: one VAT layer, so BR-CO-14 is an equality.
+                let breakdown_tax: Amount<5> =
+                    doc.tax_breakdown().iter().map(|e| e.tax_amount).sum();
+                assert_eq!(
+                    breakdown_tax,
+                    doc.tax_total(),
+                    "BR-CO-14 with strategy {strategy:?}, rate {rate}, base {}",
+                    doc.net_total()
+                );
+                assert_amounts_conform(&doc, scale);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 17_000, "ran only {checked} cases");
+}
+
+/// Multi-line documents, pseudo-random quantities and prices, every strategy.
+///
+/// The single-line sweeps pin the rounding boundaries; this pins the *aggregation* —
+/// that many independently reduced lines still sum to totals which satisfy every
+/// identity. Deterministic (xorshift from a fixed seed), so a failure reproduces.
+#[test]
+fn amount_scale_holds_for_random_multi_line_documents() {
+    let strategies = [
+        RoundingStrategy::MidpointAwayFromZero,
+        RoundingStrategy::MidpointToEven,
+        RoundingStrategy::Ceiling,
+        RoundingStrategy::Floor,
+        RoundingStrategy::Truncate,
+    ];
+    let rates = [dec!(0.19), dec!(0.0825), dec!(0.190625), dec!(0.0999999)];
+
+    let mut seed: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    let mut cases = 0usize;
+    for strategy in strategies {
+        let scale = AmountScale::new(2, strategy).unwrap();
+        for rate in rates {
+            for _ in 0..300 {
+                let lines = (next() % 5 + 1) as usize;
+                let positions: Vec<LineItem> = (0..lines)
+                    .map(|i| {
+                        let qty = rust_decimal::Decimal::new((next() % 2_000_000) as i64, 3);
+                        let price = rust_decimal::Decimal::new((next() % 1_000_000) as i64, 6);
+                        LineItem::for_usage(
+                            format!("line {i}"),
+                            Quantity::new(qty, "kWh"),
+                            UnitPrice::new(price, "EUR/kWh"),
+                        )
+                        .build()
+                        .unwrap()
+                    })
+                    .collect();
+
+                let doc = BillingDocument::builder()
+                    .meta(meta("RANDOM"))
+                    .amount_scale(scale)
+                    .positions(positions)
+                    .extra_tax(FixedRateTax::new("VAT", rate).unwrap().boxed())
+                    .build()
+                    .unwrap();
+
+                assert_amounts_conform(&doc, scale);
+                // One VAT layer and no other tax, so BR-CO-14 is an equality here.
+                let breakdown_tax: Amount<5> =
+                    doc.tax_breakdown().iter().map(|e| e.tax_amount).sum();
+                assert_eq!(breakdown_tax, doc.tax_total(), "BR-CO-14");
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 6_000);
+}
+
+/// The exact case that exposed the divergence, pinned on its own.
+#[test]
+fn br_co_14_regression_floor_strategy_with_a_seven_decimal_rate() {
+    let scale = AmountScale::new(2, RoundingStrategy::Floor).unwrap();
+    let doc = BillingDocument::builder()
+        .meta(meta("REG"))
+        .amount_scale(scale)
+        .positions(vec![
+            LineItem::fixed("x", Amount::parse("0.10000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("VAT", dec!(0.0999999)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // 0.10 × 0.0999999 = 0.00999999. Floored to two decimals that is 0.00 —
+    // one rounding of the exact product, which is what BR-CO-17 specifies.
+    // Rounding to five decimals first gave 0.01000, then floored to 0.01.
+    assert_eq!(doc.tax_breakdown()[0].tax_amount, Amount::<5>::ZERO);
+    assert_eq!(doc.tax_total(), Amount::<5>::ZERO);
+    doc.assert_valid();
+}
+
+/// A metered line is reduced from its **exact** product, not from the already-
+/// rounded stored amount.
+///
+/// `LineItemBuilder::build` rounds `quantity × unit_price` to the engine's five
+/// decimals. Reducing that a second time rounds twice and can move the line a whole
+/// cent, which also pushes it off `BT-131 = BT-129 × BT-146` — a rule EN 16931
+/// validators check on every line.
+#[test]
+fn a_metered_line_is_reduced_from_the_exact_product() {
+    // 0.0999999 EUR/kWh × 0.1 kWh = 0.00999999.
+    //   Engine value (5 dp, commercial): 0.01000  -> floored to 2 dp: 0.01
+    //   Exact product floored to 2 dp:   0.00     <- correct, one rounding
+    let doc = BillingDocument::builder()
+        .meta(meta("LINE"))
+        .amount_scale(AmountScale::new(2, RoundingStrategy::Floor).unwrap())
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(0.1), "kWh"),
+                UnitPrice::new(dec!(0.0999999), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(doc.net_positions()[0].net_amount, Amount::<5>::ZERO);
+    assert_eq!(doc.net_total(), Amount::<5>::ZERO);
+    doc.assert_valid();
+
+    // The credit counterpart keeps its sign.
+    let credit = BillingDocument::builder()
+        .meta(meta("LINE-C"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::credit_for_usage(
+                "Einspeisung",
+                Quantity::new(dec!(1234.567), "kWh"),
+                UnitPrice::new(dec!(0.08110), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    // 1234.567 × 0.0811 = 100.1233837 -> 100.12, credited.
+    assert_eq!(
+        credit.net_positions()[0].net_amount,
+        Amount::parse("-100.12000").unwrap()
+    );
+    assert!(credit.net_positions()[0].is_credit());
+    credit.assert_valid();
+}
+
+/// A stated `fixed_amount` is authoritative even when a quantity is also present —
+/// it is reduced verbatim, never recomputed from `quantity × unit_price`.
+#[test]
+fn a_stated_fixed_amount_is_never_recomputed_from_the_quantity() {
+    let stated = LineItem::debit("Pauschale mit Mengenangabe")
+        .quantity(Quantity::new(dec!(1000), "kWh"))
+        .unit_price(UnitPrice::new(dec!(0.30), "EUR/kWh"))
+        // Deliberately NOT 1000 × 0.30 = 300.
+        .fixed_amount(Amount::parse("123.45678").unwrap())
+        .build()
+        .unwrap();
+    assert_eq!(stated.net_amount, Amount::parse("123.45678").unwrap());
+
+    let doc = BillingDocument::builder()
+        .meta(meta("FIXED"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![stated])
+        .build()
+        .unwrap();
+    // The stated amount, reduced — not 300.00.
+    assert_eq!(
+        doc.net_positions()[0].net_amount,
+        Amount::parse("123.46000").unwrap()
+    );
+    doc.assert_valid();
+}
+
+/// Reversal preserves the scale; **allocation does not**, and cannot.
+///
+/// Splitting 100.00 three ways is 33.333… — there is no two-decimal answer, so an
+/// allocated document has to be re-assembled (or re-checked) before it is emitted.
+/// This is pinned as a test rather than left to be discovered downstream.
+#[test]
+fn allocation_breaks_the_amount_scale_but_reversal_keeps_it() {
+    let doc = BillingDocument::builder()
+        .meta(meta("SPLIT"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("x", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("V", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert!(doc.fits_amount_scale(2));
+
+    // A credit note of a two-decimal invoice is still two decimals.
+    let reversed = doc.reverse(meta("STORNO")).unwrap();
+    assert!(reversed.fits_amount_scale(2));
+    assert_amounts_conform(&reversed, AmountScale::EN16931);
+
+    // A three-way split of 100.00 is not.
+    let parts = EqualAllocation::new(3).unwrap().allocate(&doc).unwrap();
+    assert!(
+        parts.iter().any(|p| !p.fits_amount_scale(2)),
+        "an equal three-way split cannot land on two decimals"
+    );
+    // The allocation is still exact — it is the *precision*, not the sum, that gives.
+    let total: Amount<5> = parts.iter().map(|p| p.gross_total()).sum();
+    assert_eq!(total, doc.gross_total());
+    for p in &parts {
+        p.assert_valid();
+    }
 }

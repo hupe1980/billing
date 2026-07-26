@@ -1,11 +1,12 @@
 //! [`BillingDocument`] — self-validating invoice with ordered positions + totals.
 use crate::advance::{AdvancePayment, DocumentKind, Prepayment};
-use crate::amount::Amount;
+use crate::amount::{Amount, AmountScale};
 use crate::currency::Currency;
 use crate::error::BillingError;
 use crate::line_item::LineItem;
 use crate::period::Period;
 use crate::settlement::CashRounding;
+use crate::tariff::Billing;
 use crate::tax::{DiscountLayer, TaxLayer};
 use crate::vat::TaxBreakdownEntry;
 
@@ -225,6 +226,86 @@ impl BillingDocument {
         &self.tax_breakdown
     }
 
+    /// Whether **every** monetary amount in this document fits `scale` decimals.
+    ///
+    /// The precondition for emitting the document into an interchange format that
+    /// caps decimals on money — EN 16931 and its national CIUSes (XRechnung,
+    /// Peppol BIS, ZUGFeRD/Factur-X) all cap at two. Covers every amount a format
+    /// carries: each position (BT-131), the totals (BT-106 / BT-109 / BT-110 /
+    /// BT-112), the paid amount and rounding amount (BT-113 / BT-114), the amount
+    /// due (BT-115), each VAT breakdown entry's base and tax (BT-116 / BT-117), and
+    /// each itemised advance payment.
+    ///
+    /// A document built with [`BillingDocumentBuilder::amount_scale`] satisfies this
+    /// by construction. For any other document this is a genuine question, because
+    /// `quantity × unit_price` routinely produces more decimals than two:
+    /// `1234.567 kWh × 0.28901 EUR/kWh = 356.80221`.
+    ///
+    /// Do **not** respond to a `false` here by rounding the amounts on the way out —
+    /// that breaks the totals identities the same format also checks. Rebuild with
+    /// `amount_scale` instead; [`AmountScale`] explains why.
+    ///
+    /// ```rust
+    /// # use billing::{BillingDocument, DocumentMeta, LineItem, Amount, Currency,
+    /// #               AmountScale, Quantity, UnitPrice};
+    /// # use rust_decimal::dec;
+    /// let positions = || vec![LineItem::for_usage(
+    ///     "Arbeit",
+    ///     Quantity::new(dec!(1234.567), "kWh"),
+    ///     UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+    /// ).build().unwrap()];
+    ///
+    /// let raw = BillingDocument::builder().currency(Currency::EUR)
+    ///     .positions(positions()).build()?;
+    /// assert!(!raw.fits_amount_scale(2)); // 356.80221 — not emittable as EN 16931
+    ///
+    /// let scaled = BillingDocument::builder().currency(Currency::EUR)
+    ///     .amount_scale(AmountScale::EN16931)
+    ///     .positions(positions()).build()?;
+    /// assert!(scaled.fits_amount_scale(2));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn fits_amount_scale(&self, scale: u8) -> bool {
+        self.amount_scale_violation(scale).is_none()
+    }
+
+    /// The first amount that does not fit `scale` decimals, as
+    /// `(what, value)` — for reporting which field to look at.
+    ///
+    /// Returns `None` exactly when [`BillingDocument::fits_amount_scale`] is `true`.
+    #[must_use]
+    pub fn amount_scale_violation(&self, scale: u8) -> Option<(String, Amount<5>)> {
+        let mut checks: Vec<(String, Amount<5>)> = Vec::new();
+        for (i, p) in self.all_positions().enumerate() {
+            checks.push((format!("position[{i}] {:?}", p.description), p.net_amount));
+        }
+        checks.extend([
+            ("net_total (BT-106/BT-109)".to_owned(), self.net_total),
+            ("tax_total (BT-110)".to_owned(), self.tax_total),
+            ("gross_total (BT-112)".to_owned(), self.gross_total),
+            ("discount_total (BT-107)".to_owned(), self.discount_total),
+            ("prepaid (BT-113)".to_owned(), self.prepaid),
+            ("rounding (BT-114)".to_owned(), self.rounding),
+        ]);
+        for (i, e) in self.tax_breakdown.iter().enumerate() {
+            checks.push((
+                format!("tax_breakdown[{i}].taxable_base (BT-116)"),
+                e.taxable_base,
+            ));
+            checks.push((
+                format!("tax_breakdown[{i}].tax_amount (BT-117)"),
+                e.tax_amount,
+            ));
+        }
+        for (i, a) in self.prepayment.advances().iter().enumerate() {
+            checks.push((format!("advance[{i}].gross"), a.gross()));
+        }
+        checks
+            .into_iter()
+            .find(|(_, amount)| !amount.fits_scale(scale))
+    }
+
     /// EN 16931 **BT-113** — the sum of amounts already paid (advance payments,
     /// deposits, instalments).
     pub fn prepaid(&self) -> Amount<5> {
@@ -361,11 +442,80 @@ impl BillingDocument {
     ///
     /// Discount layers are applied first (reduce the taxable base),
     /// then tax layers are applied to the combined net + discount positions.
+    ///
+    /// Amounts keep their full 5-decimal precision. To assemble a document whose
+    /// every amount fits an interchange format's decimal limit, use
+    /// [`BillingDocumentBuilder::amount_scale`].
     pub fn from_positions(
         meta: DocumentMeta,
         positions: Vec<LineItem>,
         tax_layers: Vec<Box<dyn TaxLayer>>,
         discounts: Vec<Box<dyn DiscountLayer>>,
+    ) -> Result<Self, BillingError> {
+        Self::assemble(meta, positions, tax_layers, discounts, None)
+    }
+
+    /// Reduce one position's amount to `scale`, rounding the **exact** product once
+    /// where the position was derived from `quantity × unit_price`.
+    ///
+    /// [`crate::LineItemBuilder::build`] rounds that product to the engine's five
+    /// decimals. Reducing the stored result again would round twice and can land a
+    /// whole minor unit away from rounding the true product directly — the same
+    /// defect that made the declared VAT disagree with the VAT breakdown. It also
+    /// pushes the line off `BT-131 = BT-129 × BT-146`, which EN 16931 validators
+    /// check (as a warning) on every line.
+    ///
+    /// The stored amount is only bypassed when it still **agrees** with the product
+    /// at the engine's precision. A position carrying an explicit `fixed_amount`
+    /// alongside a quantity is deliberately not `quantity × unit_price`, and that
+    /// stated amount is authoritative — it is reduced as-is.
+    fn reduce_position(item: &LineItem, scale: AmountScale) -> Result<Amount<5>, BillingError> {
+        let (Some(qty), Some(price)) = (item.quantity.as_ref(), item.unit_price.as_ref()) else {
+            return scale.apply(item.net_amount);
+        };
+        let Some(product) = qty.value.checked_mul(price.value) else {
+            return scale.apply(item.net_amount);
+        };
+        // Reconstruct what `build()` would have stored, sign convention included.
+        let engine_value = {
+            let rounded = Amount::<5>::from_decimal_rounded(
+                product,
+                crate::amount::RoundingStrategy::MidpointAwayFromZero,
+            );
+            match rounded {
+                Ok(v) if item.is_credit() && v.is_positive() => v.checked_neg()?,
+                Ok(v) => v,
+                Err(_) => return scale.apply(item.net_amount),
+            }
+        };
+        if engine_value != item.net_amount {
+            // A stated amount that is not the product — honour it verbatim.
+            return scale.apply(item.net_amount);
+        }
+        let reduced = scale.apply_decimal(product)?;
+        if item.is_credit() && reduced.is_positive() {
+            reduced.checked_neg()
+        } else {
+            Ok(reduced)
+        }
+    }
+
+    /// Shared assembly path for [`BillingDocument::from_positions`] and the
+    /// builder's scaled variant.
+    ///
+    /// When `scale` is set, every **leaf** amount — each incoming position, each
+    /// discount-layer output, each tax-layer output and each VAT breakdown entry —
+    /// is reduced to the requested precision *before* any aggregate is computed.
+    /// Every total is then a sum of already-reduced values, so it lands on the same
+    /// precision exactly, and the totals identities hold at that precision rather
+    /// than only at 5 decimals. Rounding the finished totals instead would break
+    /// them; see [`AmountScale`] for the worked counterexamples.
+    fn assemble(
+        meta: DocumentMeta,
+        positions: Vec<LineItem>,
+        tax_layers: Vec<Box<dyn TaxLayer>>,
+        discounts: Vec<Box<dyn DiscountLayer>>,
+        scale: Option<AmountScale>,
     ) -> Result<Self, BillingError> {
         // `LineItem` has public fields, so a caller can hand us a position with an
         // empty description or a negative quantity. Check it here: the type doc
@@ -375,10 +525,27 @@ impl BillingDocument {
             item.validate()?;
         }
 
+        // Reduce the leaves first. Every layer below then computes over amounts that
+        // are already at the target precision, which keeps a layer's base equal to
+        // the base that will be reported in the VAT breakdown.
+        let positions = match scale {
+            None => positions,
+            Some(s) => positions
+                .into_iter()
+                .map(|mut p| {
+                    p.net_amount = Self::reduce_position(&p, s)?;
+                    Ok(p)
+                })
+                .collect::<Result<Vec<_>, BillingError>>()?,
+        };
+
         let discount_positions: Vec<LineItem> = discounts
             .iter()
             .map(|d| {
-                let item = d.compute(&positions)?;
+                let mut item = d.compute(&positions)?;
+                if let Some(s) = scale {
+                    item.net_amount = s.apply(item.net_amount)?;
+                }
                 // The `DiscountLayer` contract says "always returns a credit".
                 // Check it here so a misbehaving layer is named at the point of
                 // failure rather than surfacing later as a validation error.
@@ -416,11 +583,55 @@ impl BillingDocument {
         for t in &tax_layers {
             // `breakdown` sees the SAME slice `compute` does, so the reported
             // taxable base is exactly the base the tax was charged on.
-            if let Some(entry) = t.breakdown(&accumulated)? {
+            let mut scaled_tax = None;
+            if let Some(mut entry) = t.breakdown(&accumulated)? {
+                if let Some(s) = scale {
+                    // Reduce the base first, then derive the tax from the *reduced*
+                    // base in a SINGLE rounding of the exact product. EN 16931
+                    // BR-CO-17 defines `BT-117 = BT-116 × rate` rounded to the
+                    // reported precision, and a validator recomputes it that way —
+                    // so rounding an already-rounded tax would answer a different
+                    // question and can differ by a whole minor unit.
+                    entry.taxable_base = s.apply(entry.taxable_base)?;
+                    entry.tax_amount = s.apply_decimal(
+                        entry
+                            .taxable_base
+                            .into_decimal()
+                            .checked_mul(entry.rate)
+                            .ok_or(BillingError::MonetaryOverflow {
+                                precision: 5,
+                                input_value: None,
+                            })?,
+                    )?;
+                    scaled_tax = Some(entry.tax_amount);
+                }
                 entry.validate()?;
                 breakdown_entries.push(entry);
             }
-            let item = t.compute(&accumulated)?;
+            let mut item = t.compute(&accumulated)?;
+            if let Some(s) = scale {
+                // A layer that reports a VAT breakdown has just had its tax
+                // recomputed above, from the reduced base, in one rounding. Its
+                // charged position must carry that same number: EN 16931 BR-CO-14
+                // requires `BT-110 = Σ BT-117`, and a `TaxLayer` is contractually
+                // computing `breakdown` and `compute` over the same base.
+                //
+                // Reducing the layer's own output independently would round twice
+                // by a different route — `TaxLayer::compute` rounds its product to
+                // the engine's 5 decimals with commercial rounding before this code
+                // ever sees it — and the two results diverge whenever the scale uses
+                // a different strategy, or the product carries more than 5 decimals.
+                // That produced a document whose declared VAT and whose VAT
+                // breakdown disagreed.
+                item.net_amount = match scaled_tax {
+                    Some(tax) => tax,
+                    // A non-VAT layer (a per-unit excise, a commission) reports no
+                    // breakdown. Reduce its output the same way a position is
+                    // reduced, so a levy carrying `quantity × unit_price` is also
+                    // rounded once from its exact product.
+                    None => Self::reduce_position(&item, s)?,
+                };
+            }
             accumulated.push(item.clone());
             tax_positions.push(item);
         }
@@ -1060,6 +1271,7 @@ pub struct BillingDocumentBuilder {
     positions: Vec<LineItem>,
     tax_layers: Vec<Box<dyn TaxLayer>>,
     discount_layers: Vec<Box<dyn DiscountLayer>>,
+    amount_scale: Option<AmountScale>,
 }
 
 impl BillingDocumentBuilder {
@@ -1079,25 +1291,80 @@ impl BillingDocumentBuilder {
         self
     }
 
-    /// Load positions and layers from a [`crate::Tariff`] implementation.
+    /// Load positions and layers from a [`crate::Tariff`] that always bills.
     ///
     /// Replaces any previously set positions and layers.
+    ///
+    /// Bounded on `T::NotBillable = Infallible`. For a tariff that can decline to
+    /// bill, use [`try_tariff`](Self::try_tariff) — there is no way to represent a
+    /// "nothing to bill, because X" outcome as a builder, so the bound forces the
+    /// caller to handle it rather than have the reason silently dropped.
     ///
     /// # Errors
     /// Returns `Err` if `tariff.line_items(usage)` fails, converted to `BillingError`
     /// via `T::Error: Into<BillingError>`.
-    pub fn tariff<T: crate::tariff::Tariff>(
+    pub fn tariff<T>(self, tariff: &T, usage: &T::Usage) -> Result<Self, BillingError>
+    where
+        T: crate::tariff::Tariff<NotBillable = std::convert::Infallible>,
+        T::Error: Into<BillingError>,
+    {
+        Ok(self.try_tariff(tariff, usage)?.into_inner())
+    }
+
+    /// Load positions and layers from a [`crate::Tariff`], propagating a
+    /// "nothing to bill" outcome.
+    ///
+    /// Replaces any previously set positions and layers. Returns
+    /// [`Billing::NotBillable`] — carrying the tariff's own reason — when the tariff
+    /// declines to bill; the builder is then not returned, because there is no
+    /// document to assemble.
+    ///
+    /// ```rust
+    /// # use billing::{BillingDocument, Billing, DocumentMeta, Tariff, Positions, LineItem, Amount};
+    /// # use std::convert::Infallible;
+    /// # #[derive(Debug)] struct NoData;
+    /// # impl std::fmt::Display for NoData {
+    /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("no data") }
+    /// # }
+    /// # struct T2;
+    /// # impl Tariff for T2 {
+    /// #     type Usage = (); type Error = Infallible; type NotBillable = NoData;
+    /// #     fn line_items(&self, _: &()) -> Result<Positions<NoData>, Infallible> {
+    /// #         Ok(Billing::NotBillable(NoData))
+    /// #     }
+    /// # }
+    /// let outcome = BillingDocument::builder()
+    ///     .meta(DocumentMeta::default())
+    ///     .try_tariff(&T2, &())?;
+    ///
+    /// let doc = match outcome {
+    ///     Billing::Billable(builder) => Some(builder.build()?),
+    ///     // The reason is available here, instead of appearing as an empty document.
+    ///     Billing::NotBillable(reason) => { eprintln!("skipped: {reason}"); None }
+    /// };
+    /// assert!(doc.is_none());
+    /// # Ok::<(), billing::BillingError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `Err` if `tariff.line_items(usage)` fails, converted to `BillingError`
+    /// via `T::Error: Into<BillingError>`.
+    pub fn try_tariff<T: crate::tariff::Tariff>(
         mut self,
         tariff: &T,
         usage: &T::Usage,
-    ) -> Result<Self, BillingError>
+    ) -> Result<Billing<Self, T::NotBillable>, BillingError>
     where
         T::Error: Into<BillingError>,
     {
-        self.positions = tariff.line_items(usage).map_err(Into::into)?;
+        let positions = match tariff.line_items(usage).map_err(Into::into)? {
+            Billing::Billable(items) => items,
+            Billing::NotBillable(reason) => return Ok(Billing::NotBillable(reason)),
+        };
+        self.positions = positions;
         self.tax_layers = tariff.tax_layers();
         self.discount_layers = tariff.discount_layers();
-        Ok(self)
+        Ok(Billing::Billable(self))
     }
 
     /// Extend positions with pre-computed `LineItem`s.
@@ -1121,13 +1388,83 @@ impl BillingDocumentBuilder {
         self
     }
 
+    /// Assemble every amount at a fixed number of decimal places.
+    ///
+    /// Each **leaf** amount — every position, every discount- and tax-layer output,
+    /// and every VAT breakdown entry — is reduced to `scale` before any total is
+    /// computed, so each total is a sum of already-reduced values and lands on the
+    /// same precision exactly.
+    ///
+    /// # Why this cannot be done afterwards
+    ///
+    /// Reducing the precision of a finished document breaks its own arithmetic.
+    /// Rounding each total independently is not a rounding of the document, it is
+    /// four unrelated roundings that no longer add up:
+    ///
+    /// - three positions of `0.005` each become `0.01`, summing to `0.03`, while the
+    ///   exact total `0.015` becomes `0.02` — the positions no longer sum to the
+    ///   total (EN 16931 **BR-CO-10**);
+    /// - a net of `0.0042` with 19 % VAT gives `0.00 + 0.00 ≠ 0.01` — net plus tax
+    ///   no longer equals gross (**BR-CO-15**).
+    ///
+    /// Both are produced by real inputs, and both make an EN 16931 validator reject
+    /// the invoice. Rounding the leaves and recomputing the aggregates is the only
+    /// construction that satisfies the decimal limits and the totals identities at
+    /// the same time — and it has to happen here, during assembly.
+    ///
+    /// Use [`AmountScale::EN16931`] for the two decimals that EN 16931, XRechnung,
+    /// Peppol BIS and ZUGFeRD all require.
+    ///
+    /// # What preserves the scale, and what does not
+    ///
+    /// [`BillingDocument::reverse`] preserves it — a credit note of a two-decimal
+    /// invoice is two decimals. [`crate::AllocationRule`] **does not, and cannot**:
+    /// splitting `100.00` three ways is `33.333…`, and there is no two-decimal
+    /// answer. Allocation keeps the split *exact* (the parts still sum to the
+    /// original) at the cost of precision, which is the right trade for money but
+    /// means an allocated document must be re-assembled — or at least re-checked
+    /// with [`BillingDocument::fits_amount_scale`] — before it is emitted.
+    ///
+    /// ```rust
+    /// use billing::{BillingDocument, DocumentMeta, LineItem, Amount, Currency,
+    ///               AmountScale, FixedRateTax, TaxLayer, Quantity, UnitPrice};
+    /// use rust_decimal::dec;
+    ///
+    /// // 1234.567 kWh × 0.28901 EUR/kWh = 356.80221 — five decimals.
+    /// let doc = BillingDocument::builder()
+    ///     .currency(Currency::EUR)
+    ///     .amount_scale(AmountScale::EN16931)
+    ///     .positions(vec![LineItem::for_usage(
+    ///         "Arbeit",
+    ///         Quantity::new(dec!(1234.567), "kWh"),
+    ///         UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+    ///     ).build()?])
+    ///     .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.boxed())
+    ///     .build()?;
+    ///
+    /// // Every amount now fits two decimals …
+    /// assert!(doc.fits_amount_scale(2));
+    /// assert_eq!(doc.net_total(),   Amount::parse("356.80000")?);
+    /// assert_eq!(doc.tax_total(),   Amount::parse("67.79000")?);
+    /// assert_eq!(doc.gross_total(), Amount::parse("424.59000")?);
+    /// // … and the identities still hold exactly, so the document validates.
+    /// doc.assert_valid();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn amount_scale(mut self, scale: AmountScale) -> Self {
+        self.amount_scale = Some(scale);
+        self
+    }
+
     /// Build the [`BillingDocument`].
     pub fn build(self) -> Result<BillingDocument, BillingError> {
-        BillingDocument::from_positions(
+        BillingDocument::assemble(
             self.meta,
             self.positions,
             self.tax_layers,
             self.discount_layers,
+            self.amount_scale,
         )
     }
 }

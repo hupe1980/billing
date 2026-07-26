@@ -254,12 +254,11 @@ pub fn prorate_amount(
         .ok_or_else(overflow)?;
     // Apply strategy once on the raw product (same logic as prorate()).
     // `checked_mul`: `Decimal`'s `*` panics on overflow.
-    let rounded = amount
+    let product = amount
         .into_decimal()
         .checked_mul(fraction)
-        .ok_or_else(overflow)?
-        .round_dp_with_strategy(5, strategy.into());
-    Amount::<5>::from_decimal(rounded).ok_or_else(overflow)
+        .ok_or_else(overflow)?;
+    Amount::<5>::from_decimal_rounded(product, strategy)
 }
 
 #[cfg(test)]

@@ -56,6 +56,23 @@ pub enum BillingError {
         input_value: Option<Decimal>,
     },
 
+    /// A [`Decimal`] carried more non-zero fractional digits than the target
+    /// [`crate::Amount`]`<P>` can represent.
+    ///
+    /// This is **not** overflow: the magnitude fits, the precision does not.
+    /// `Amount::<5>::checked_from_decimal(dec!(0.123456))` reports it, exactly as
+    /// `Amount::<5>::parse("0.123456")` is rejected — the two conversion paths
+    /// agree by construction.
+    ///
+    /// To round instead of refusing, name the rounding you want with
+    /// [`crate::Amount::from_decimal_rounded`].
+    PrecisionLoss {
+        /// The precision `P` of the target `Amount<P>`.
+        precision: u8,
+        /// The value that could not be represented exactly.
+        input_value: Decimal,
+    },
+
     /// A [`crate::TariffSchedule`] was built or used incorrectly.
     InvalidSchedule {
         /// Human-readable explanation. Accepts static literals (`"msg".into()`)
@@ -136,6 +153,14 @@ impl fmt::Display for BillingError {
             } => write!(
                 f,
                 "monetary overflow: amount exceeds representable range for Amount<{precision}>"
+            ),
+            Self::PrecisionLoss {
+                precision,
+                input_value,
+            } => write!(
+                f,
+                "precision loss: {input_value} has more non-zero fractional digits than \
+                 Amount<{precision}> can represent — use from_decimal_rounded to round explicitly"
             ),
             Self::InvalidSchedule { reason } => write!(f, "invalid tariff schedule: {reason}"),
             Self::InvalidInput { reason } => write!(f, "invalid input: {reason}"),

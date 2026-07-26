@@ -82,4 +82,29 @@ fn main() {
     // Exact: no rounding drift
     assert_eq!(sum, doc.net_total());
     println!("✓ Allocation sum matches original (no rounding drift)");
+
+    // ── Exactness and invoice precision pull in opposite directions ──────────
+    //
+    // The invoice itself fits two decimals, so it could be emitted as EN 16931.
+    // Its three-way split cannot: 47.10 at 35 % is 16.485, and there is no
+    // two-decimal answer. Allocation keeps the *sum* exact — which is the right
+    // trade for money, since inventing or losing a cent is worse than carrying a
+    // third decimal — at the cost of the precision an invoice needs.
+    //
+    // So a tenant document has to be re-assembled at invoice precision before it is
+    // billed onward, and the split is what must then absorb the difference.
+    assert!(doc.fits_amount_scale(2), "the invoice itself is emittable");
+    let unemittable = tenant_docs
+        .iter()
+        .filter(|d| !d.fits_amount_scale(2))
+        .count();
+    println!();
+    println!(
+        "  {unemittable} of {} tenant documents carry more than two decimals",
+        tenant_docs.len()
+    );
+    if let Some((what, value)) = tenant_docs.iter().find_map(|d| d.amount_scale_violation(2)) {
+        println!("  e.g. {what} = {value} — exact, but not an invoice amount");
+    }
+    println!("  → re-assemble a tenant document with `amount_scale` before billing it on");
 }

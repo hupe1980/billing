@@ -10,6 +10,7 @@ use billing::{
     merge_period_documents, minimum_charge, proportional_split, prorate, prorate_amount,
 };
 use rust_decimal::dec;
+use std::convert::Infallible;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Amount<P> — arithmetic precision
@@ -158,12 +159,24 @@ fn amount_round_to_ceiling() {
 }
 
 #[test]
-fn amount_from_decimal_midpoint_rounds_away() {
-    // 0.5 → 1 at scale 10^0 = rounds up (MidpointAwayFromZero)
+fn amount_from_decimal_rounded_midpoint_rounds_away() {
     // For Amount<2>: 1.005 × 100 = 100.5 → rounds to 101 → 1.01
     let d = rust_decimal::Decimal::from_str_exact("1.005").unwrap();
-    let a = Amount::<2>::try_from(d).unwrap();
+    let a = Amount::<2>::from_decimal_rounded(d, RoundingStrategy::MidpointAwayFromZero).unwrap();
     assert_eq!(a, Amount::<2>::parse("1.01").unwrap());
+}
+
+/// The exact conversion refuses what it cannot represent instead of rounding it.
+///
+/// `TryFrom<Decimal>` is the exact path, so a third decimal at `P = 2` is an error —
+/// the caller must name a `RoundingStrategy` to discard it.
+#[test]
+fn amount_try_from_decimal_refuses_excess_precision() {
+    let d = rust_decimal::Decimal::from_str_exact("1.005").unwrap();
+    assert!(matches!(
+        Amount::<2>::try_from(d),
+        Err(BillingError::PrecisionLoss { precision: 2, .. })
+    ));
 }
 
 #[test]
@@ -221,9 +234,10 @@ fn line_item_qty_price_multiplication_precision() {
     // Verify it doesn't use f64 approximation
     assert_eq!(
         item.net_amount,
-        Amount::<5>::from_decimal(
+        Amount::<5>::from_decimal_rounded(
             rust_decimal::Decimal::from_str_exact("1234.567").unwrap()
-                * rust_decimal::Decimal::from_str_exact("0.28901").unwrap()
+                * rust_decimal::Decimal::from_str_exact("0.28901").unwrap(),
+            RoundingStrategy::MidpointAwayFromZero
         )
         .unwrap()
     );
@@ -808,23 +822,21 @@ fn with_extra_position_preserves_assert_valid() {
 
 #[test]
 fn builder_with_tariff_then_extra_tax() {
+    // A usage-less tariff: `ScalarTariff` needs no `type Usage = ()` and no
+    // ignored `usage` parameter, and the blanket impl still makes it a `Tariff`.
     struct FlatTariff;
-    impl Tariff for FlatTariff {
-        type Usage = ();
+    impl ScalarTariff for FlatTariff {
         type Error = BillingError;
-        fn line_items(&self, _: &()) -> Result<Vec<LineItem>, BillingError> {
-            Ok(vec![
-                LineItem::fixed("Flat", Amount::<5>::from_int(100))
-                    .build()
-                    .unwrap(),
-            ])
+        type NotBillable = Infallible;
+        fn positions(&self) -> Result<Positions<Infallible>, BillingError> {
+            Ok(vec![LineItem::fixed("Flat", Amount::<5>::from_int(100)).build()?].into())
         }
     }
     let doc = BillingDocument::builder()
         .meta(DocumentMeta::default())
         .tariff(&FlatTariff, &())
         .unwrap()
-        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.10)).unwrap()))
+        .extra_tax(FixedRateTax::new("VAT", dec!(0.10)).unwrap().boxed())
         .build()
         .unwrap();
     assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
@@ -1960,10 +1972,8 @@ fn line_item_negative_unit_price_debit_produces_negative_net() {
 fn line_item_for_usage_negative_price() {
     let item = LineItem::for_usage(
         "EPEX Spot (negativ)",
-        dec!(1000),
-        "kWh",
-        dec!(-0.005),
-        "EUR/kWh",
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(-0.005), "EUR/kWh"),
     )
     .build()
     .unwrap();
@@ -2348,13 +2358,13 @@ fn amount_parse_one_above_max_is_error() {
 
 #[test]
 fn amount_into_decimal_lossless_roundtrip() {
-    // into_decimal() must be the exact inverse of from_decimal() for all values
-    // in the representable range.
+    // into_decimal() must be the exact inverse of checked_from_decimal() for all
+    // values in the representable range.
     for raw in [0i64, 1, -1, i64::MAX, i64::MIN + 1, 100_000, -100_000] {
         // Use parse()/to_raw() instead of from_raw() (internal API).
         let a = Amount::<5>::from_int(raw / 100_000); // scale to whole-number Amount
         let d = a.into_decimal();
-        let back = Amount::<5>::from_decimal(d).expect("roundtrip must succeed");
+        let back = Amount::<5>::checked_from_decimal(d).expect("roundtrip must succeed");
         assert_eq!(
             back.to_raw(),
             a.to_raw(),
@@ -3107,7 +3117,7 @@ fn within_tolerance_ppm_inside_window() {
     let stated = Amount::<5>::parse("100.00000").unwrap();
     let computed = Amount::<5>::parse("100.50000").unwrap();
     // 0.5 / 100.0 = 5_000 ppm — inside 10_000 ppm (1 %)
-    assert!(stated.within_tolerance_ppm(computed, 10_000).unwrap());
+    assert!(stated.within_tolerance_ppm(computed, 10_000));
 }
 
 #[test]
@@ -3115,28 +3125,28 @@ fn within_tolerance_ppm_outside_window() {
     let stated = Amount::<5>::parse("100.00000").unwrap();
     let computed = Amount::<5>::parse("100.50000").unwrap();
     // 5_000 ppm > 4_000 ppm threshold
-    assert!(!stated.within_tolerance_ppm(computed, 4_000).unwrap());
+    assert!(!stated.within_tolerance_ppm(computed, 4_000));
 }
 
 #[test]
 fn within_tolerance_ppm_exact_equality_passes_zero_ppm() {
     let a = Amount::<5>::parse("42.50000").unwrap();
-    assert!(a.within_tolerance_ppm(a, 0).unwrap());
+    assert!(a.within_tolerance_ppm(a, 0));
 }
 
 #[test]
 fn within_tolerance_ppm_different_values_fail_zero_ppm() {
     let a = Amount::<5>::parse("100.00000").unwrap();
     let b = Amount::<5>::parse("100.00001").unwrap();
-    assert!(!a.within_tolerance_ppm(b, 0).unwrap());
+    assert!(!a.within_tolerance_ppm(b, 0));
 }
 
 #[test]
 fn within_tolerance_ppm_expected_zero_only_passes_when_self_zero() {
     let zero = Amount::<5>::ZERO;
     let nonzero = Amount::<5>::parse("0.00001").unwrap();
-    assert!(zero.within_tolerance_ppm(zero, 999_999).unwrap());
-    assert!(!nonzero.within_tolerance_ppm(zero, 999_999).unwrap());
+    assert!(zero.within_tolerance_ppm(zero, 999_999));
+    assert!(!nonzero.within_tolerance_ppm(zero, 999_999));
 }
 
 #[test]
@@ -3144,8 +3154,8 @@ fn within_tolerance_ppm_negative_expected() {
     // Tolerance is relative to |expected|, sign doesn't matter.
     let expected = Amount::<5>::parse("-100.00000").unwrap();
     let actual = Amount::<5>::parse("-100.50000").unwrap();
-    assert!(actual.within_tolerance_ppm(expected, 10_000).unwrap());
-    assert!(!actual.within_tolerance_ppm(expected, 4_000).unwrap());
+    assert!(actual.within_tolerance_ppm(expected, 10_000));
+    assert!(!actual.within_tolerance_ppm(expected, 4_000));
 }
 
 #[test]
@@ -3154,8 +3164,8 @@ fn within_tolerance_ppm_symmetry() {
     let a = Amount::<5>::parse("100.00000").unwrap();
     let b = Amount::<5>::parse("101.00000").unwrap();
     assert_eq!(
-        a.within_tolerance_ppm(b, 15_000).unwrap(),
-        b.within_tolerance_ppm(a, 15_000).unwrap(),
+        a.within_tolerance_ppm(b, 15_000),
+        b.within_tolerance_ppm(a, 15_000),
     );
 }
 
@@ -3166,17 +3176,9 @@ fn within_tolerance_ppm_invoice_validation_pattern() {
     let stated_total = Amount::<5>::parse("12345.67890").unwrap();
     let computed_total = Amount::<5>::parse("12345.56000").unwrap();
     // diff ≈ 0.119 EUR on 12345 EUR ≈ 9.6 ppm — within 100 ppm
-    assert!(
-        computed_total
-            .within_tolerance_ppm(stated_total, 100)
-            .unwrap()
-    );
+    assert!(computed_total.within_tolerance_ppm(stated_total, 100));
     // but outside 5 ppm
-    assert!(
-        !computed_total
-            .within_tolerance_ppm(stated_total, 5)
-            .unwrap()
-    );
+    assert!(!computed_total.within_tolerance_ppm(stated_total, 5));
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3191,13 +3193,35 @@ fn checked_from_decimal_basic() {
     assert_eq!(a, Amount::<5>::parse("1.23456").unwrap());
 }
 
+/// `checked_from_decimal` refuses excess precision; it does not round it away.
+///
+/// The rounding it used to do was implicit — no `RoundingStrategy` argument — which
+/// contradicted both the crate's "rounding is always explicit" invariant and
+/// `parse`, which rejects the identical value. Rounding is now opt-in and named.
 #[test]
-fn checked_from_decimal_rounds_to_p_digits() {
+fn checked_from_decimal_refuses_excess_precision() {
     use rust_decimal::Decimal;
-    // 0.123456 rounded to 5 dp = 0.12346 (MidpointAwayFromZero)
     let d = Decimal::from_str_exact("0.123456").unwrap();
-    let a = Amount::<5>::checked_from_decimal(d).unwrap();
-    assert_eq!(a, Amount::<5>::parse("0.12346").unwrap());
+    match Amount::<5>::checked_from_decimal(d) {
+        Err(BillingError::PrecisionLoss {
+            precision,
+            input_value,
+        }) => {
+            assert_eq!(precision, 5);
+            assert_eq!(input_value, d);
+        }
+        other => panic!("expected PrecisionLoss, got {other:?}"),
+    }
+    // The same value, with the rounding named, is accepted.
+    assert_eq!(
+        Amount::<5>::from_decimal_rounded(d, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+        Amount::<5>::parse("0.12346").unwrap()
+    );
+    // Trailing zeros beyond P are not excess precision.
+    assert_eq!(
+        Amount::<5>::checked_from_decimal(Decimal::from_str_exact("0.1234500").unwrap()).unwrap(),
+        Amount::<5>::parse("0.12345").unwrap()
+    );
 }
 
 #[test]
@@ -3397,29 +3421,29 @@ fn within_tolerance_ppm_no_panic_when_diff_equals_i64_min() {
     // The difference is i64::MIN, which is a very large deviation.
     // Even with ppm = u32::MAX the relative tolerance is nowhere near i64::MIN,
     // so the result must be false — but crucially it must NOT panic.
-    let result = self_amt.within_tolerance_ppm(expected_amt, u32::MAX);
     assert!(
-        result.is_ok(),
-        "must not panic or return Err on extreme inputs"
-    );
-    assert!(
-        !result.unwrap(),
+        !self_amt.within_tolerance_ppm(expected_amt, u32::MAX),
         "a diff of i64::MIN is not within any reasonable tolerance of 5"
     );
 }
 
-/// Symmetry property: tolerance is independent of direction.
+/// The comparison is **total**: opposite extremes give a real answer, not an error.
+///
+/// `MAX - MIN` overflows `i64`, which is why this used to return `Err` — and why
+/// every call site wrote `.unwrap_or(false)`, silently converting an arithmetic
+/// failure into a spurious "outside tolerance" finding. The difference is now taken
+/// in `i128`, so the answer is the mathematically correct one.
 #[test]
-fn within_tolerance_ppm_no_panic_extreme_values() {
-    // Both amounts at extreme ends — checked_sub will overflow → should return Err, not panic.
+fn within_tolerance_ppm_is_total_at_the_extremes() {
     let max = Amount::<5>::MAX;
     let min = Amount::<5>::MIN;
-    let result = max.within_tolerance_ppm(min, 1_000);
-    // The subtraction MAX - MIN overflows i64, so we expect Err, not a panic.
-    assert!(
-        result.is_err(),
-        "MAX - MIN overflows i64, must return Err not panic"
-    );
+    assert!(!max.within_tolerance_ppm(min, 1_000));
+    assert!(!min.within_tolerance_ppm(max, 1_000));
+    // 100 % tolerance still cannot bridge MAX and MIN: |diff| ≈ 2 × |expected|.
+    assert!(!max.within_tolerance_ppm(min, 1_000_000));
+    // …but 200 % can, which proves a real comparison happened rather than a
+    // swallowed error.
+    assert!(max.within_tolerance_ppm(min, 2_000_000));
 }
 
 // ── Regression: minimum_charge with empty description returns Err (bug fixed 2025) ──
@@ -3496,10 +3520,8 @@ fn fixed_and_credit_fixed_are_symmetric() {
 fn for_usage_positive_price() {
     let item = LineItem::for_usage(
         "Einspeisevergütung §21 EEG",
-        dec!(5000),
-        "kWh",
-        dec!(0.0811),
-        "EUR/kWh",
+        Quantity::new(dec!(5000), "kWh"),
+        UnitPrice::new(dec!(0.0811), "EUR/kWh"),
     )
     .build()
     .unwrap();
@@ -3510,9 +3532,13 @@ fn for_usage_positive_price() {
 
 #[test]
 fn for_usage_zero_quantity_gives_zero_net() {
-    let item = LineItem::for_usage("Freigrenze", dec!(0), "kWh", dec!(0.32), "EUR/kWh")
-        .build()
-        .unwrap();
+    let item = LineItem::for_usage(
+        "Freigrenze",
+        Quantity::new(dec!(0), "kWh"),
+        UnitPrice::new(dec!(0.32), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     assert!(item.net_amount.is_zero());
 }
 
@@ -3691,10 +3717,8 @@ fn rate_lookup_applied_to_line_item() {
     let rate = lookup.rate_for(leistung_kwp).unwrap();
     let item = LineItem::for_usage(
         "EEG Einspeisevergütung",
-        einspeisung_kwh,
-        "kWh",
-        rate.into_decimal(),
-        "EUR/kWh",
+        Quantity::new(einspeisung_kwh, "kWh"),
+        UnitPrice::new(rate.into_decimal(), "EUR/kWh"),
     )
     .tag("eeg")
     .build()
@@ -3815,9 +3839,13 @@ fn line_item_credit_fixed_sign_is_credit() {
 
 #[test]
 fn line_item_for_usage_sign_is_debit() {
-    let item = LineItem::for_usage("usage", dec!(100), "kWh", dec!(0.32), "EUR/kWh")
-        .build()
-        .unwrap();
+    let item = LineItem::for_usage(
+        "usage",
+        Quantity::new(dec!(100), "kWh"),
+        UnitPrice::new(dec!(0.32), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     assert_eq!(item.sign, billing::Sign::Debit);
 }
 
@@ -4080,10 +4108,8 @@ fn line_item_period_none_by_default() {
 fn line_item_period_eeg_tariff_change_mid_month() {
     let first_half = LineItem::for_usage(
         "Vergütung alt (01.–14.06.)",
-        dec!(500),
-        "kWh",
-        dec!(0.0811),
-        "EUR/kWh",
+        Quantity::new(dec!(500), "kWh"),
+        UnitPrice::new(dec!(0.0811), "EUR/kWh"),
     )
     .period("2026-06-01", "2026-06-14")
     .build()
@@ -4091,10 +4117,8 @@ fn line_item_period_eeg_tariff_change_mid_month() {
 
     let second_half = LineItem::for_usage(
         "Vergütung neu (15.–30.06.)",
-        dec!(600),
-        "kWh",
-        dec!(0.0679),
-        "EUR/kWh",
+        Quantity::new(dec!(600), "kWh"),
+        UnitPrice::new(dec!(0.0679), "EUR/kWh"),
     )
     .period("2026-06-15", "2026-06-30")
     .build()
@@ -4699,14 +4723,10 @@ fn billing_error_display_overflow_with_input() {
 #[test]
 fn for_usage_rounded_stores_truncated_price() {
     let rate = dec!(811) / dec!(100_000); // 0.00811 EUR/kWh
-    let item = LineItem::for_usage_rounded(
+    let item = LineItem::for_usage(
         "Arbeit",
-        dec!(1000),
-        "kWh",
-        rate,
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(rate, "EUR/kWh").rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -4723,14 +4743,11 @@ fn for_usage_rounded_stores_truncated_price() {
 fn for_usage_rounded_net_agrees_with_rounded_price() {
     // 1/3 EUR/kWh rounded to 6dp = 0.333333 EUR/kWh
     // 300 kWh × 0.333333 = 99.9999 → rounded to 5dp = 99.99990
-    let item = LineItem::for_usage_rounded(
+    let item = LineItem::for_usage(
         "Test",
-        dec!(300),
-        "kWh",
-        dec!(1) / dec!(3),
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(300), "kWh"),
+        UnitPrice::new(dec!(1) / dec!(3), "EUR/kWh")
+            .rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -4747,10 +4764,13 @@ fn for_usage_rounded_net_agrees_with_rounded_price() {
 
 #[test]
 fn credit_for_usage_net_is_negative() {
-    let item =
-        LineItem::credit_for_usage("EEG Einspeisung", dec!(500), "kWh", dec!(0.0811), "EUR/kWh")
-            .build()
-            .unwrap();
+    let item = LineItem::credit_for_usage(
+        "EEG Einspeisung",
+        Quantity::new(dec!(500), "kWh"),
+        UnitPrice::new(dec!(0.0811), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     assert_eq!(item.net_amount, Amount::<5>::parse("-40.55000").unwrap());
     assert!(item.is_credit());
     assert!(!item.is_debit());
@@ -4759,12 +4779,20 @@ fn credit_for_usage_net_is_negative() {
 #[test]
 fn credit_for_usage_in_document_reduces_net() {
     let positions = vec![
-        LineItem::for_usage("Netzbezug", dec!(300), "kWh", dec!(0.30), "EUR/kWh")
-            .build()
-            .unwrap(),
-        LineItem::credit_for_usage("Einspeisung", dec!(200), "kWh", dec!(0.08), "EUR/kWh")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Netzbezug",
+            Quantity::new(dec!(300), "kWh"),
+            UnitPrice::new(dec!(0.30), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
+        LineItem::credit_for_usage(
+            "Einspeisung",
+            Quantity::new(dec!(200), "kWh"),
+            UnitPrice::new(dec!(0.08), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
     ];
     let doc = BillingDocument::from_positions(DocumentMeta::default(), positions, vec![], vec![])
         .unwrap();
@@ -4775,12 +4803,20 @@ fn credit_for_usage_in_document_reduces_net() {
 #[test]
 fn credit_for_usage_excluded_from_per_unit_levy() {
     let positions = vec![
-        LineItem::for_usage("Bezug", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-            .build()
-            .unwrap(),
-        LineItem::credit_for_usage("Einspeisung", dec!(400), "kWh", dec!(0.08), "EUR/kWh")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Bezug",
+            Quantity::new(dec!(1000), "kWh"),
+            UnitPrice::new(dec!(0.30), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
+        LineItem::credit_for_usage(
+            "Einspeisung",
+            Quantity::new(dec!(400), "kWh"),
+            UnitPrice::new(dec!(0.08), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
     ];
     let levy =
         billing::tax::PerUnitLevy::new("Levy", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
@@ -4872,14 +4908,22 @@ fn to_decimal_lossless_roundtrip() {
 fn mixed_vat_rates_require_tag_pattern() {
     // PV feed-in (0%) + grid charge (19%) in one prosumer document.
     let positions = vec![
-        LineItem::credit_for_usage("PV-Einspeisung", dec!(500), "kWh", dec!(0.0811), "EUR/kWh")
-            .tag("pv-feed-in")
-            .build()
-            .unwrap(),
-        LineItem::for_usage("Netzbezug", dec!(300), "kWh", dec!(0.085), "EUR/kWh")
-            .tag("grid-charge")
-            .build()
-            .unwrap(),
+        LineItem::credit_for_usage(
+            "PV-Einspeisung",
+            Quantity::new(dec!(500), "kWh"),
+            UnitPrice::new(dec!(0.0811), "EUR/kWh"),
+        )
+        .tag("pv-feed-in")
+        .build()
+        .unwrap(),
+        LineItem::for_usage(
+            "Netzbezug",
+            Quantity::new(dec!(300), "kWh"),
+            UnitPrice::new(dec!(0.085), "EUR/kWh"),
+        )
+        .tag("grid-charge")
+        .build()
+        .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(
         FixedRateTax::new("MwSt 19%", dec!(0.19))
@@ -4970,10 +5014,8 @@ fn eeg_feed_in_billing_end_to_end() {
     let rate = lookup.rate_for(dec!(7)).unwrap();
     let credit = LineItem::credit_for_usage(
         "EEG Einspeisung",
-        dec!(623.4),
-        "kWh",
-        rate.into_decimal(),
-        "EUR/kWh",
+        Quantity::new(dec!(623.4), "kWh"),
+        UnitPrice::new(rate.into_decimal(), "EUR/kWh"),
     )
     .tag("eeg-feed-in")
     .build()
@@ -5038,14 +5080,10 @@ fn period_from_display_with_format_args() {
 #[test]
 fn credit_for_usage_rounded_net_is_negated() {
     // EEG feed-in: 500 kWh × 0.00811 EUR/kWh (already 5dp-exact) → -4.05500
-    let item = LineItem::credit_for_usage_rounded(
+    let item = LineItem::credit_for_usage(
         "EEG Einspeisevergütung",
-        dec!(500),
-        "kWh",
-        dec!(0.00811),
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(500), "kWh"),
+        UnitPrice::new(dec!(0.00811), "EUR/kWh").rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -5056,25 +5094,19 @@ fn credit_for_usage_rounded_net_is_negated() {
 #[test]
 fn credit_for_usage_rounded_matches_for_usage_rounded_in_abs_value() {
     // credit_for_usage_rounded and for_usage_rounded must give |net| == net respectively.
-    let debit = LineItem::for_usage_rounded(
+    let debit = LineItem::for_usage(
         "Arbeit",
-        dec!(1000),
-        "kWh",
-        dec!(0.0811001),
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(0.0811001), "EUR/kWh")
+            .rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
-    let credit = LineItem::credit_for_usage_rounded(
+    let credit = LineItem::credit_for_usage(
         "Gutschrift",
-        dec!(1000),
-        "kWh",
-        dec!(0.0811001),
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(0.0811001), "EUR/kWh")
+            .rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -5085,14 +5117,11 @@ fn credit_for_usage_rounded_matches_for_usage_rounded_in_abs_value() {
 #[test]
 fn credit_for_usage_rounded_price_scale_applied() {
     // 0.081157... rounded to 6dp = 0.081157; net = 500 × 0.081157 = 40.5785 → 40.57850
-    let item = LineItem::credit_for_usage_rounded(
+    let item = LineItem::credit_for_usage(
         "Gutschrift",
-        dec!(500),
-        "kWh",
-        dec!(0.0811579),
-        "EUR/kWh",
-        6,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(500), "kWh"),
+        UnitPrice::new(dec!(0.0811579), "EUR/kWh")
+            .rounded(6, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -5288,10 +5317,8 @@ fn mixed_rate_vat_grid_and_feedin_in_one_document() {
         // PV feed-in credit: 0% VAT (§12 Abs. 3 Nr. 1 UStG / Photovoltaik).
         LineItem::credit_for_usage(
             "EEG Einspeisevergütung",
-            dec!(500),
-            "kWh",
-            dec!(0.0811),
-            "EUR/kWh",
+            Quantity::new(dec!(500), "kWh"),
+            UnitPrice::new(dec!(0.0811), "EUR/kWh"),
         )
         .build()
         .unwrap(), // No "grid" tag → excluded from VAT base.

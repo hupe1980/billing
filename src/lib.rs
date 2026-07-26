@@ -18,8 +18,11 @@
 //! | [`UsageAggregator`] | Pre-billing event aggregation (SUM / MAX / COUNT / …) |
 //! | [`TaxLayer`] | Composable tax and surcharge overlays |
 //! | [`DiscountLayer`] | Composable discount overlays |
-//! | [`Tariff`] | Primary extension point for domain-specific pricing |
+//! | [`Tariff`] | Primary extension point for usage-driven pricing |
+//! | [`ScalarTariff`] | Pricing for pre-computed settlements — no `Usage` type, no ignored argument |
+//! | [`Billing`] | Three outcomes: billable, not billable (with a domain reason), error |
 //! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
+//! | [`AmountScale`] | Assemble every amount at an interchange format's decimal limit |
 //! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
 //! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
 //! | [`proportional_split`] | Penny-correct Hamilton split of a raw `Decimal` quantity |
@@ -33,6 +36,15 @@
 //!   variant returns `Err` and never panics, including on `Decimal`'s own
 //!   overflow (whose operators panic rather than saturating).
 //! - **Rounding is always explicit** — [`RoundingStrategy`] is a required parameter.
+//!   The `Decimal` → [`Amount`] conversion therefore *refuses* excess precision
+//!   ([`Amount::checked_from_decimal`]) rather than rounding it silently, and agrees
+//!   with [`Amount::parse`] on exactly what is representable;
+//!   [`Amount::from_decimal_rounded`] is the opt-in that rounds.
+//! - **Comparisons are total** — [`Amount::within_tolerance_ppm`] returns `bool`, so
+//!   a tolerance check can never degrade into a spurious finding via `unwrap_or`.
+//! - **"Nothing to bill" is not an error and not an empty list** — [`Billing`]
+//!   carries the domain's own reason, and tariffs that always bill opt out at the
+//!   type level with `NotBillable = Infallible`.
 //! - **No implicit currency** — [`Currency`] defaults to ISO 4217 `XXX`, never `EUR`.
 //! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
 //!   [`BillingDocument::assert_valid`] panics on failure (convenient for tests).
@@ -40,6 +52,10 @@
 //!   `Σ(recipient totals) == original total` with per-document penny correction.
 //! - **Invariants survive deserialisation** — validated types re-run their checks
 //!   via `#[serde(try_from = ...)]` rather than trusting reconstructed fields.
+//! - **Precision reduction happens at the leaves** — [`AmountScale`] rounds every
+//!   position and layer output *before* the totals are summed, so an interchange
+//!   format's decimal limit and its totals identities hold at once. Rounding a
+//!   finished document satisfies neither.
 //!
 //! ## README
 //!
@@ -79,7 +95,7 @@ pub use aggregation::{
     UsageAggregator, WeightedSumAggregator,
 };
 pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
-pub use amount::{Amount, EuroAmount, InvoiceAmt, RoundingStrategy};
+pub use amount::{Amount, AmountScale, EuroAmount, InvoiceAmt, RoundingStrategy};
 pub use currency::Currency;
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
@@ -90,7 +106,7 @@ pub use period::{Period, merge_period_documents, prorate, prorate_amount};
 pub use quantity::{Quantity, UnitPrice};
 pub use schedule::{TariffBand, TariffSchedule};
 pub use settlement::CashRounding;
-pub use tariff::Tariff;
+pub use tariff::{Billed, Billing, Positions, ScalarTariff, Tariff};
 pub use tax::{
     DiscountLayer, FixedDiscount, FixedRateTax, PerUnitLevy, PercentageCharge, PercentageDiscount,
     TaxLayer,
@@ -135,27 +151,39 @@ pub mod tags {
 /// An empty unit renders as `"EUR/"` in a generated unit-price label and as a
 /// bare space in a description — visible nonsense on an invoice, and cheap to
 /// prevent at the boundary.
-pub(crate) fn validate_unit(unit: String) -> Result<String, BillingError> {
+pub(crate) fn check_unit(what: &str, unit: &str) -> Result<(), BillingError> {
     if unit.trim().is_empty() {
+        let subject = if what.is_empty() {
+            "unit label".to_owned()
+        } else {
+            format!("{what} unit label")
+        };
         return Err(BillingError::InvalidInput {
-            reason: "unit label must not be empty".into(),
+            reason: format!("{subject} must not be empty"),
         });
     }
+    Ok(())
+}
+
+/// [`check_unit`] in the owned-value position the schedule and time-of-use
+/// builders use, where the checked label is moved into the built value.
+pub(crate) fn validate_unit(unit: String) -> Result<String, BillingError> {
+    check_unit("", &unit)?;
     Ok(unit)
 }
 
 /// Convenience glob import — covers all primary types and traits.
 pub mod prelude {
     pub use crate::{
-        AdvancePayment, AllocationRule, Amount, BillingDocument, BillingDocumentBuilder,
-        BillingError, CashRounding, CountAggregator, Currency, DiscountLayer, DocumentKind,
-        DocumentMeta, DynamicPricing, EqualAllocation, EuroAmount, FixedDiscount, FixedRateTax,
-        InvoiceAmt, LatestAggregator, LineItem, MaxAggregator, ParseAmountError, PerUnitLevy,
-        PercentageCharge, PercentageDiscount, Period, Prepayment, ProportionalAllocation, Quantity,
-        RateLookup, RateLookupBuilder, RoundingStrategy, Sign, SumAggregator, Tariff, TariffBand,
-        TariffSchedule, TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing, TouBand,
-        UniqueCountAggregator, UnitPrice, UsageAggregator, WeightedSumAggregator,
-        merge_period_documents, minimum_charge, proportional_split, prorate, prorate_amount,
-        residual_breakdown,
+        AdvancePayment, AllocationRule, Amount, AmountScale, Billed, Billing, BillingDocument,
+        BillingDocumentBuilder, BillingError, CashRounding, CountAggregator, Currency,
+        DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EqualAllocation, EuroAmount,
+        FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineItem, MaxAggregator,
+        ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount, Period, Positions,
+        Prepayment, ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder,
+        RoundingStrategy, ScalarTariff, Sign, SumAggregator, Tariff, TariffBand, TariffSchedule,
+        TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing, TouBand, UniqueCountAggregator,
+        UnitPrice, UsageAggregator, WeightedSumAggregator, merge_period_documents, minimum_charge,
+        proportional_split, prorate, prorate_amount, residual_breakdown,
     };
 }

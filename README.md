@@ -29,6 +29,9 @@ rounding — and leaves every domain decision to your crate.
 | [`tags`](#-design-invariants) | The engine's reserved tag namespace, protected against caller collisions |
 | [`DynamicPricing`](#-time-of-use-and-dynamic-pricing) | Per-interval price sequence (spot, real-time) |
 | [`UsageAggregator<E>`](#-usage-aggregation) | 6 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM |
+| [`Tariff`](#-implementing-tariff) | Primary extension point for usage-driven pricing |
+| [`ScalarTariff`](#pre-computed--scalartariff) | Same, for settlements whose figures are already computed — no `Usage` type |
+| [`Billing<T, R>`](#-three-outcomes-billable-not-billable-error) | Three outcomes: billable, **not billable (with your reason)**, error |
 | [`TaxLayer`](#-tax-layers--compound-taxes) | Composable, **ordered** tax stack — each layer sees all prior layers in its base |
 | [`PerUnitLevy`](#-tax-layers--compound-taxes) | Per-unit excise duty / environmental levy, matched by unit label |
 | [`DiscountLayer`](#-discounts) | Percentage and fixed discounts |
@@ -38,7 +41,9 @@ rounding — and leaves every domain decision to your crate.
 | [`BillingDocument`](#-billingdocument) | Self-validating document: eleven invariants checked at build time |
 | [`TaxBreakdownEntry`](#-vat-breakdown-en-16931-bg-23) | Per-rate VAT breakdown (EN 16931 BG-23) — **legally required** on any invoice |
 | [`TaxCategory`](#-vat-breakdown-en-16931-bg-23) | UNTDID 5305 VAT category (S / Z / E / AE / K / G / O / L / M) |
+| [`FixedRateTax::exempt`](#categories-and-exemptions) | Zero-tax layer with a validated category + mandatory exemption reason |
 | [`CashRounding`](#-cash-rounding-and-amount-due) | Rappenrundung / öresavrundning — tender-level rounding (BT-114) |
+| [`AmountScale`](#-e-invoicing-en-16931-xrechnung-zugferd) | Assemble every amount at an interchange format's decimal limit (EN 16931: 2) |
 | [`BillingDocument::reverse`](#-credit-notes) | Credit note / Storno — negates an entire document |
 | [`AdvancePayment`](#-advance-payments-and-final-invoices) | An advance already invoiced and paid, **with the tax it contains** |
 | [`Prepayment`](#-advance-payments-and-final-invoices) | What has been paid so far — a flat total or itemised advances, never both |
@@ -49,7 +54,7 @@ rounding — and leaves every domain decision to your crate.
 | [`DocumentMeta.labels`](https://docs.rs/billing/latest/billing/document/struct.DocumentMeta.html) | Key-value domain annotation bag (`malo_id`, `billing_year`, …) |
 | [`LineItem::scaled`](#-proration-and-period-merging) | Scale a position, keeping `quantity × unit_price == net_amount` consistent |
 | `LineItem::credit_for_usage` | Symmetric credit counterpart of `for_usage` (feed-in, refunds) |
-| `LineItem::for_usage_rounded` | `for_usage` with explicit unit-price precision (prevents silent drift) |
+| `UnitPrice::rounded` | Pin a derived unit price to a scale with an explicit strategy |
 | [`minimum_charge()`](#-billingdocument) | Minimum-spend shortfall helper |
 | [`merge_period_documents()`](#-proration-and-period-merging) | Merge two half-period documents (tariff change mid-period) |
 | [`prorate()`](#-proration-and-period-merging) | Scale a fixed charge to a partial period |
@@ -92,7 +97,7 @@ let doc = BillingDocument::from_positions(
         ..Default::default()
     },
     items,
-    vec![Box::new(FixedRateTax::new("VAT", dec!(0.10))?)],
+    vec![FixedRateTax::new("VAT", dec!(0.10))?.boxed()],
     vec![],
 )?;
 
@@ -124,6 +129,7 @@ is a compile-time error.
 ```rust
 use billing::{Amount, RoundingStrategy};
 use rust_decimal::Decimal;
+use rust_decimal::dec;
 
 // Parse — rejects strings with more non-zero digits than P
 let price: Amount<5> = Amount::parse("0.03456")?;              // ✓ exactly 5 dp
@@ -139,7 +145,16 @@ let _ = a.checked_mul_qty(Decimal::from(3u32))?;               // Ok(300.00000)
 
 // `checked_*` never panics — not even at the extremes of Decimal's range.
 assert!(a.checked_mul_qty(Decimal::MAX).is_err());
-assert_eq!(Amount::<5>::from_decimal(Decimal::MAX), None);
+assert!(Amount::<5>::checked_from_decimal(Decimal::MAX).is_err());
+
+// Decimal → Amount is EXACT, and agrees with `parse`: what is refused as text is
+// refused as a Decimal. Rounding is opt-in and must name a strategy.
+assert!(Amount::<5>::checked_from_decimal(dec!(0.123456)).is_err());   // ✗ 6th digit
+assert!(Amount::<5>::checked_from_decimal(dec!(0.1234500)).is_ok());   // ✓ trailing zeros
+assert_eq!(
+    Amount::<5>::from_decimal_rounded(dec!(0.123456), RoundingStrategy::MidpointAwayFromZero)?,
+    Amount::<5>::parse("0.12346")?,
+);
 
 // += and -= (panicking, like + and -)
 let mut total = Amount::<5>::ZERO;
@@ -262,8 +277,8 @@ let positions = vec![
     LineItem::fixed("Buch",       Amount::parse("50.00000")?).tag("reduced").build()?,
 ];
 let taxes: Vec<Box<dyn TaxLayer>> = vec![
-    Box::new(FixedRateTax::new("MwSt 19%", dec!(0.19))?.with_tag("standard")),
-    Box::new(FixedRateTax::new("MwSt 7%",  dec!(0.07))?.with_tag("reduced")),
+    FixedRateTax::new("MwSt 19%", dec!(0.19))?.with_tag("standard").boxed(),
+    FixedRateTax::new("MwSt 7%",  dec!(0.07))?.with_tag("reduced").boxed(),
 ];
 
 let doc = BillingDocument::from_positions(
@@ -286,14 +301,29 @@ Entries sharing a `(category, rate)` merge into one line, with the rate
 
 ### Categories and exemptions
 
+Three constructors cover the whole matrix, and each refuses the cases that belong
+to another:
+
+| Constructor | Categories | Exemption reason |
+|-------------|------------|------------------|
+| `FixedRateTax::new(name, rate)` | `S`, `L`, `M` — these levy tax | forbidden |
+| `FixedRateTax::exempt(name, category, reason)` | `E`, `AE`, `K`, `G`, `O` | **required** (hence not an `Option`) |
+| `FixedRateTax::zero_rated(name)` | `Z` | forbidden (infallible) |
+
 ```rust
 use billing::{FixedRateTax, TaxCategory, TaxLayer};
 use rust_decimal::dec;
 
 // §13b UStG reverse charge: 0%, and a reason is mandatory (BR-AE-10).
-let _rc = FixedRateTax::new("Reverse charge", dec!(0))?
-    .with_category(TaxCategory::ReverseCharge)
-    .with_exemption_reason("Steuerschuldnerschaft des Leistungsempfängers (§13b UStG)");
+let _rc = FixedRateTax::exempt(
+    "Reverse charge",
+    TaxCategory::ReverseCharge,
+    "Steuerschuldnerschaft des Leistungsempfängers (§13b UStG)",
+)?;
+
+// Wrong-family arguments are refused at construction, not at breakdown time:
+assert!(FixedRateTax::exempt("Z", TaxCategory::ZeroRated, "why").is_err());  // Z forbids one
+assert!(FixedRateTax::exempt("S", TaxCategory::Standard,  "why").is_err());  // S levies tax
 
 // The category rules are enforced, not merely documented:
 assert!(FixedRateTax::new("Bad", dec!(0.19))?              // a zero-tax category
@@ -365,7 +395,7 @@ use rust_decimal::dec;
 let doc = BillingDocument::from_positions(
     DocumentMeta { currency: Currency::EUR, ..Default::default() },
     vec![LineItem::fixed("Jahresverbrauch", Amount::parse("1000.00000")?).build()?],
-    vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)],
+    vec![FixedRateTax::new("MwSt", dec!(0.19))?.boxed()],
     vec![],
 )?
 .with_prepaid(Amount::parse("900.00000")?)?;   // BT-113 Abschlagszahlungen
@@ -437,7 +467,7 @@ use rust_decimal::dec;
 let doc = BillingDocument::from_positions(
     DocumentMeta { currency: Currency::EUR, ..Default::default() },
     vec![LineItem::fixed("Jahresverbrauch", Amount::parse("1000.00000")?).build()?],
-    vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)],
+    vec![FixedRateTax::new("MwSt", dec!(0.19))?.boxed()],
     vec![],
 )?;
 
@@ -510,7 +540,7 @@ use rust_decimal::dec;
 let doc = BillingDocument::from_positions(
     DocumentMeta { currency: Currency::EUR, ..Default::default() },
     vec![LineItem::fixed("Supply", Amount::parse("1000.00000")?).build()?],
-    vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)],
+    vec![FixedRateTax::new("MwSt", dec!(0.19))?.boxed()],
     vec![],
 )?;
 
@@ -557,8 +587,8 @@ use rust_decimal::dec;
 
 let invoice = BillingDocument::from_positions(
     DocumentMeta { invoice_number: "INV-9".into(), currency: Currency::EUR, ..Default::default() },
-    vec![LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh").build()?],
-    vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)],
+    vec![LineItem::for_usage("Arbeit", Quantity::new(dec!(1000), "kWh"), UnitPrice::new(dec!(0.30), "EUR/kWh")).build()?],
+    vec![FixedRateTax::new("MwSt", dec!(0.19))?.boxed()],
     vec![],
 )?;
 
@@ -783,47 +813,61 @@ assert_eq!(
 ## 🏗️ Implementing `Tariff`
 
 The `Tariff` trait is the primary extension point. Implement it once per
-pricing model in *your* crate:
+pricing model in *your* crate.
+
+There are two shapes, and picking the right one costs you nothing:
+
+| Trait | Use when | You write |
+|-------|----------|-----------|
+| `Tariff` | pricing consumes usage data | `type Usage = YourUsage` + `line_items(&self, usage)` |
+| `ScalarTariff` | the figures are already computed | `positions(&self)` — no `Usage`, no ignored argument |
+
+### Usage-driven — `Tariff`
 
 ```rust
-use billing::{Tariff, LineItem, Amount, Quantity, UnitPrice,
+use billing::{Tariff, Positions, LineItem, Amount, Quantity, UnitPrice,
               TaxLayer, BillingError, DocumentMeta, Currency, FixedRateTax};
 use rust_decimal::Decimal;
 use rust_decimal::dec;
+use std::convert::Infallible;
 
-struct SaasPlan { seats: u32, base_fee: u32 }
+struct SaasPlan { base_fee: u32 }
+struct Seats { count: u32 }
 
 impl Tariff for SaasPlan {
-    type Usage = ();    // usage is embedded in the struct
+    type Usage = Seats;
     type Error = BillingError;
+    // This plan always produces an invoice, so "nothing to bill" is uninhabited
+    // and `.bill()` hands back a document with no extra matching.
+    type NotBillable = Infallible;
 
-    fn line_items(&self, _: &()) -> Result<Vec<LineItem>, BillingError> {
+    fn line_items(&self, usage: &Seats) -> Result<Positions<Infallible>, BillingError> {
         Ok(vec![
             LineItem::fixed("Platform fee", Amount::<5>::from_int(self.base_fee.into()))
                 .build()?,
             LineItem::debit("Seats")
-                .quantity(Quantity::new(Decimal::from(self.seats), "seats"))
+                .quantity(Quantity::new(Decimal::from(usage.count), "seats"))
                 .unit_price(UnitPrice::new(dec!(19), "EUR/seat"))
                 .build()?,
-        ])
+        ].into())
     }
 
     fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
         // `new` is fallible; a hardcoded literal rate is one of the few places
         // `expect` is defensible — it cannot fail for a valid constant.
-        vec![Box::new(FixedRateTax::new("VAT", dec!(0.20)).expect("0.20 is a valid rate"))]
+        vec![FixedRateTax::new("VAT", dec!(0.20)).expect("0.20 is a valid rate").boxed()]
     }
 }
 
 // Build a document in one call:
-let doc = SaasPlan { seats: 5, base_fee: 49 }.bill(
+let doc = SaasPlan { base_fee: 49 }.bill(
     DocumentMeta {
         invoice_number: "INV-001".into(),
         period_label:   "2026-07".into(),
         currency:       Currency::EUR,
         ..Default::default()
     },
-    &(),
+    &Seats { count: 5 },
 )?;
 
 // 49 + 5×19 = 144 net, +20% VAT
@@ -831,6 +875,126 @@ assert_eq!(doc.net_total(),   Amount::parse("144.00000")?);
 assert_eq!(doc.gross_total(), Amount::parse("172.80000")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+### Pre-computed — `ScalarTariff`
+
+Plenty of settlements are not usage-driven: a subsidy payout, a redispatch
+compensation, an EEG or KWKG settlement whose figures were determined upstream.
+Those get `ScalarTariff` — no `type Usage = ()`, and no `usage` parameter to
+accept and ignore. A blanket impl still makes it a full `Tariff`, so it composes
+with `BillingDocumentBuilder` and anything else generic over `Tariff`:
+
+```rust
+use billing::{ScalarTariff, Positions, LineItem, Amount, DocumentMeta, Currency, BillingError};
+use std::convert::Infallible;
+
+struct EegSettlement { payout_eur: i64 }
+
+impl ScalarTariff for EegSettlement {
+    type Error = BillingError;
+    type NotBillable = Infallible;
+
+    fn positions(&self) -> Result<Positions<Infallible>, BillingError> {
+        Ok(vec![
+            LineItem::credit_fixed("EEG Vergütung", Amount::<5>::from_int(self.payout_eur))
+                .build()?,
+        ].into())
+    }
+}
+
+let meta = DocumentMeta { currency: Currency::EUR, ..Default::default() };
+let doc = EegSettlement { payout_eur: 400 }.settle(meta)?;
+assert_eq!(doc.net_total(), Amount::parse("-400.00000")?);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Implement **either** `Tariff` or `ScalarTariff` for a given type, never both —
+the blanket impl makes that a coherence error rather than a silent ambiguity.
+
+---
+
+## 🚦 Three outcomes: billable, not billable, error
+
+`Result<Vec<LineItem>, Error>` offers two answers. Settlements have three.
+
+A settlement can be **not billable yet, for a specific and entirely expected
+reason** — no meter reading has arrived, the reference price for the period is
+unpublished, the subsidy entitlement has ended. That is neither a set of
+positions nor a failure: nothing went wrong, there is simply nothing to invoice.
+
+Flattened into `Ok(vec![])` the reason is destroyed, and *"we billed nothing"*
+becomes indistinguishable from *"there was nothing to bill, because X"* — a
+distinction every audit trail needs and that no caller can reconstruct afterwards.
+Pushed into `Err` it puts an ordinary business state on the error path, where a
+missing price is indistinguishable from a genuine arithmetic fault.
+
+So `line_items` returns `Positions<Self::NotBillable>` — an alias for
+`Billing<Vec<LineItem>, R>` — and `R` is *your* reason type, matched exhaustively:
+
+```rust
+use billing::{Tariff, Billing, Positions, Billed, LineItem, Amount,
+              DocumentMeta, Currency, BillingError};
+use std::convert::Infallible;
+use std::fmt;
+
+#[derive(Debug, PartialEq)]
+enum NotYet { NoMeterReading, PriceUnpublished, EntitlementEnded }
+
+impl fmt::Display for NotYet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMeterReading    => f.write_str("no meter reading for the period"),
+            Self::PriceUnpublished  => f.write_str("reference price not yet published"),
+            Self::EntitlementEnded  => f.write_str("subsidy entitlement has ended"),
+        }
+    }
+}
+
+struct Settlement;
+struct Readings { kwh: Option<u32>, price_published: bool }
+
+impl Tariff for Settlement {
+    type Usage = Readings;
+    type Error = BillingError;
+    type NotBillable = NotYet;
+
+    fn line_items(&self, usage: &Readings) -> Result<Positions<NotYet>, BillingError> {
+        let Some(kwh) = usage.kwh else {
+            return Ok(Billing::NotBillable(NotYet::NoMeterReading));
+        };
+        if !usage.price_published {
+            return Ok(Billing::NotBillable(NotYet::PriceUnpublished));
+        }
+        Ok(vec![
+            LineItem::fixed("Arbeit", Amount::<5>::from_int(kwh.into())).build()?,
+        ].into())
+    }
+}
+
+let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+
+// Not billable — and the reason survives, typed.
+let outcome: Billed<NotYet> =
+    Settlement.try_bill(meta(), &Readings { kwh: None, price_published: true })?;
+assert_eq!(outcome.reason(), Some(&NotYet::NoMeterReading));
+
+// Billable.
+let outcome = Settlement.try_bill(meta(), &Readings { kwh: Some(100), price_published: true })?;
+assert_eq!(outcome.billable().unwrap().net_total(), Amount::parse("100.00000")?);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**Tariffs that always bill pay nothing for this.** Set
+`type NotBillable = Infallible` and the `NotBillable` variant is uninhabited — the
+compiler knows the outcome, and you keep the two-outcome API:
+
+| Can decline to bill | `Tariff` | `BillingDocumentBuilder` |
+|---------------------|----------|--------------------------|
+| No (`NotBillable = Infallible`) | `.bill(meta, usage) -> Result<BillingDocument, _>` | `.tariff(&t, &u)` |
+| Yes | `.try_bill(meta, usage) -> Result<Billed<R>, _>` | `.try_tariff(&t, &u)` |
+
+The bound is what makes it a compile-time distinction: a tariff that can decline
+to bill has no `.bill()` method, so its reason cannot be silently dropped.
 
 ---
 
@@ -851,8 +1015,8 @@ let pos = vec![LineItem::fixed("Net charge", Amount::parse("100.00000")?).build(
 // Layer 1: 5% levy on the net.
 // Layer 2: 19% VAT — base is net (100) + levy (5) = 105.
 let taxes: Vec<Box<dyn TaxLayer>> = vec![
-    Box::new(PercentageCharge::new("Levy", dec!(0.05))?),
-    Box::new(FixedRateTax::new("VAT", dec!(0.19))?),
+    PercentageCharge::new("Levy", dec!(0.05))?.boxed(),
+    FixedRateTax::new("VAT", dec!(0.19))?.boxed(),
 ];
 
 let doc = BillingDocument::from_positions(
@@ -867,6 +1031,45 @@ assert_eq!(doc.gross_total(), Amount::parse("124.95000")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Tax regimes are layer sets, not types
+
+A "tax regime" is *which layers apply*, over the same positions. That makes it
+**data** — build the `Vec<Box<dyn TaxLayer>>` for the regime and return it from
+`tax_layers()`. There is no need for one tariff type, wrapper struct or type alias
+per regime.
+
+The German VAT matrix for a PV settlement, in full:
+
+```rust
+use billing::{FixedRateTax, TaxCategory, TaxLayer};
+use rust_decimal::dec;
+
+enum Regime { Regelbesteuerung, ParagraphTwelveAbsThree, Kleinunternehmer }
+
+fn layers_for(regime: &Regime) -> Result<Vec<Box<dyn TaxLayer>>, billing::BillingError> {
+    Ok(match regime {
+        // Standard rate.
+        Regime::Regelbesteuerung =>
+            vec![FixedRateTax::new("USt 19%", dec!(0.19))?.boxed()],
+        // §12 Abs. 3 UStG — 0%, input tax still deductible, no reason text.
+        Regime::ParagraphTwelveAbsThree =>
+            vec![FixedRateTax::zero_rated("§12 Abs. 3 UStG").boxed()],
+        // §19 UStG small-business exemption — reason mandatory.
+        Regime::Kleinunternehmer => vec![
+            FixedRateTax::exempt(
+                "§19 UStG",
+                TaxCategory::Exempt,
+                "Kleinunternehmer gemäß §19 UStG",
+            )?.boxed(),
+        ],
+    })
+}
+
+assert_eq!(layers_for(&Regime::Regelbesteuerung)?.len(), 1);
+assert_eq!(layers_for(&Regime::Kleinunternehmer)?.len(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 > ⚠️ **Order matters.** Tax layers are applied in declaration order.
 > Place levies that form part of the VAT base *before* VAT.
 
@@ -877,16 +1080,16 @@ quantities from **debit positions whose unit label matches**, so credits
 (feed-in, refunds) are correctly excluded from an excise base.
 
 ```rust
-use billing::{PerUnitLevy, TaxLayer, LineItem, Amount, Currency};
+use billing::{PerUnitLevy, TaxLayer, LineItem, Amount, Currency, Quantity, UnitPrice};
 use rust_decimal::dec;
 
 let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050")?, "kWh")?
     .with_currency(Currency::EUR);
 
 let positions = vec![
-    LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh").build()?,
+    LineItem::for_usage("Arbeit", Quantity::new(dec!(1000), "kWh"), UnitPrice::new(dec!(0.30), "EUR/kWh")).build()?,
     // A credit position — excluded from the levy base.
-    LineItem::credit_for_usage("Einspeisung", dec!(400), "kWh", dec!(0.08), "EUR/kWh").build()?,
+    LineItem::credit_for_usage("Einspeisung", Quantity::new(dec!(400), "kWh"), UnitPrice::new(dec!(0.08), "EUR/kWh")).build()?,
 ];
 
 // 1000 kWh × 0.02050 = 20.50 (the 400 kWh credit is not levied)
@@ -912,9 +1115,9 @@ use rust_decimal::dec;
 
 let discounts: Vec<Box<dyn DiscountLayer>> = vec![
     // 10% loyalty discount on all debit positions
-    Box::new(PercentageDiscount::new("Loyalty -10%", dec!(0.10))?),
+    PercentageDiscount::new("Loyalty -10%", dec!(0.10))?.boxed(),
     // Fixed 15.00 voucher
-    Box::new(FixedDiscount::new("Voucher", Amount::parse("15.00000")?)?),
+    FixedDiscount::new("Voucher", Amount::parse("15.00000")?)?.boxed(),
 ];
 
 let doc = BillingDocument::from_positions(
@@ -983,12 +1186,12 @@ still reads correctly (`400 kWh × 0.30 = 120.00`, not `1000 kWh × 0.30 = 120.0
 
 ```rust
 use billing::{ProportionalAllocation, EqualAllocation, AllocationRule,
-              BillingDocument, DocumentMeta, LineItem, Amount, Currency};
+              BillingDocument, DocumentMeta, LineItem, Amount, Currency, Quantity, UnitPrice};
 use rust_decimal::dec;
 
 let doc = BillingDocument::from_positions(
     DocumentMeta { currency: Currency::EUR, ..Default::default() },
-    vec![LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh").build()?],
+    vec![LineItem::for_usage("Arbeit", Quantity::new(dec!(1000), "kWh"), UnitPrice::new(dec!(0.30), "EUR/kWh")).build()?],
     vec![], vec![],
 )?;
 
@@ -1043,11 +1246,11 @@ assert_eq!(total, dec!(987.654));  // ✓ exact sum
 
 ```rust
 use billing::{prorate, merge_period_documents, RoundingStrategy,
-              BillingDocument, DocumentMeta, LineItem, Amount, Currency};
+              BillingDocument, DocumentMeta, LineItem, Amount, Currency, Quantity, UnitPrice};
 use rust_decimal::dec;
 
 // Prorate scales the QUANTITY as well as the amount, so the line stays honest.
-let full = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh").build()?;
+let full = LineItem::for_usage("Arbeit", Quantity::new(dec!(1000), "kWh"), UnitPrice::new(dec!(0.30), "EUR/kWh")).build()?;
 let half = prorate(&full, 15, 30, RoundingStrategy::MidpointAwayFromZero)?;
 assert_eq!(half.quantity_value(), Some(dec!(500)));
 assert_eq!(half.net_amount, Amount::parse("150.00000")?);
@@ -1099,7 +1302,7 @@ use billing::{BillingDocument, DocumentMeta, LineItem, Amount, Currency,
 use rust_decimal::dec;
 
 let positions = vec![LineItem::fixed("Service", Amount::parse("200.00000")?).build()?];
-let tax_layers: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("VAT", dec!(0.19))?)];
+let tax_layers: Vec<Box<dyn TaxLayer>> = vec![FixedRateTax::new("VAT", dec!(0.19))?.boxed()];
 
 let doc = BillingDocument::from_positions(
     DocumentMeta {
@@ -1143,7 +1346,7 @@ if let Some(shortfall) =
 }
 
 // 2. Build the real document — VAT now applies to the shortfall too.
-let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)];
+let taxes: Vec<Box<dyn TaxLayer>> = vec![FixedRateTax::new("MwSt", dec!(0.19))?.boxed()];
 let doc = BillingDocument::from_positions(
     DocumentMeta { currency: Currency::EUR, ..Default::default() },
     positions, taxes, vec![])?;
@@ -1155,6 +1358,147 @@ assert_eq!(doc.tax_total(), Amount::parse("20.90000")?);   // 110 × 19%, not 10
 
 `with_extra_position` appends without re-running the tax layers, so it is refused
 on any document carrying a VAT breakdown.
+
+---
+
+## 📤 E-invoicing: EN 16931, XRechnung, ZUGFeRD
+
+**This crate computes invoices; it does not serialise them.** It deliberately stops
+at the semantic model, and there are no plans to add XML or PDF output here — see
+[Why not in this crate](#why-not-in-this-crate) below. What it *does* do is make its
+documents **representable** in those formats, which is the part that is genuinely
+hard and that a serialiser cannot fix afterwards.
+
+### The precision problem
+
+EN 16931 — and with it XRechnung, Peppol BIS and ZUGFeRD/Factur-X — caps **every**
+monetary amount at two decimals:
+
+| Rule | Amount |
+|------|--------|
+| BR-DEC-23 | Invoice line net amount (BT-131) |
+| BR-DEC-09 | Sum of line net amounts (BT-106) |
+| BR-DEC-12 / 13 / 14 | Total without VAT (BT-109), VAT total (BT-110), total with VAT (BT-112) |
+| BR-DEC-16 / 17 / 18 | Paid amount (BT-113), rounding amount (BT-114), amount due (BT-115) |
+| BR-DEC-19 / 20 | VAT category taxable base (BT-116) and tax amount (BT-117) |
+
+At the same time the totals identities must hold **exactly at that precision**:
+BR-CO-10 (`BT-106 = Σ BT-131`), BR-CO-13, BR-CO-14 (`BT-110 = Σ BT-117`),
+BR-CO-15 (`BT-112 = BT-109 + BT-110`), BR-CO-16 and BR-CO-17.
+
+Metered billing produces more than two decimals constantly —
+`1234.567 kWh × 0.28901 EUR/kWh = 356.80221` — so something has to round. **It
+cannot be the serialiser**, because rounding each amount independently breaks the
+identities the same standard checks:
+
+- three positions of `0.005` each round to `0.01`, summing to `0.03`, while the
+  exact total `0.015` rounds to `0.02` — **BR-CO-10 violated**;
+- a net of `0.0042` at 19 % VAT gives `0.00 + 0.00 ≠ 0.01` — **BR-CO-15 violated**.
+
+Both come from ordinary inputs, and both make a validator reject the invoice.
+
+### The fix: round the leaves, recompute the aggregates
+
+`amount_scale` reduces every *leaf* — each position, each discount- and tax-layer
+output, each VAT breakdown entry — before any total is computed. Every total is then
+a sum of already-reduced values, so it lands on the same precision exactly and every
+identity survives:
+
+```rust
+use billing::{BillingDocument, DocumentMeta, LineItem, Amount, Currency, AmountScale,
+              FixedRateTax, TaxLayer, Quantity, UnitPrice, RoundingStrategy};
+use rust_decimal::dec;
+
+let positions = || vec![
+    LineItem::for_usage("Arbeit",
+        Quantity::new(dec!(1234.567), "kWh"),
+        UnitPrice::new(dec!(0.28901), "EUR/kWh")).build().unwrap(),
+];
+
+// Full precision — arithmetically correct, but not emittable as EN 16931.
+let raw = BillingDocument::builder().currency(Currency::EUR)
+    .positions(positions()).build()?;
+assert_eq!(raw.net_total(), Amount::parse("356.80221")?);
+assert!(!raw.fits_amount_scale(2));
+assert!(raw.amount_scale_violation(2).unwrap().0.contains("position[0]"));
+
+// Two decimals throughout, identities intact.
+let doc = BillingDocument::builder().currency(Currency::EUR)
+    .amount_scale(AmountScale::EN16931)
+    .positions(positions())
+    .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.boxed())
+    .build()?;
+
+assert!(doc.fits_amount_scale(2));
+assert_eq!(doc.net_total(),   Amount::parse("356.80000")?);   // BT-106 / BT-109
+assert_eq!(doc.tax_total(),   Amount::parse("67.79000")?);    // BT-110
+assert_eq!(doc.gross_total(), Amount::parse("424.59000")?);   // BT-112
+assert_eq!(doc.net_total() + doc.tax_total(), doc.gross_total()); // BR-CO-15
+doc.assert_valid();
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`AmountScale::EN16931` is two decimals with commercial rounding.
+`AmountScale::new(0, ..)` handles zero-decimal currencies (JPY, KRW);
+`fits_amount_scale` / `amount_scale_violation` are the preconditions to assert
+before emitting.
+
+**Every amount is rounded exactly once**, from the exact value, at the reporting
+precision. That is not a detail — rounding twice is a different operation and lands
+a whole minor unit away often enough to matter: `0.004999` rounded to five decimals
+is `0.005`, which then rounds to `0.01`, while rounding `0.004999` straight to two
+decimals gives `0.00`. So:
+
+- a **VAT category tax** is computed from the *reduced* base in one rounding, which
+  is what BR-CO-17 specifies and what a validator recomputes;
+- the **charged VAT position** carries that same number rather than being reduced on
+  its own, so `BT-110 = Σ BT-117` (**BR-CO-14**) holds by construction;
+- a **line derived from `quantity × unit_price`** is reduced from the exact product,
+  not from the engine's five-decimal intermediate, so `BT-131 = BT-129 × BT-146`
+  holds — a rule validators check on every line. A position carrying an explicit
+  `fixed_amount` is authoritative and is reduced verbatim.
+
+This is verified over ~24 000 boundary cases and 6 000 randomised multi-line
+documents, across all five rounding strategies and VAT rates with up to seven
+decimals.
+
+> **Allocation breaks the scale, and cannot preserve it.** Splitting `100.00` three
+> ways is `33.333…`. `AllocationRule` keeps the split *exact* — the parts still sum
+> to the original — at the cost of precision. Re-check an allocated document with
+> `fits_amount_scale` before emitting. `reverse()` (credit notes) preserves it.
+
+### What is still missing for a valid XRechnung
+
+Precision is the deepest gap but not the only one. To emit a document that passes
+the KoSIT validator you also need, in your own mapping layer:
+
+| Gap | What EN 16931 / XRechnung requires | Status here |
+|-----|-----------------------------------|-------------|
+| **Parties** | Seller and buyer name, postal address with country code, VAT identifier (BT-31), electronic address (BT-34 / BT-49) | `DocumentMeta` carries opaque `issuer_id` / `recipient_id` only |
+| **Buyer reference** | BT-10 — the Leitweg-ID, mandatory for German B2G | put it in `meta.labels` |
+| **Dates** | BT-2 issue date, BT-9 due date as real dates | `Option<String>`, unparsed by design (no chrono dependency) |
+| **Line VAT category** | BT-151 per line (BR-CO-04) | VAT is modelled as document-level `TaxLayer`s with tag filtering |
+| **Unit codes** | BT-130 must be a UN/ECE Rec 20 code (`KWH`, `MTQ`, `C62`) | `Quantity.unit` is a free-form label (`"kWh"`) |
+| **Line identifiers** | BT-126 per line | positions are ordered, not identified |
+
+Amounts, totals, the VAT breakdown (BG-23), advance payments, cash rounding
+(BT-114), prepaid (BT-113), amount due (BT-115) and document type codes (BT-3) are
+all modelled here.
+
+### Why not in this crate
+
+**ZUGFeRD is out of scope permanently.** It is a PDF/A-3 container with embedded
+CII XML and XMP metadata — that needs a PDF writer, font embedding and subsetting,
+and ICC colour profiles. This crate has three dependencies, does no I/O and forbids
+`unsafe`; a PDF engine is the opposite of all three.
+
+**XML belongs in a separate crate.** UBL and CII serialisation needs an XML writer,
+the UN/ECE Rec 20 and UNTDID code lists, and Schematron conformance fixtures to be
+trustworthy — none of which a pricing engine should carry, and all of which move on
+a different release cadence (XRechnung 4.0, implementing EN 16931-1:2026, is
+expected during 2026). Keeping it out means this crate does not inherit that
+cadence. Build it on top: this crate gives you amounts that are already
+representable, which is the part that is hard to get right.
 
 ---
 
@@ -1283,7 +1627,7 @@ proc-macro does not appear in downstream builds.
 ```text
 src/
 ├── lib.rs          — re-exports, prelude, crate docs
-├── amount.rs       — Amount<P>, RoundingStrategy, EuroAmount, InvoiceAmt
+├── amount.rs       — Amount<P>, RoundingStrategy, AmountScale, EuroAmount, InvoiceAmt
 ├── currency.rs     — Currency (ISO 4217 + minor units)
 ├── quantity.rs     — Quantity, UnitPrice
 ├── line_item.rs    — LineItem, LineItemBuilder, Sign
@@ -1299,9 +1643,19 @@ src/
 ├── vat.rs          — TaxCategory, TaxBreakdownEntry (EN 16931 BG-23)
 ├── advance.rs      — AdvancePayment, DocumentKind, residual_breakdown
 ├── settlement.rs   — CashRounding (BT-114)
-├── tariff.rs       — Tariff trait
+├── tariff.rs       — Tariff, ScalarTariff, Billing (three-way outcome)
 └── error.rs        — BillingError, ParseAmountError
 ```
+
+### Examples
+
+Run with `cargo run --example <name>`, or all three with `just examples`.
+
+| Example | Shows |
+|---------|-------|
+| `saas_billing` | `Tariff` with usage, graduated pricing with a free tier, a commission reported **separately** from VAT, the BG-23 breakdown, assembled at `AmountScale::EN16931` |
+| `cloud_compute` | Four pricing modes + dynamic intervals at full engine precision, then the same document rebuilt so it is emittable — and what `amount_scale_violation` reports in between |
+| `water_utility` | Graduated tiers, `minimum_charge`, and the allocation trade-off: the split stays exact while leaving invoice precision behind |
 
 ---
 

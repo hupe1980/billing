@@ -123,8 +123,8 @@ fn main() {
             period_label: "July 2026".into(),
             ..Default::default()
         })
-        .positions(all_positions)
-        .extra_tax(Box::new(FixedRateTax::new("VAT", dec!(0.20)).unwrap()))
+        .positions(all_positions.clone())
+        .extra_tax(FixedRateTax::new("VAT", dec!(0.20)).unwrap().boxed())
         .build()
         .unwrap();
 
@@ -133,7 +133,9 @@ fn main() {
     println!("  CPU-hours billed: {total_cpu_hours:.1}");
     println!("  Peak bandwidth:   {peak_mbps:.1} Mbps");
     println!();
-    for pos in doc.all_positions() {
+    // Iterate the *net* positions only. `all_positions()` also yields the tax
+    // positions, so printing those here and the VAT again below reports it twice.
+    for pos in doc.net_positions() {
         println!("  {:48} {:>12}", pos.description, pos.net_amount);
     }
     println!();
@@ -144,4 +146,69 @@ fn main() {
     doc.assert_valid();
     println!();
     println!("✓ Document validation passed");
+
+    // ── Engine precision vs. invoice precision ───────────────────────────────
+    //
+    // This document is kept at the engine's full five decimals: metered usage
+    // priced per unit lands on more than two decimals routinely (net 500.655),
+    // which is arithmetically exact but not a number an invoice can carry.
+    // EN 16931 caps every monetary amount at two decimals, so the document above
+    // is correct and *not* emittable:
+    println!();
+    match doc.amount_scale_violation(2) {
+        None => println!("  (already fits two decimals)"),
+        Some((what, value)) => println!("  Not emittable as EN 16931: {what} = {value}"),
+    }
+
+    // Rebuilding with a scale reduces every leaf *before* the totals are summed, so
+    // the decimal limit and the totals identities hold at the same time. Rounding
+    // the finished totals instead would break them.
+    let invoiceable = BillingDocument::builder()
+        .meta(DocumentMeta {
+            invoice_number: "CLOUD-2026-07".into(),
+            currency: Currency::EUR,
+            period_label: "July 2026".into(),
+            ..Default::default()
+        })
+        .amount_scale(AmountScale::EN16931)
+        .positions(all_positions)
+        .extra_tax(FixedRateTax::new("VAT", dec!(0.20)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    println!();
+    println!("  --- rebuilt at EN 16931 precision ---");
+    println!(
+        "  {:48} {:>12}",
+        "NET TOTAL",
+        invoiceable
+            .net_total()
+            .checked_round_to::<2>(RoundingStrategy::MidpointAwayFromZero)
+            .unwrap()
+    );
+    println!(
+        "  {:48} {:>12}",
+        "VAT (20%)",
+        invoiceable
+            .tax_total()
+            .checked_round_to::<2>(RoundingStrategy::MidpointAwayFromZero)
+            .unwrap()
+    );
+    println!(
+        "  {:48} {:>12}",
+        "GROSS TOTAL",
+        invoiceable
+            .gross_total()
+            .checked_round_to::<2>(RoundingStrategy::MidpointAwayFromZero)
+            .unwrap()
+    );
+    invoiceable.assert_valid();
+    assert!(invoiceable.fits_amount_scale(2));
+    // net + VAT == gross still holds exactly at two decimals (EN 16931 BR-CO-15).
+    assert_eq!(
+        invoiceable.net_total() + invoiceable.tax_total(),
+        invoiceable.gross_total()
+    );
+    println!();
+    println!("✓ Emittable as EN 16931: every amount fits two decimals, totals intact");
 }

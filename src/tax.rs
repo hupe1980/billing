@@ -63,6 +63,31 @@ pub trait TaxLayer {
         let _ = positions;
         Ok(None)
     }
+
+    /// Box this layer for [`crate::Tariff::tax_layers`].
+    ///
+    /// `vec![tax.boxed()]` rather than `vec![Box::new(tax) as Box<dyn TaxLayer>]`,
+    /// which is the form that actually type-checks when the vector holds more than
+    /// one kind of layer.
+    ///
+    /// ```rust
+    /// use billing::{TaxLayer, FixedRateTax, PerUnitLevy, Amount};
+    /// use rust_decimal::dec;
+    ///
+    /// // Stromsteuer before MwSt — order is the compound-tax base.
+    /// let layers: Vec<Box<dyn TaxLayer>> = vec![
+    ///     PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh").unwrap().boxed(),
+    ///     FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed(),
+    /// ];
+    /// assert_eq!(layers.len(), 2);
+    /// ```
+    #[must_use]
+    fn boxed(self) -> Box<dyn TaxLayer>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
 }
 
 // ── FixedRateTax ──────────────────────────────────────────────────────────────
@@ -138,6 +163,104 @@ impl FixedRateTax {
             category: TaxCategory::Standard,
             exemption_reason: None,
         })
+    }
+
+    /// A layer that levies **no tax**, carrying the category and exemption reason
+    /// that explain why — EN 16931 BT-118 / BT-120.
+    ///
+    /// A 0% line is not self-explanatory to a tax authority: "exempt", "reverse
+    /// charge", "intra-Community supply" and "outside scope" all produce no tax and
+    /// mean materially different things. This constructor establishes in one call
+    /// what the chainable [`with_category`](Self::with_category) /
+    /// [`with_exemption_reason`](Self::with_exemption_reason) setters can only check
+    /// afterwards — and it takes `reason` as a **required** argument, not an
+    /// `Option`, because every category it accepts requires one:
+    ///
+    /// | Categories | Exemption reason | Constructor |
+    /// |------------|------------------|-------------|
+    /// | `E`, `AE`, `K`, `G`, `O` | required (BR-E/AE/IC/G/O-10) | `exempt` |
+    /// | `Z` | forbidden (BR-Z-10) | [`zero_rated`](Self::zero_rated) |
+    /// | `S`, `L`, `M` | these levy tax | [`new`](Self::new) |
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if the category levies tax (use
+    /// [`FixedRateTax::new`]) or forbids an exemption reason (use
+    /// [`FixedRateTax::zero_rated`]).
+    ///
+    /// ```rust
+    /// use billing::{FixedRateTax, TaxCategory, TaxLayer};
+    ///
+    /// // §13b UStG reverse charge — recipient accounts for the tax.
+    /// let rc = FixedRateTax::exempt(
+    ///     "Reverse charge",
+    ///     TaxCategory::ReverseCharge,
+    ///     "Steuerschuldnerschaft des Leistungsempfängers (§13b UStG)",
+    /// ).unwrap();
+    /// assert!(rc.compute(&[]).unwrap().net_amount.is_zero());
+    /// assert!(rc.exemption_reason().is_some());
+    ///
+    /// // `Z` forbids a reason — it has its own constructor.
+    /// assert!(FixedRateTax::exempt("Zero", TaxCategory::ZeroRated, "why").is_err());
+    /// // A taxed category does not belong here.
+    /// assert!(FixedRateTax::exempt("Std", TaxCategory::Standard, "why").is_err());
+    /// ```
+    pub fn exempt(
+        name: impl Into<String>,
+        category: TaxCategory,
+        reason: impl Into<String>,
+    ) -> Result<Self, BillingError> {
+        if category.carries_tax() {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "FixedRateTax::exempt requires a category that levies no tax, got {category} \
+                     — use FixedRateTax::new for a category that carries tax"
+                ),
+            });
+        }
+        if category.forbids_exemption_reason() {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "VAT category {category} must not carry an exemption reason (BT-120) \
+                     — use FixedRateTax::zero_rated"
+                ),
+            });
+        }
+        let layer = Self {
+            name: name.into(),
+            rate: Decimal::ZERO,
+            require_tag: None,
+            category,
+            exemption_reason: Some(reason.into()),
+        };
+        layer.check_category()?;
+        Ok(layer)
+    }
+
+    /// A zero-rated layer (`Z`): taxable at 0%, input tax still deductible.
+    ///
+    /// The counterpart of [`FixedRateTax::exempt`] for the one zero-tax category that
+    /// must **not** carry an exemption reason (BR-Z-10) — which is precisely why it is
+    /// a separate, infallible constructor rather than an `Option` argument.
+    ///
+    /// Distinct from [`TaxCategory::Exempt`], where input tax is generally *not*
+    /// deductible: both produce no tax, and that asymmetry is the one implementers
+    /// most often get wrong.
+    ///
+    /// ```rust
+    /// use billing::{FixedRateTax, TaxCategory};
+    /// let z = FixedRateTax::zero_rated("Nullsatz");
+    /// assert_eq!(z.category(), TaxCategory::ZeroRated);
+    /// assert_eq!(z.exemption_reason(), None);
+    /// ```
+    #[must_use]
+    pub fn zero_rated(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            rate: Decimal::ZERO,
+            require_tag: None,
+            category: TaxCategory::ZeroRated,
+            exemption_reason: None,
+        }
     }
 
     /// Set the EN 16931 VAT category (BT-118). Defaults to
@@ -239,7 +362,8 @@ impl FixedRateTax {
     /// tag items by their VAT treatment and add one `FixedRateTax` per applicable rate:
     ///
     /// ```rust
-    /// use billing::{FixedRateTax, LineItem, Amount, BillingDocument, DocumentMeta, Currency};
+    /// use billing::{FixedRateTax, LineItem, Amount, Quantity, UnitPrice};
+    /// use billing::{BillingDocument, DocumentMeta, Currency, TaxLayer};
     /// use rust_decimal::dec;
     ///
     /// // Two positions: grid charges (19% VAT) + PV feed-in credit (0% / tax-exempt)
@@ -248,14 +372,17 @@ impl FixedRateTax {
     ///         .fixed_amount(Amount::parse("100.00000").unwrap())
     ///         .tag("grid")
     ///         .build().unwrap(),
-    ///     LineItem::credit_for_usage("EEG Einspeisevergütung", dec!(500), "kWh",
-    ///                                dec!(0.0811), "EUR/kWh")
+    ///     LineItem::credit_for_usage(
+    ///         "EEG Einspeisevergütung",
+    ///         Quantity::new(dec!(500), "kWh"),
+    ///         UnitPrice::new(dec!(0.0811), "EUR/kWh"),
+    ///     )
     ///         // No "grid" tag → excluded from the 19% VAT layer below.
     ///         .build().unwrap(),
     /// ];
     /// // Only grid-tagged items are subject to 19% VAT:
     /// let vat = FixedRateTax::new("MwSt 19%", dec!(0.19)).unwrap().with_tag("grid");
-    /// let taxes: Vec<Box<dyn billing::TaxLayer>> = vec![Box::new(vat)];
+    /// let taxes: Vec<Box<dyn TaxLayer>> = vec![vat.boxed()];
     /// let doc = BillingDocument::from_positions(
     ///     DocumentMeta { currency: Currency::EUR, ..Default::default() },
     ///     positions, taxes, vec![],
@@ -631,6 +758,15 @@ pub trait DiscountLayer {
     ///
     /// Always returns a credit (negative `net_amount`).
     fn compute(&self, positions: &[LineItem]) -> Result<LineItem, BillingError>;
+
+    /// Box this layer for [`crate::Tariff::discount_layers`].
+    #[must_use]
+    fn boxed(self) -> Box<dyn DiscountLayer>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
 }
 
 // ── PercentageDiscount ────────────────────────────────────────────────────────
@@ -896,9 +1032,13 @@ mod tests {
             .unwrap()
             .with_currency(Currency::EUR);
         let positions = vec![
-            LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-                .build()
-                .unwrap(),
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
         ];
         let item = levy.compute(&positions).unwrap();
         assert_eq!(item.unit_price.as_ref().unwrap().unit, "EUR/kWh");

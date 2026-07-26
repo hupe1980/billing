@@ -26,16 +26,55 @@ fn checked_mul_qty_returns_err_instead_of_panicking_on_decimal_overflow() {
 }
 
 #[test]
-fn from_decimal_returns_none_instead_of_panicking() {
-    assert_eq!(Amount::<5>::from_decimal(Decimal::MAX), None);
-    assert_eq!(Amount::<5>::from_decimal(Decimal::MIN), None);
+fn decimal_conversion_returns_err_instead_of_panicking() {
+    // `Decimal`'s own `Mul` panics on overflow; every conversion here must not.
     assert!(Amount::<5>::checked_from_decimal(Decimal::MAX).is_err());
-    assert!(Amount::<5>::try_from_decimal(Decimal::MAX).is_err());
+    assert!(Amount::<5>::checked_from_decimal(Decimal::MIN).is_err());
+    assert!(Amount::<5>::try_from(Decimal::MAX).is_err());
+    assert!(
+        Amount::<5>::from_decimal_rounded(Decimal::MAX, RoundingStrategy::MidpointAwayFromZero)
+            .is_err()
+    );
+    assert!(Amount::<5>::from_decimal_rounded(Decimal::MIN, RoundingStrategy::Floor).is_err());
+}
+
+/// The two conversion paths into `Amount` must agree on what is representable.
+///
+/// `parse` has always rejected non-zero digits beyond `P`; `checked_from_decimal`
+/// used to round them away, so the same unrepresentable price was refused as text
+/// and silently altered as a `Decimal`.
+#[test]
+fn string_and_decimal_conversions_agree_on_representability() {
+    for s in ["0.123456", "1.000011", "-0.000001"] {
+        let d = Decimal::from_str_exact(s).unwrap();
+        assert!(Amount::<5>::parse(s).is_err(), "parse must reject {s}");
+        assert!(
+            matches!(
+                Amount::<5>::checked_from_decimal(d),
+                Err(BillingError::PrecisionLoss { .. })
+            ),
+            "checked_from_decimal must reject {s}"
+        );
+    }
+    // Trailing zeros carry no information — both paths accept them.
+    for s in ["1.100000", "49.990000"] {
+        let d = Decimal::from_str_exact(s).unwrap();
+        assert!(Amount::<5>::parse(s).is_ok(), "parse must accept {s}");
+        assert!(
+            Amount::<5>::checked_from_decimal(d).is_ok(),
+            "checked_from_decimal must accept {s}"
+        );
+    }
 }
 
 #[test]
 fn line_item_build_returns_err_instead_of_panicking_on_extreme_inputs() {
-    let r = LineItem::for_usage("x", Decimal::MAX, "u", Decimal::MAX, "c/u").build();
+    let r = LineItem::for_usage(
+        "x",
+        Quantity::new(Decimal::MAX, "u"),
+        UnitPrice::new(Decimal::MAX, "c/u"),
+    )
+    .build();
     assert!(r.is_err(), "quantity × price overflow must be an Err");
 }
 
@@ -72,9 +111,9 @@ fn assert_line_self_consistent(item: &LineItem) {
     let (Some(q), Some(p)) = (item.quantity.as_ref(), item.unit_price.as_ref()) else {
         return; // fixed-amount lines carry no quantity to cross-check
     };
-    let expected = Amount::<5>::from_decimal(
-        (q.value * p.value)
-            .round_dp_with_strategy(5, rust_decimal::RoundingStrategy::MidpointAwayFromZero),
+    let expected = Amount::<5>::from_decimal_rounded(
+        q.value * p.value,
+        RoundingStrategy::MidpointAwayFromZero,
     )
     .unwrap();
     let diff = (expected.to_raw() - item.net_amount.to_raw()).abs();
@@ -92,9 +131,13 @@ fn assert_line_self_consistent(item: &LineItem) {
 
 #[test]
 fn prorate_scales_quantity_alongside_amount() {
-    let full = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-        .build()
-        .unwrap();
+    let full = LineItem::for_usage(
+        "Arbeit",
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(0.30), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     let half = prorate(&full, 15, 30, RoundingStrategy::MidpointAwayFromZero).unwrap();
 
     assert_eq!(half.net_amount, Amount::<5>::parse("150.00000").unwrap());
@@ -109,12 +152,20 @@ fn prorate_scales_quantity_alongside_amount() {
 #[test]
 fn allocated_positions_are_self_consistent() {
     let positions = vec![
-        LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-            .build()
-            .unwrap(),
-        LineItem::for_usage("Gas", dec!(500), "m³", dec!(0.12), "EUR/m³")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Arbeit",
+            Quantity::new(dec!(1000), "kWh"),
+            UnitPrice::new(dec!(0.30), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
+        LineItem::for_usage(
+            "Gas",
+            Quantity::new(dec!(500), "m³"),
+            UnitPrice::new(dec!(0.12), "EUR/m³"),
+        )
+        .build()
+        .unwrap(),
     ];
     let doc = BillingDocument::from_positions(
         DocumentMeta {
@@ -338,9 +389,13 @@ fn percentage_discount_on_negative_base_does_not_become_an_extra_credit() {
     // "10% discount" on a -200 base used to yield another -20 credit, increasing
     // the amount owed to the customer.
     let positions = vec![
-        LineItem::for_usage("Spot", dec!(1000), "kWh", dec!(-0.2), "EUR/kWh")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Spot",
+            Quantity::new(dec!(1000), "kWh"),
+            UnitPrice::new(dec!(-0.2), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
     ];
     let disc = PercentageDiscount::new("Loyalty", dec!(0.10)).unwrap();
     let item = disc.compute(&positions).unwrap();
@@ -582,9 +637,13 @@ fn stacked_per_unit_levies_do_not_double_count_quantities() {
     // consumption and doubled its base — over-billing by 100% on the standard
     // German Stromsteuer + Konzessionsabgabe stack.
     let positions = vec![
-        LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-            .build()
-            .unwrap(),
+        LineItem::for_usage(
+            "Arbeit",
+            Quantity::new(dec!(1000), "kWh"),
+            UnitPrice::new(dec!(0.30), "EUR/kWh"),
+        )
+        .build()
+        .unwrap(),
     ];
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
         Box::new(
@@ -657,15 +716,23 @@ fn scaled_quantity_does_not_explode_in_decimal_scale() {
     // Exact 1/3 scaling produced "99.99999999999999999999999999 kWh" on the
     // invoice line and walked toward Decimal's 28-digit ceiling under repeated
     // scaling.
-    let item = LineItem::for_usage("Arbeit", dec!(300), "kWh", dec!(0.30), "EUR/kWh")
-        .build()
-        .unwrap();
+    let item = LineItem::for_usage(
+        "Arbeit",
+        Quantity::new(dec!(300), "kWh"),
+        UnitPrice::new(dec!(0.30), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     let third = prorate(&item, 1, 3, RoundingStrategy::MidpointAwayFromZero).unwrap();
     assert_eq!(third.quantity_value(), Some(dec!(100)));
 
-    let item = LineItem::for_usage("Arbeit", dec!(1000), "kWh", dec!(0.30), "EUR/kWh")
-        .build()
-        .unwrap();
+    let item = LineItem::for_usage(
+        "Arbeit",
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(0.30), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     let mut cur = item;
     for _ in 0..6 {
         cur = cur
@@ -973,14 +1040,11 @@ fn validate_rejects_a_fabricated_vat_breakdown_and_a_positive_discount() {
 fn for_usage_rounded_clamps_an_out_of_range_price_scale() {
     // `round_dp_with_strategy` silently no-ops above scale 28, leaving the price
     // unrounded while the caller was promised `price_scale` decimals.
-    let item = LineItem::for_usage_rounded(
+    let item = LineItem::for_usage(
         "Arbeit",
-        dec!(1),
-        "kWh",
-        dec!(0.1234567890123),
-        "EUR/kWh",
-        99,
-        RoundingStrategy::MidpointAwayFromZero,
+        Quantity::new(dec!(1), "kWh"),
+        UnitPrice::new(dec!(0.1234567890123), "EUR/kWh")
+            .rounded(99, RoundingStrategy::MidpointAwayFromZero),
     )
     .build()
     .unwrap();
@@ -1061,9 +1125,13 @@ fn from_positions_rejects_a_position_that_fails_its_own_validate() {
             .is_err()
     );
 
-    let mut neg_qty = LineItem::for_usage("x", dec!(5), "kWh", dec!(1), "EUR/kWh")
-        .build()
-        .unwrap();
+    let mut neg_qty = LineItem::for_usage(
+        "x",
+        Quantity::new(dec!(5), "kWh"),
+        UnitPrice::new(dec!(1), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
     neg_qty.quantity = Some(billing::Quantity::new(dec!(-5), "kWh"));
     assert!(
         BillingDocument::from_positions(DocumentMeta::default(), vec![neg_qty], vec![], vec![])
@@ -1196,4 +1264,353 @@ fn schedule_mode_deserialises_from_the_documented_lowercase_names() {
     assert!(json.contains(r#""mode":"graduated""#), "{json}");
     let back: TariffSchedule = serde_json::from_str(&json).unwrap();
     assert_eq!(back.unit(), "kWh");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 0.8.0 — API-shape corrections reported from downstream use
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// An empty unit label must not survive into a document.
+///
+/// `TariffSchedule` and `TimeOfUsePricing` had always rejected empty units, but
+/// `Quantity` / `UnitPrice` did not, so a hand-built position could carry one. That
+/// is not merely cosmetic: `PerUnitLevy` selects its base by matching `unit_label`,
+/// so an empty unit silently drops the position out of every per-unit levy — the
+/// position is billed, the levy on it is not.
+#[test]
+fn empty_unit_labels_are_rejected_at_every_entry_point() {
+    use billing::{Quantity, UnitPrice};
+
+    // Builder path.
+    assert!(
+        LineItem::debit("Arbeit")
+            .quantity(Quantity::new(dec!(100), ""))
+            .unit_price(UnitPrice::new(dec!(0.30), "EUR/kWh"))
+            .build()
+            .is_err(),
+        "empty quantity unit must be rejected"
+    );
+    assert!(
+        LineItem::debit("Arbeit")
+            .quantity(Quantity::new(dec!(100), "kWh"))
+            .unit_price(UnitPrice::new(dec!(0.30), "   "))
+            .build()
+            .is_err(),
+        "whitespace-only price unit must be rejected"
+    );
+
+    // Struct-literal / post-mutation path, which `validate()` backstops.
+    let mut item = LineItem::for_usage(
+        "Arbeit",
+        Quantity::new(dec!(100), "kWh"),
+        UnitPrice::new(dec!(0.30), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
+    assert!(item.validate().is_ok());
+    item.quantity = Some(Quantity::new(dec!(100), ""));
+    assert!(item.validate().is_err(), "validate() must catch it too");
+}
+
+/// A document refuses a position with an empty unit rather than emitting it.
+#[test]
+fn from_positions_rejects_an_empty_unit_label() {
+    use billing::{Quantity, UnitPrice};
+    let bad = LineItem {
+        description: "Arbeit".into(),
+        quantity: Some(Quantity::new(dec!(100), "")),
+        unit_price: Some(UnitPrice::new(dec!(0.30), "EUR/kWh")),
+        net_amount: Amount::parse("30.00000").unwrap(),
+        sign: billing::Sign::Debit,
+        period: None,
+        tags: vec![],
+        metadata: Default::default(),
+    };
+    assert!(
+        BillingDocument::from_positions(DocumentMeta::default(), vec![bad], vec![], vec![])
+            .is_err()
+    );
+}
+
+/// `UnitPrice::rounded` replaces the seven-positional-argument `for_usage_rounded`,
+/// and must round identically.
+#[test]
+fn unit_price_rounded_pins_a_derived_price() {
+    use billing::{Quantity, UnitPrice};
+    // 1/300 EUR/kWh is non-terminating; pin it to 6 decimals.
+    let price = UnitPrice::new(dec!(1) / dec!(300), "EUR/kWh")
+        .rounded(6, RoundingStrategy::MidpointAwayFromZero);
+    assert_eq!(price.value, dec!(0.003333));
+
+    let item = LineItem::for_usage("Arbeit", Quantity::new(dec!(500), "kWh"), price)
+        .build()
+        .unwrap();
+    assert_eq!(item.net_amount, Amount::parse("1.66650").unwrap());
+
+    // Truncation is a different, explicitly chosen answer.
+    let trunc =
+        UnitPrice::new(dec!(1) / dec!(300), "EUR/kWh").rounded(6, RoundingStrategy::Truncate);
+    assert_eq!(trunc.value, dec!(0.003333));
+    let up = UnitPrice::new(dec!(2) / dec!(300), "EUR/kWh").rounded(6, RoundingStrategy::Truncate);
+    assert_eq!(up.value, dec!(0.006666)); // not 0.006667
+}
+
+/// A scale above `Decimal`'s maximum must clamp, not silently no-op.
+#[test]
+fn unit_price_rounded_clamps_scale_to_decimal_max() {
+    use billing::UnitPrice;
+    let p =
+        UnitPrice::new(dec!(0.1), "EUR/kWh").rounded(99, RoundingStrategy::MidpointAwayFromZero);
+    assert_eq!(p.value, dec!(0.1));
+}
+
+/// The "nothing to bill, because X" outcome must survive to the caller.
+#[test]
+fn not_billable_reason_survives_instead_of_becoming_an_empty_document() {
+    use billing::{Billing, Positions, ScalarTariff};
+    use std::fmt;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Why {
+        NoData,
+        PriceMissing,
+    }
+    impl fmt::Display for Why {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::NoData => f.write_str("no data"),
+                Self::PriceMissing => f.write_str("price missing"),
+            }
+        }
+    }
+
+    struct Settle(Option<Why>);
+    impl ScalarTariff for Settle {
+        type Error = BillingError;
+        type NotBillable = Why;
+        fn positions(&self) -> Result<Positions<Why>, BillingError> {
+            match self.0 {
+                Some(Why::NoData) => Ok(Billing::NotBillable(Why::NoData)),
+                Some(Why::PriceMissing) => Ok(Billing::NotBillable(Why::PriceMissing)),
+                None => Ok(vec![
+                    LineItem::fixed("Vergütung", Amount::parse("42.00000").unwrap()).build()?,
+                ]
+                .into()),
+            }
+        }
+    }
+
+    // Each reason arrives distinct — not flattened into an empty Vec.
+    let out = Settle(Some(Why::PriceMissing))
+        .try_settle(DocumentMeta::default())
+        .unwrap();
+    assert_eq!(out.reason(), Some(&Why::PriceMissing));
+    assert!(!out.is_billable());
+    assert!(out.into_billable().is_none());
+
+    let out = Settle(Some(Why::NoData))
+        .try_settle(DocumentMeta::default())
+        .unwrap();
+    assert_eq!(out.reason(), Some(&Why::NoData));
+    // The Display impl carries the reason for logs.
+    assert_eq!(out.to_string(), "not billable: no data");
+
+    // And the billable case still produces a document.
+    let out = Settle(None).try_settle(DocumentMeta::default()).unwrap();
+    assert_eq!(
+        out.billable().unwrap().net_total(),
+        Amount::parse("42.00000").unwrap()
+    );
+}
+
+/// A `ScalarTariff` needs neither `type Usage = ()` nor an ignored `usage` argument,
+/// and is still usable everywhere a `Tariff` is.
+#[test]
+fn scalar_tariff_composes_as_a_tariff() {
+    use billing::{Positions, ScalarTariff, Tariff};
+    use std::convert::Infallible;
+
+    struct Payout(i64);
+    impl ScalarTariff for Payout {
+        type Error = BillingError;
+        type NotBillable = Infallible;
+        fn positions(&self) -> Result<Positions<Infallible>, BillingError> {
+            Ok(vec![LineItem::fixed("Payout", Amount::<5>::from_int(self.0)).build()?].into())
+        }
+        fn tax_layers(&self) -> Vec<Box<dyn billing::TaxLayer>> {
+            vec![FixedRateTax::new("VAT", dec!(0.19)).unwrap().boxed()]
+        }
+    }
+
+    // Via the scalar convenience…
+    let doc = Payout(100).settle(DocumentMeta::default()).unwrap();
+    assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
+    assert_eq!(doc.tax_total(), Amount::parse("19.00000").unwrap());
+
+    // …and via the generic `Tariff` surface, including the tax layers.
+    let doc2 = Tariff::bill(&Payout(100), DocumentMeta::default(), &()).unwrap();
+    assert_eq!(doc2.gross_total(), doc.gross_total());
+
+    // …and through the document builder.
+    let doc3 = BillingDocument::builder()
+        .meta(DocumentMeta::default())
+        .tariff(&Payout(100), &())
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(doc3.gross_total(), doc.gross_total());
+}
+
+/// `FixedRateTax::exempt` enforces the EN 16931 category/reason pairing that the
+/// chainable setters can only detect after the fact.
+#[test]
+fn exempt_constructor_enforces_the_category_reason_pairing() {
+    use billing::{TaxCategory, TaxLayer};
+
+    // Every category that requires a reason is constructible with one.
+    for c in [
+        TaxCategory::Exempt,
+        TaxCategory::ReverseCharge,
+        TaxCategory::IntraCommunity,
+        TaxCategory::Export,
+        TaxCategory::OutOfScope,
+    ] {
+        let layer = FixedRateTax::exempt("Steuerfrei", c, "legal basis").unwrap();
+        assert_eq!(layer.category(), c);
+        assert_eq!(layer.rate(), dec!(0));
+        assert!(layer.compute(&[]).unwrap().net_amount.is_zero());
+        // The breakdown reports the category and a zero tax amount.
+        let entry = layer.breakdown(&[]).unwrap().unwrap();
+        assert_eq!(entry.category, c);
+        assert!(entry.tax_amount.is_zero());
+    }
+
+    // Z forbids a reason; S/L/M levy tax. Neither belongs in `exempt`.
+    assert!(FixedRateTax::exempt("Z", TaxCategory::ZeroRated, "why").is_err());
+    for c in [
+        TaxCategory::Standard,
+        TaxCategory::CanaryIslands,
+        TaxCategory::CeutaMelilla,
+    ] {
+        assert!(FixedRateTax::exempt("taxed", c, "why").is_err());
+    }
+
+    // `zero_rated` is the Z path, and carries no reason.
+    let z = FixedRateTax::zero_rated("Nullsatz");
+    assert_eq!(z.category(), TaxCategory::ZeroRated);
+    assert_eq!(z.exemption_reason(), None);
+    assert!(z.breakdown(&[]).unwrap().unwrap().tax_amount.is_zero());
+}
+
+/// The three German VAT regimes are three layer sets over the same positions — no
+/// wrapper type per regime.
+#[test]
+fn vat_regimes_are_data_not_three_tariff_impls() {
+    use billing::{TaxCategory, TaxLayer};
+
+    let positions = || {
+        vec![
+            LineItem::fixed("Direktvermarktung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ]
+    };
+    let regime = |layers: Vec<Box<dyn TaxLayer>>| {
+        BillingDocument::from_positions(
+            DocumentMeta {
+                currency: Currency::EUR,
+                ..Default::default()
+            },
+            positions(),
+            layers,
+            vec![],
+        )
+        .unwrap()
+    };
+
+    // Regelbesteuerung — 19 %.
+    let standard = regime(vec![
+        FixedRateTax::new("USt 19%", dec!(0.19)).unwrap().boxed(),
+    ]);
+    assert_eq!(standard.tax_total(), Amount::parse("190.00000").unwrap());
+
+    // §12 Abs. 3 UStG — zero-rated, input tax still deductible, no reason text.
+    let zero = regime(vec![FixedRateTax::zero_rated("§12 Abs. 3 UStG").boxed()]);
+    assert_eq!(zero.tax_total(), Amount::<5>::ZERO);
+    assert_eq!(zero.tax_breakdown().len(), 1);
+    assert_eq!(zero.tax_breakdown()[0].category, TaxCategory::ZeroRated);
+
+    // §19 UStG Kleinunternehmer — exempt, reason required.
+    let small = regime(vec![
+        FixedRateTax::exempt(
+            "§19 UStG",
+            TaxCategory::Exempt,
+            "Kleinunternehmer gemäß §19 UStG",
+        )
+        .unwrap()
+        .boxed(),
+    ]);
+    assert_eq!(small.tax_total(), Amount::<5>::ZERO);
+    assert_eq!(small.tax_breakdown()[0].category, TaxCategory::Exempt);
+    assert!(small.tax_breakdown()[0].exemption_reason.is_some());
+
+    // All three agree on the net; only the tax treatment differs.
+    for d in [&standard, &zero, &small] {
+        assert_eq!(d.net_total(), Amount::parse("1000.00000").unwrap());
+        d.assert_valid();
+    }
+}
+
+/// `AmountScale` must re-run its constructor check on deserialisation.
+///
+/// The crate's stated invariant is that validated types route deserialisation
+/// through the same validation via `#[serde(try_from = ...)]`; a derived impl on
+/// private fields would let stored configuration reintroduce a precision that
+/// `AmountScale::new` refuses.
+#[cfg(feature = "serde")]
+#[test]
+fn amount_scale_revalidates_on_deserialisation() {
+    // Round-trip of a valid value.
+    let scale = AmountScale::new(2, RoundingStrategy::Floor).unwrap();
+    let json = serde_json::to_string(&scale).unwrap();
+    let back: AmountScale = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, scale);
+
+    // A precision the constructor refuses must not slip in through JSON.
+    let err = serde_json::from_str::<AmountScale>(r#"{"decimals":99,"strategy":"Floor"}"#)
+        .expect_err("decimals > 5 must be rejected on deserialisation");
+    assert!(
+        err.to_string().contains("must be <= 5"),
+        "error should name the violated bound, got: {err}"
+    );
+}
+
+/// `Amount::round_to_scale` agrees with `round_to_increment` for every strategy,
+/// and is a no-op at or above the type's own precision.
+#[test]
+fn round_to_scale_matches_increment_rounding_for_every_strategy() {
+    let strategies = [
+        RoundingStrategy::MidpointAwayFromZero,
+        RoundingStrategy::MidpointToEven,
+        RoundingStrategy::Ceiling,
+        RoundingStrategy::Floor,
+        RoundingStrategy::Truncate,
+    ];
+    for strategy in strategies {
+        for raw in -2_000i64..2_000 {
+            let a = Amount::<5>::from_raw_units(raw);
+            // scale 2 == increment 0.001_00 (10^(5-2) = 1000 raw units)
+            assert_eq!(
+                a.round_to_scale(2, strategy).unwrap(),
+                a.round_to_increment(Amount::<5>::from_raw_units(1_000), strategy)
+                    .unwrap(),
+                "scale 2 vs increment 1000 for raw {raw}, {strategy:?}"
+            );
+            assert!(a.round_to_scale(2, strategy).unwrap().fits_scale(2));
+            // At or above P, nothing changes.
+            assert_eq!(a.round_to_scale(5, strategy).unwrap(), a);
+            assert_eq!(a.round_to_scale(9, strategy).unwrap(), a);
+            assert!(a.fits_scale(5));
+        }
+    }
 }
