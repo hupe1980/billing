@@ -605,15 +605,15 @@ fn check_price_base_unit(
     let (Some(q), Some(p)) = (quantity, price) else {
         return Ok(());
     };
-    if let (Some(qc), Some(pc)) = (q.code.as_deref(), p.base_quantity_code.as_deref())
-        && qc != pc
-    {
-        return Err(BillingError::InvalidInput {
-            reason: format!(
-                "item price base quantity unit code {pc:?} (BT-150) differs from the invoiced \
-                 quantity unit code {qc:?} (BT-130); PEPPOL-EN16931-R130 requires them equal"
-            ),
-        });
+    if let (Some(qc), Some(pc)) = (q.code.as_deref(), p.base_quantity_code.as_deref()) {
+        if qc != pc {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "item price base quantity unit code {pc:?} (BT-150) differs from the invoiced \
+                     quantity unit code {qc:?} (BT-130); PEPPOL-EN16931-R130 requires them equal"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1031,7 +1031,7 @@ impl LineItem {
     /// | Term | Value |
     /// |---|---|
     /// | BT-129 invoiced quantity | `1` |
-    /// | BT-130 unit code | [`UNIT_CODE_ONE`] — `C62`, UN/ECE Rec 20 "one", the code for a countable item with no other unit |
+    /// | BT-130 unit code | [`crate::UNIT_CODE_ONE`] — `C62`, UN/ECE Rec 20 "one", the code for a countable item with no other unit |
     /// | BT-146 item net price | the full amount |
     ///
     /// `1 × amount` is exactly `amount`, so `PEPPOL-EN16931-R120` holds trivially
@@ -1531,8 +1531,10 @@ impl LineItemBuilder {
         // Quantity must be non-negative; a negative quantity on a debit or credit
         // line is a caller error (model refunds via Sign::Credit, not by negating
         // the quantity).
-        if let Some(q) = &self.quantity
-            && q.value < rust_decimal::Decimal::ZERO
+        if self
+            .quantity
+            .as_ref()
+            .is_some_and(|q| q.value < rust_decimal::Decimal::ZERO)
         {
             return Err(BillingError::InvalidInput {
                 reason: "LineItem quantity must be non-negative".into(),
