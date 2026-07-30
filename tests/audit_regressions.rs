@@ -1324,6 +1324,8 @@ fn from_positions_rejects_an_empty_unit_label() {
         sign: billing::Sign::Debit,
         period: None,
         tags: vec![],
+        vat: None,
+        allowance_charge: None,
         metadata: Default::default(),
     };
     assert!(

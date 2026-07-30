@@ -14,6 +14,15 @@ use rust_decimal::Decimal;
 /// or validated** by the engine. Store `"YYYY-MM-DD"` dates for maximum interoperability
 /// with BO4E, EDIFACT, UBL, and German energy market standards (UStG §14, MessZV §22).
 ///
+/// # Ordering is the caller's responsibility
+///
+/// Because the engine does not parse the dates, it cannot tell an end-before-start
+/// period from a valid one — `Period::new("2026-06-30", "2026-06-01")` is accepted.
+/// EN 16931 *does* check it: **BR-29** requires BT-74 ≥ BT-73 on the invoicing
+/// period and **BR-30** requires BT-135 ≥ BT-134 on a line period, both fatal. A
+/// consumer that parses dates should verify ordering at its own boundary;
+/// [`Period::is_ordered`] does it here for the ISO 8601 case.
+///
 /// # Example
 /// ```rust
 /// use billing::Period;
@@ -73,6 +82,39 @@ impl Period {
             from: from.to_string(),
             to: to.to_string(),
         }
+    }
+
+    /// Whether `to` is on or after `from` — EN 16931 **BR-29** / **BR-30**.
+    ///
+    /// Compares the two strings **lexicographically**, which is a correct date
+    /// comparison for zero-padded ISO 8601 (`"YYYY-MM-DD"`) and for nothing else.
+    /// Returns `None` when either endpoint is not of that shape, rather than
+    /// answering a question it cannot actually decide — the engine stays
+    /// date-agnostic, and a confident `false` on `"1.6.2026"` would be worse than
+    /// no answer.
+    ///
+    /// ```rust
+    /// use billing::Period;
+    ///
+    /// assert_eq!(Period::new("2026-06-01", "2026-06-30").is_ordered(), Some(true));
+    /// assert_eq!(Period::new("2026-06-30", "2026-06-01").is_ordered(), Some(false));
+    /// // A single-day period is ordered: BR-29 and BR-30 both say "later or equal".
+    /// assert_eq!(Period::new("2026-06-01", "2026-06-01").is_ordered(), Some(true));
+    /// // Not ISO 8601 — the engine declines to guess.
+    /// assert_eq!(Period::new("1.6.2026", "30.6.2026").is_ordered(), None);
+    /// ```
+    #[must_use]
+    pub fn is_ordered(&self) -> Option<bool> {
+        /// `YYYY-MM-DD`, zero-padded — the only shape a lexicographic compare
+        /// orders the same way a calendar does.
+        fn is_iso_date(s: &str) -> bool {
+            s.len() == 10
+                && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+                    4 | 7 => *b == b'-',
+                    _ => b.is_ascii_digit(),
+                })
+        }
+        (is_iso_date(&self.from) && is_iso_date(&self.to)).then(|| self.to >= self.from)
     }
 }
 
@@ -156,7 +198,7 @@ pub fn merge_period_documents(
     let prepaid = doc_a.prepaid().checked_add(doc_b.prepaid())?;
     let rounding = doc_a.rounding().checked_add(doc_b.rounding())?;
 
-    BillingDocument::from_raw(crate::document::DocumentParts {
+    let merged = BillingDocument::from_raw(crate::document::DocumentParts {
         meta: doc_a.meta,
         net_positions,
         tax_positions,
@@ -168,7 +210,17 @@ pub fn merge_period_documents(
         // Both halves' already-paid amounts and rounding adjustments carry over.
         prepaid,
         rounding,
-    })
+    })?;
+    // `from_raw` performs no validation, so without this the function could hand
+    // back a document that fails `validate()`. Two individually lawful halves do
+    // not always compose into a lawful whole: merging an "outside the scope of
+    // VAT" document with a taxed one produces a breakdown that BR-O-11 forbids,
+    // and only the combined document can show it. `AllocationRule` has always
+    // re-checked its outputs for the same reason.
+    merged.validate().map_err(|e| BillingError::InvalidInput {
+        reason: format!("merging produced an inconsistent document: {e}"),
+    })?;
+    Ok(merged)
 }
 
 // ── prorate ───────────────────────────────────────────────────────────────────

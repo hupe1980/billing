@@ -1224,8 +1224,10 @@ fn fixed_rate_tax_negative_rate_is_err() {
 
 #[test]
 fn fixed_rate_tax_zero_rate_ok() {
-    // Zero-rate tax (e.g. zero-rated VAT) is valid.
-    let tax = FixedRateTax::new("Zero-rated", dec!(0)).unwrap();
+    // A supply taxed at zero is zero-*rated* (`Z`), not standard-rated at 0 %:
+    // BR-S-05 forbids the latter, and BR-S-08 then makes an (S, 0) breakdown group
+    // unsatisfiable. `zero_rated` is the constructor for it.
+    let tax = FixedRateTax::zero_rated("Zero-rated");
     let pos = vec![
         LineItem::fixed("Item", Amount::parse("100.00000").unwrap())
             .build()
@@ -1233,6 +1235,13 @@ fn fixed_rate_tax_zero_rate_ok() {
     ];
     let item = tax.compute(&pos).unwrap();
     assert!(item.net_amount.is_zero());
+
+    // The standard-rated spelling of the same thing is refused, and says why.
+    let err = FixedRateTax::new("Zero-rated", dec!(0))
+        .unwrap()
+        .compute(&pos)
+        .unwrap_err();
+    assert!(err.to_string().contains("BR-S-05"), "unhelpful: {err}");
 }
 
 #[test]
@@ -2667,8 +2676,12 @@ fn all_positions_is_zero_allocation_iterator() {
 
 #[test]
 fn all_positions_count_correct() {
+    // A commission (no VAT breakdown) stacked under a VAT layer — the ordinary
+    // compound shape. Two *VAT* layers over one untagged position would instead be
+    // rejected as double attribution; see
+    // `two_vat_layers_covering_one_position_are_rejected`.
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
-        Box::new(FixedRateTax::new("T1", dec!(0.10)).unwrap()),
+        Box::new(billing::PercentageCharge::new("T1", dec!(0.10)).unwrap()),
         Box::new(FixedRateTax::new("T2", dec!(0.05)).unwrap()),
     ];
     let doc = BillingDocument::from_positions(
@@ -2684,6 +2697,70 @@ fn all_positions_count_correct() {
     .unwrap();
     // 1 net + 0 discounts + 2 taxes = 3 positions total.
     assert_eq!(doc.all_positions().count(), 3);
+}
+
+/// Two VAT layers whose bases overlap tax the same position twice, so BR-S-08
+/// cannot hold for either group. Assembly used to accept this silently.
+#[test]
+fn two_vat_layers_covering_one_position_are_rejected() {
+    let taxes: Vec<Box<dyn TaxLayer>> = vec![
+        Box::new(FixedRateTax::new("MwSt 19", dec!(0.19)).unwrap()),
+        Box::new(FixedRateTax::new("MwSt 7", dec!(0.07)).unwrap()),
+    ];
+    let err = BillingDocument::from_positions(
+        DocumentMeta::default(),
+        vec![
+            LineItem::fixed("X", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        taxes,
+        vec![],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, billing::BillingError::LayerError { .. }),
+        "expected LayerError, got {err:?}"
+    );
+    // The message must name the layer and the position, or it is not actionable.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("MwSt 7") && msg.contains('X'),
+        "unhelpful: {msg}"
+    );
+
+    // Tagging them apart is the fix, and it assembles.
+    let taxes: Vec<Box<dyn TaxLayer>> = vec![
+        Box::new(
+            FixedRateTax::new("MwSt 19", dec!(0.19))
+                .unwrap()
+                .with_tag("full"),
+        ),
+        Box::new(
+            FixedRateTax::new("MwSt 7", dec!(0.07))
+                .unwrap()
+                .with_tag("reduced"),
+        ),
+    ];
+    let doc = BillingDocument::from_positions(
+        DocumentMeta::default(),
+        vec![
+            LineItem::fixed("X", Amount::parse("100.00000").unwrap())
+                .tag("full")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Y", Amount::parse("50.00000").unwrap())
+                .tag("reduced")
+                .build()
+                .unwrap(),
+        ],
+        taxes,
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(doc.net_positions()[0].vat.unwrap().rate, dec!(0.19));
+    assert_eq!(doc.net_positions()[1].vat.unwrap().rate, dec!(0.07));
+    doc.verify_vat_attribution().unwrap();
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4481,10 +4558,9 @@ fn fixed_rate_tax_zero_rate_creates_zero_item() {
             .build()
             .unwrap(),
     ];
-    let item = FixedRateTax::new("ZeroTax", dec!(0))
-        .unwrap()
-        .compute(&pos)
-        .unwrap();
+    // `Z` — zero-rated. `FixedRateTax::new(.., 0)` would be standard-rated at 0 %,
+    // which BR-S-05 refuses; see `fixed_rate_tax_zero_rate_ok`.
+    let item = FixedRateTax::zero_rated("ZeroTax").compute(&pos).unwrap();
     assert!(item.net_amount.is_zero());
     assert!(item.has_tag("tax"));
 }

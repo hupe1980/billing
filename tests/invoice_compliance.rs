@@ -70,7 +70,7 @@ fn mixed_rate_invoice_produces_one_breakdown_line_per_rate() {
 
 #[test]
 fn same_rate_from_two_layers_merges_into_one_breakdown_line() {
-    // BR-CO-18: exactly one breakdown line per (category, rate) pair.
+    // One breakdown line per (category, rate) — BR-S-08 for the taxed categories.
     let positions = vec![
         LineItem::fixed("A", Amount::parse("100.00000").unwrap())
             .tag("a")
@@ -885,13 +885,15 @@ fn amount_scale_satisfies_en16931_across_a_sweep() {
     // Rates with 2, 3 and 4 decimals. The 4-decimal ones (a real US sales-tax
     // shape) are the case where rounding a 5-decimal intermediate a second time
     // could land a minor unit away from what a validator recomputes for BR-CO-17.
+    // `dec!(0)` is deliberately absent: a standard-rated 0 % layer is not a lawful
+    // EN 16931 state (BR-S-05), and `FixedRateTax::zero_rated` is the constructor
+    // for a zero-rated supply. The sweep is about rounding, and 0 % rounds nothing.
     let rates = [
         dec!(0.19),
         dec!(0.07),
         dec!(0.081),
         dec!(0.0825),
         dec!(0.0625),
-        dec!(0),
     ];
     let mut checked = 0;
     for rate in rates {
@@ -1017,11 +1019,7 @@ fn amount_scale_holds_for_a_full_document_stack() {
         .unwrap();
 
     assert_amounts_conform(&doc, AmountScale::EN16931);
-    assert_eq!(
-        doc.tax_breakdown().len(),
-        2,
-        "one entry per rate (BR-CO-18)"
-    );
+    assert_eq!(doc.tax_breakdown().len(), 2, "one entry per rate (BR-S-08)");
 }
 
 /// A scale of 0 (whole units — JPY, KRW) works the same way.
@@ -1323,5 +1321,1162 @@ fn allocation_breaks_the_amount_scale_but_reversal_keeps_it() {
     assert_eq!(total, doc.gross_total());
     for p in &parts {
         p.assert_valid();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The VAT / charge split (EN 16931 BT-110 vs BG-21)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `tax_total` mixes value added tax with document level charges. Mapping all of
+/// it to BT-110 breaks BR-CO-14 (`BT-110 = Σ BT-117`) on every document carrying a
+/// levy — which is the whole German electricity stack.
+#[test]
+fn vat_total_and_charge_total_split_bt_110_from_bg_21() {
+    let doc = BillingDocument::builder()
+        .meta(meta("SPLIT-1"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh").with_code("KWH"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        // Two document level charges, then VAT on net + both.
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .with_unit_code("KWH")
+                .with_reason_code("AAE")
+                .boxed(),
+        )
+        .extra_tax(
+            PercentageCharge::new("Abrechnungsentgelt", dec!(0.01))
+                .unwrap()
+                .with_reason_code("ABK")
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // Exactly one VAT position, two charges.
+    assert_eq!(doc.vat_positions().count(), 1);
+    assert_eq!(doc.charge_positions().count(), 2);
+    assert_eq!(doc.tax_positions().len(), 3);
+
+    // BR-CO-14: BT-110 is the VAT alone, and equals Σ BT-117.
+    let bt_110 = doc.vat_total().unwrap();
+    let sum_bt_117 = Amount::checked_sum(doc.tax_breakdown().iter().map(|e| e.tax_amount)).unwrap();
+    assert_eq!(bt_110, sum_bt_117, "BR-CO-14");
+    assert_ne!(bt_110, doc.tax_total(), "the naive mapping would differ");
+
+    // The charges account for the rest, exactly.
+    assert_eq!(
+        doc.vat_total()
+            .unwrap()
+            .checked_add(doc.charge_total().unwrap())
+            .unwrap(),
+        doc.tax_total(),
+    );
+
+    // Every charge carries the BT-102/BT-103 the VAT layer attributed to it, plus
+    // the BT-105 its layer declared — both mandatory-ish under BR-37 / BR-38.
+    for charge in doc.charge_positions() {
+        let vat = charge.vat.expect("BT-102 on every BG-21 charge");
+        assert_eq!(vat.category, TaxCategory::Standard);
+        assert_eq!(vat.rate, dec!(0.19));
+        assert!(
+            charge
+                .allowance_charge
+                .as_ref()
+                .and_then(|a| a.reason_code.as_deref())
+                .is_some(),
+            "BT-105"
+        );
+    }
+    // The VAT position itself is BG-23 and carries no BT-102.
+    assert!(doc.vat_positions().all(|p| p.vat.is_none()));
+
+    // BT-130 survives assembly on both the metered line and the levy.
+    assert_eq!(
+        doc.net_positions()[0]
+            .quantity
+            .as_ref()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("KWH")
+    );
+    let levy = doc.charge_positions().next().unwrap();
+    assert_eq!(levy.quantity.as_ref().unwrap().code.as_deref(), Some("KWH"));
+
+    // BR-S-08: the breakdown agrees with the per-position attribution.
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// A third-party `TaxLayer` is classified by what it returns from `breakdown`,
+/// not by tags it happened to write — so the split is total, not a heuristic.
+#[test]
+fn vat_tag_is_engine_assigned_so_custom_layers_classify_correctly() {
+    struct CustomVat;
+    impl TaxLayer for CustomVat {
+        fn name(&self) -> &str {
+            "Custom VAT"
+        }
+        fn compute(&self, positions: &[LineItem]) -> Result<LineItem, BillingError> {
+            let base = Amount::checked_sum(positions.iter().map(|p| p.net_amount))?;
+            // Deliberately writes no reserved tag of its own.
+            LineItem::debit("Custom VAT")
+                .fixed_amount(base.checked_mul_qty(dec!(0.19))?)
+                .build()
+        }
+        fn breakdown(
+            &self,
+            positions: &[LineItem],
+        ) -> Result<Option<TaxBreakdownEntry>, BillingError> {
+            let base = Amount::checked_sum(positions.iter().map(|p| p.net_amount))?;
+            Ok(Some(TaxBreakdownEntry::new(
+                TaxCategory::Standard,
+                dec!(0.19),
+                base,
+                base.checked_mul_qty(dec!(0.19))?,
+            )))
+        }
+    }
+
+    struct CustomCharge;
+    impl TaxLayer for CustomCharge {
+        fn name(&self) -> &str {
+            "Handling"
+        }
+        fn compute(&self, _: &[LineItem]) -> Result<LineItem, BillingError> {
+            LineItem::debit("Handling")
+                .fixed_amount(Amount::parse("5.00000").unwrap())
+                .build()
+        }
+    }
+
+    let doc = BillingDocument::builder()
+        .meta(meta("CUSTOM-1"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(Box::new(CustomCharge))
+        .extra_tax(Box::new(CustomVat))
+        .build()
+        .unwrap();
+
+    // The engine tagged both, from the `breakdown` return value alone.
+    assert_eq!(doc.charge_positions().count(), 1);
+    assert_eq!(doc.vat_positions().count(), 1);
+    assert!(
+        doc.tax_positions()
+            .iter()
+            .all(|p| p.has_tag(billing::tags::TAX))
+    );
+    // VAT on 100 + 5 = 105 → 19.95.
+    assert_eq!(doc.vat_total().unwrap(), Amount::parse("19.95000").unwrap());
+    assert_eq!(
+        doc.charge_total().unwrap(),
+        Amount::parse("5.00000").unwrap()
+    );
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// BR-CO-18, as actually written: an invoice that charges VAT must have a BG-23.
+#[test]
+fn br_co_18_requires_a_breakdown_behind_declared_vat() {
+    let doc = BillingDocument::builder()
+        .meta(meta("CO18"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    doc.assert_valid();
+
+    // A document with only charges and no VAT is fine — `billing` bills things
+    // that are not EN 16931 invoices, and BR-CO-18 cannot be demanded blindly.
+    let charges_only = BillingDocument::builder()
+        .meta(meta("CO18-B"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(PercentageCharge::new("Fee", dec!(0.05)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert!(charges_only.tax_breakdown().is_empty());
+    charges_only.assert_valid();
+
+    // Stripping the breakdown from a document that charges VAT is what BR-CO-18
+    // catches. Round-tripping through JSON is the realistic way to reach it.
+    #[cfg(feature = "serde")]
+    {
+        let mut json: serde_json::Value = serde_json::to_value(&doc).unwrap();
+        json["tax_breakdown"] = serde_json::json!([]);
+        let err = serde_json::from_value::<BillingDocument>(json).unwrap_err();
+        assert!(err.to_string().contains("BR-CO-18"), "unhelpful: {err}");
+    }
+}
+
+/// A `B` (split payment) invoice: taxed at the normal rate, and the tax is stated.
+#[test]
+fn split_payment_invoice_states_its_tax() {
+    let doc = BillingDocument::builder()
+        .meta(meta("IT-SPLIT-1"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Consulenza", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::new("IVA", dec!(0.22))
+                .unwrap()
+                .with_category(TaxCategory::SplitPayment)
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    let entry = &doc.tax_breakdown()[0];
+    assert_eq!(entry.category, TaxCategory::SplitPayment);
+    assert_eq!(entry.category.code(), "B");
+    // Unlike `AE`, BT-117 is NOT zero — there is no BR-B-09.
+    assert_eq!(entry.tax_amount, Amount::parse("220.00000").unwrap());
+    assert_eq!(
+        doc.vat_total().unwrap(),
+        Amount::parse("220.00000").unwrap()
+    );
+    // And no exemption reason is required or forbidden.
+    assert!(entry.exemption_reason.is_none());
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// Allowances carry their own BT-95 / BT-96 / BT-98, and reduce the base they name.
+#[test]
+fn allowances_carry_vat_and_reason_codes() {
+    let doc = BillingDocument::builder()
+        .meta(meta("ALLOW-1"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Beratung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::PercentageDiscount::new("Treuerabatt", dec!(0.10))
+                .unwrap()
+                // UNCL 5189 "95" = Discount.
+                .with_reason_code("95")
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    let allowance = &doc.discount_positions()[0];
+    let ac = allowance.allowance_charge.as_ref().expect("BG-20 detail");
+    assert_eq!(ac.reason_code.as_deref(), Some("95"), "BT-98");
+    // BT-93 / BT-94 travel together (PEPPOL-EN16931-R041 / R042).
+    assert_eq!(ac.base_amount, Some(Amount::parse("1000.00000").unwrap()));
+    assert_eq!(ac.percentage, Some(dec!(10)));
+    // The VAT layer covered it, so it was attributed BT-95 / BT-96.
+    let vat = allowance.vat.expect("BT-95 on every BG-20 allowance");
+    assert_eq!(vat.category, TaxCategory::Standard);
+    assert_eq!(vat.rate, dec!(0.19));
+
+    // BR-S-08: 1000.00 − 100.00 = 900.00 is the taxable base.
+    assert_eq!(
+        doc.tax_breakdown()[0].taxable_base,
+        Amount::parse("900.00000").unwrap()
+    );
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// A caller-declared BT-151 that contradicts the layer actually taxing the
+/// position is a tagging bug, and is reported rather than silently overridden.
+#[test]
+fn contradictory_declared_vat_is_rejected() {
+    let err = BillingDocument::builder()
+        .meta(meta("CONTRA"))
+        .positions(vec![
+            LineItem::fixed("Buch", Amount::parse("100.00000").unwrap())
+                // The caller says 7 % …
+                .vat(LineVat::new(TaxCategory::Standard, dec!(0.07)).unwrap())
+                .build()
+                .unwrap(),
+        ])
+        // … while the layer that taxes it says 19 %.
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap_err();
+    assert!(
+        matches!(err, BillingError::LayerError { .. }),
+        "got {err:?}"
+    );
+    assert!(err.to_string().contains("Buch"));
+}
+
+/// `exact_to` narrows without rounding, or says it cannot — the conversion an
+/// interchange boundary needs, where rounding would break the totals identities.
+#[test]
+fn exact_to_refuses_to_lose_money_at_the_boundary() {
+    let doc = BillingDocument::builder()
+        .meta(meta("EXACT"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1234.567), "kWh"),
+                UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // Every amount narrows exactly, so the EN 16931 identities survive the move.
+    let net: Amount<2> = doc.net_total().exact_to().unwrap();
+    let tax: Amount<2> = doc.tax_total().exact_to().unwrap();
+    let gross: Amount<2> = doc.gross_total().exact_to().unwrap();
+    assert_eq!(net.checked_add(tax).unwrap(), gross, "BR-CO-15 at 2 dp");
+
+    // An unscaled document does not narrow, and says so instead of rounding.
+    let raw = BillingDocument::builder()
+        .meta(meta("EXACT-RAW"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1234.567), "kWh"),
+                UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert!(!raw.fits_amount_scale(2));
+    assert!(raw.net_total().exact_to::<2>().is_err());
+}
+
+/// A credit note keeps the attribution and the tags, so it maps to EN 16931 the
+/// same way the invoice did — and BR-S-08 still holds with every sign flipped.
+#[test]
+fn reversal_preserves_vat_attribution_and_classification() {
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-REV"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh").with_code("KWH"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    doc.verify_vat_attribution().unwrap();
+
+    let credit = doc.reverse(meta("CN-REV")).unwrap();
+    assert_eq!(credit.vat_positions().count(), 1);
+    assert_eq!(credit.charge_positions().count(), 1);
+    assert_eq!(
+        credit.vat_total().unwrap(),
+        doc.vat_total().unwrap().checked_neg().unwrap()
+    );
+    assert_eq!(
+        credit.net_positions()[0].vat.unwrap().rate,
+        dec!(0.19),
+        "BT-152 survives the reversal"
+    );
+    assert_eq!(
+        credit.net_positions()[0]
+            .quantity
+            .as_ref()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("KWH"),
+        "BT-130 survives the reversal"
+    );
+    // Base and tax are both negated, so the identity is unchanged.
+    credit.verify_vat_attribution().unwrap();
+    credit.assert_valid();
+}
+
+/// Everything added for the EN 16931 mapping survives a serde round trip, and the
+/// re-validation on the way in still runs.
+#[cfg(feature = "serde")]
+#[test]
+fn en16931_attribution_survives_a_serde_round_trip() {
+    let doc = BillingDocument::builder()
+        .meta(meta("SERDE-1"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh").with_code("KWH"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .extra_discount(
+            billing::FixedDiscount::new("Gutschrift", Amount::parse("10.00000").unwrap())
+                .unwrap()
+                .with_reason_code("95")
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("IVA", dec!(0.22))
+                .unwrap()
+                .with_category(TaxCategory::SplitPayment)
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    let json = serde_json::to_string(&doc).unwrap();
+    let back: BillingDocument = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, doc);
+    assert_eq!(back.tax_breakdown()[0].category, TaxCategory::SplitPayment);
+    assert_eq!(
+        back.net_positions()[0].vat.unwrap().category,
+        TaxCategory::SplitPayment
+    );
+    assert_eq!(
+        back.net_positions()[0]
+            .quantity
+            .as_ref()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("KWH")
+    );
+    assert_eq!(
+        back.discount_positions()[0]
+            .allowance_charge
+            .as_ref()
+            .and_then(|a| a.reason_code.as_deref()),
+        Some("95")
+    );
+    back.verify_vat_attribution().unwrap();
+
+    // A hand-edited line rate that contradicts its category is refused on the way
+    // in, rather than trusted because it came from JSON.
+    let mut bad: serde_json::Value = serde_json::from_str(&json).unwrap();
+    bad["net_positions"][0]["vat"]["category"] = serde_json::json!("ReverseCharge");
+    assert!(serde_json::from_value::<BillingDocument>(bad).is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The totals chain: BT-106 / BT-107 / BT-108 / BT-109 (BR-CO-13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `net_total` is `BT-106 − BT-107`, which is **not** BT-109 once the document
+/// carries a charge — and a levy-bearing utility invoice always does.
+#[test]
+fn taxable_total_is_bt_109_and_net_total_is_not() {
+    let doc = BillingDocument::builder()
+        .meta(meta("CO13"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+            LineItem::fixed("Grundpreis", Amount::parse("120.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::FixedDiscount::new("Neukundenbonus", Amount::parse("30.00000").unwrap())
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    let bt_106 = doc.line_total().unwrap(); // 300.00 + 120.00
+    let bt_107 = doc.discount_total(); // −30.00
+    let bt_108 = doc.charge_total().unwrap(); // 20.50
+    let bt_109 = doc.taxable_total().unwrap();
+    let bt_110 = doc.vat_total().unwrap();
+    let bt_112 = doc.gross_total();
+
+    assert_eq!(bt_106, Amount::parse("420.00000").unwrap());
+    assert_eq!(bt_107, Amount::parse("-30.00000").unwrap());
+    assert_eq!(bt_108, Amount::parse("20.50000").unwrap());
+
+    // BR-CO-13: BT-109 = BT-106 − BT-107 + BT-108.
+    assert_eq!(
+        bt_109,
+        bt_106
+            .checked_add(bt_107)
+            .unwrap()
+            .checked_add(bt_108)
+            .unwrap()
+    );
+    // BR-CO-15: BT-112 = BT-109 + BT-110.
+    assert_eq!(bt_112, bt_109.checked_add(bt_110).unwrap());
+
+    // And the trap this exists to close: net_total is BT-106 − BT-107, so it
+    // differs from BT-109 by exactly the charge.
+    assert_eq!(doc.net_total(), Amount::parse("390.00000").unwrap());
+    assert_ne!(doc.net_total(), bt_109);
+    assert_eq!(bt_109.checked_sub(doc.net_total()).unwrap(), bt_108);
+
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Exemption reasons: BT-120 text vs BT-121 code
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// BR-E-10 and friends accept a reason **code** as an alternative to the text, so
+/// a caller holding only the VATEX code need not invent prose.
+#[test]
+fn exemption_reason_code_satisfies_the_requirement_on_its_own() {
+    let doc = BillingDocument::builder()
+        .meta(meta("VATEX-1"))
+        .positions(vec![
+            LineItem::fixed("Lieferung nach FR", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::exempt_coded(
+                "Innergemeinschaftliche Lieferung",
+                TaxCategory::IntraCommunity,
+                "VATEX-EU-IC",
+            )
+            .unwrap()
+            .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    let entry = &doc.tax_breakdown()[0];
+    assert_eq!(entry.exemption_reason_code.as_deref(), Some("VATEX-EU-IC"));
+    assert_eq!(entry.exemption_reason, None);
+    assert!(entry.has_exemption_reason());
+    doc.assert_valid();
+
+    // Neither form present is still a violation of BR-IC-10.
+    let bare = TaxBreakdownEntry::new(
+        TaxCategory::IntraCommunity,
+        dec!(0),
+        Amount::parse("1000.00000").unwrap(),
+        Amount::ZERO,
+    );
+    let err = bare.validate().unwrap_err();
+    assert!(err.to_string().contains("BT-120") && err.to_string().contains("BT-121"));
+
+    // BR-S-10 / BR-Z-10 forbid *both*, so the code must be refused too — checking
+    // only the text would have let this through.
+    let coded_standard = TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("100.00000").unwrap(),
+        Amount::parse("19.00000").unwrap(),
+    )
+    .with_exemption_reason_code("VATEX-EU-AE");
+    assert!(
+        coded_standard.validate().is_err(),
+        "BR-S-10 forbids BT-121 too"
+    );
+    assert!(FixedRateTax::exempt_coded("Z", TaxCategory::ZeroRated, "VATEX-EU-O").is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Category O — outside the scope of VAT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `O` is the only category that must not state a rate at all (BR-O-05/06/07),
+/// and it must stand alone in the breakdown (BR-O-11 … BR-O-14).
+#[test]
+fn out_of_scope_stands_alone_and_states_no_rate() {
+    // `states_rate` is the instruction a serialiser needs: suppress the element.
+    assert!(!TaxCategory::OutOfScope.states_rate());
+    assert!(TaxCategory::ReverseCharge.states_rate());
+    assert!(TaxCategory::ZeroRated.states_rate());
+
+    let doc = BillingDocument::builder()
+        .meta(meta("O-1"))
+        .positions(vec![
+            LineItem::fixed("Schadenersatz", Amount::parse("500.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::exempt_coded("Nicht steuerbar", TaxCategory::OutOfScope, "VATEX-EU-O")
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    doc.assert_valid();
+    doc.verify_vat_attribution().unwrap();
+
+    // BR-O-11: merging an `O` document with a taxed one produces a breakdown that
+    // no validator accepts, and the engine now refuses to hand it back.
+    let taxed = BillingDocument::builder()
+        .meta(meta("O-2"))
+        .positions(vec![
+            LineItem::fixed("Beratung", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    let err = billing::merge_period_documents(doc, taxed).unwrap_err();
+    assert!(err.to_string().contains("BR-O-11"), "unhelpful: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VAT on VAT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A levy compounding into a VAT base is legitimate (it is a BG-21 charge). VAT
+/// compounding onto VAT is not representable in EN 16931 at all.
+#[test]
+fn vat_on_vat_is_rejected_but_a_levy_in_the_vat_base_is_not() {
+    // Legitimate: charge first, VAT over net + charge.
+    BillingDocument::builder()
+        .meta(meta("COMPOUND-OK"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(PercentageCharge::new("Fee", dec!(0.05)).unwrap().boxed())
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // Not representable: a second VAT layer whose base includes the first's output.
+    let err = BillingDocument::builder()
+        .meta(meta("VAT-ON-VAT"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .tag("a")
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::new("MwSt", dec!(0.19))
+                .unwrap()
+                .with_tag("a")
+                .boxed(),
+        )
+        // Untagged, so its base includes the first layer's VAT position.
+        .extra_tax(FixedRateTax::new("Zuschlag", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap_err();
+    assert!(
+        matches!(err, BillingError::LayerError { .. }),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("VAT on the VAT position"),
+        "unhelpful: {err}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Document type code (BT-3) and the credit-note syntax split
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `BR-CL-01` polices two **disjoint** UNTDID 1001 lists, chosen by the syntax
+/// element. A reversal carrying `380` is fatal in either element.
+#[test]
+fn reverse_sets_a_credit_note_type_code() {
+    use billing::DocumentKind;
+
+    let inv = BillingDocument::builder()
+        .meta(meta("INV-K"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert_eq!(inv.meta.kind, DocumentKind::CommercialInvoice); // 380
+
+    // The obvious spelling — `..Default::default()` — used to leave BT-3 at 380
+    // on a document with negative totals.
+    let credit = inv.reverse(meta("CN-K")).unwrap();
+    assert_eq!(credit.meta.kind, DocumentKind::CreditNote); // 381
+    assert!(credit.meta.kind.is_credit_note());
+    assert!(credit.net_total().is_negative());
+    credit.assert_valid();
+
+    // An explicit credit-note code is honoured rather than overwritten.
+    let explicit = inv
+        .reverse(DocumentMeta {
+            kind: DocumentKind::CreditNote,
+            ..meta("CN-K2")
+        })
+        .unwrap();
+    assert_eq!(explicit.meta.kind, DocumentKind::CreditNote);
+
+    // Exactly one modelled kind belongs to the credit-note list; `383` does not,
+    // despite being called a debit note.
+    assert_eq!(
+        DocumentKind::ALL
+            .iter()
+            .filter(|k| k.is_credit_note())
+            .count(),
+        1
+    );
+    assert!(!DocumentKind::DebitNote.is_credit_note());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allowance / charge base amount and percentage (PEPPOL-EN16931-R041 / R042)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A percentage allowance or charge must state its base **and** its percentage,
+/// or neither — both directions are fatal in Peppol.
+#[test]
+fn percentage_allowances_and_charges_state_base_and_percentage() {
+    let doc = BillingDocument::builder()
+        .meta(meta("R041"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Beratung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::PercentageDiscount::new("Treuerabatt", dec!(0.10))
+                .unwrap()
+                .with_reason_code("95")
+                .boxed(),
+        )
+        .extra_tax(
+            PercentageCharge::new("Servicepauschale", dec!(0.025))
+                .unwrap()
+                .with_reason_code("ABK")
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // BG-20: 10 % of 1000.00.
+    let allowance = doc.discount_positions()[0]
+        .allowance_charge
+        .as_ref()
+        .expect("BG-20 detail");
+    assert_eq!(allowance.reason_code.as_deref(), Some("95")); // BT-98
+    assert_eq!(
+        allowance.base_amount,
+        Some(Amount::parse("1000.00000").unwrap())
+    ); // BT-93
+    assert_eq!(allowance.percentage, Some(dec!(10))); // BT-94 — percent, not fraction
+    assert!(allowance.validate().is_ok());
+
+    // BG-21: 2.5 % of the net. `PercentageCharge` excludes credit positions from
+    // its base by design, so the allowance does not reduce it — and the stated
+    // pair still reproduces the amount exactly, which is what R041/R042 are for.
+    let charge = doc
+        .charge_positions()
+        .next()
+        .unwrap()
+        .allowance_charge
+        .as_ref()
+        .expect("BG-21 detail");
+    assert_eq!(charge.reason_code.as_deref(), Some("ABK")); // BT-105
+    assert_eq!(
+        charge.base_amount,
+        Some(Amount::parse("1000.00000").unwrap())
+    ); // BT-100
+    assert_eq!(charge.percentage, Some(dec!(2.5))); // BT-101
+    // The stated pair reproduces the amount: 1000.00 × 2.5 % = 25.00.
+    assert_eq!(
+        doc.charge_positions().next().unwrap().net_amount,
+        Amount::parse("25.00000").unwrap()
+    );
+
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// A clamped percentage charge no longer equals `base × percentage`, so stating
+/// the pair would be a claim a validator can disprove. It is suppressed instead.
+#[test]
+fn a_capped_percentage_charge_states_no_percentage_basis() {
+    let doc = BillingDocument::builder()
+        .meta(meta("R041-CAP"))
+        .positions(vec![
+            LineItem::fixed("Umsatz", Amount::parse("10000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            PercentageCharge::new("Provision", dec!(0.05))
+                .unwrap()
+                .with_max(Amount::parse("100.00000").unwrap())
+                .with_reason_code("ABK")
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    let charge = doc.charge_positions().next().unwrap();
+    assert_eq!(charge.net_amount, Amount::parse("100.00000").unwrap()); // capped
+    let ac = charge
+        .allowance_charge
+        .as_ref()
+        .expect("reason code survives");
+    assert_eq!(ac.reason_code.as_deref(), Some("ABK"));
+    assert_eq!(
+        ac.base_amount, None,
+        "would not reproduce the capped amount"
+    );
+    assert_eq!(ac.percentage, None);
+    assert!(ac.validate().is_ok());
+    doc.assert_valid();
+}
+
+/// The R041/R042 pairing is an invariant of the type, not just of the layers.
+#[test]
+fn a_half_stated_percentage_basis_is_rejected() {
+    use billing::AllowanceCharge;
+
+    let only_base = AllowanceCharge {
+        base_amount: Some(Amount::parse("100.00000").unwrap()),
+        ..Default::default()
+    };
+    assert!(
+        only_base
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("R042")
+    );
+
+    let only_pct = AllowanceCharge {
+        percentage: Some(dec!(10)),
+        ..Default::default()
+    };
+    assert!(
+        only_pct
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("R041")
+    );
+
+    // And a LineItem carrying one is rejected too, including from JSON.
+    let bad = LineItem::fixed("x", Amount::parse("10.00000").unwrap())
+        .allowance_charge(only_pct)
+        .build();
+    assert!(bad.is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PEPPOL-EN16931-R040 — the stated basis must reproduce the amount
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stating BT-93 / BT-94 is a claim a validator recomputes, so the base has to
+/// follow the amount through every transform. Allocation used to leave it behind.
+#[test]
+fn allocation_keeps_the_allowance_basis_consistent() {
+    use billing::{AllocationRule, EqualAllocation};
+
+    let doc = BillingDocument::builder()
+        .meta(meta("R040-ALLOC"))
+        .positions(vec![
+            LineItem::fixed("Beratung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::PercentageDiscount::new("Rabatt", dec!(0.10))
+                .unwrap()
+                .with_reason_code("95")
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // 1000.00 split three ways does not divide evenly — the penny-correction path.
+    let parts = EqualAllocation::new(3).unwrap().allocate(&doc).unwrap();
+    for part in &parts {
+        part.assert_valid(); // check 11 now runs R040 on every position
+        for p in part.all_positions() {
+            if let Some(ac) = &p.allowance_charge {
+                // Either the basis was rescaled and still reproduces the amount …
+                ac.check_amount(p.net_amount).unwrap();
+                // … or it was dropped, keeping the reason code.
+                if ac.base_amount.is_none() {
+                    assert_eq!(ac.reason_code.as_deref(), Some("95"));
+                }
+            }
+        }
+    }
+    // The split is still exact.
+    let total: Amount<5> = parts.iter().map(|d| d.gross_total()).sum();
+    assert_eq!(total, doc.gross_total());
+}
+
+/// A credit note negates the amount, so the base must negate with it — otherwise
+/// R040 fails by twice the allowance.
+#[test]
+fn reversal_keeps_the_allowance_basis_consistent() {
+    let doc = BillingDocument::builder()
+        .meta(meta("R040-REV"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Beratung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::PercentageDiscount::new("Rabatt", dec!(0.10))
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    let credit = doc.reverse(meta("R040-CN")).unwrap();
+    credit.assert_valid();
+
+    let ac = credit.discount_positions()[0]
+        .allowance_charge
+        .as_ref()
+        .expect("BG-20 detail survives");
+    // Both negated: −10 % of −1000.00 = +100.00, which is the credit's amount.
+    assert_eq!(ac.base_amount, Some(Amount::parse("-1000.00000").unwrap()));
+    assert_eq!(ac.percentage, Some(dec!(10)));
+    ac.check_amount(credit.discount_positions()[0].net_amount)
+        .unwrap();
+}
+
+/// `validate()` refuses a basis that does not reproduce the amount — the state
+/// every transform above exists to avoid.
+#[test]
+fn a_basis_that_contradicts_the_amount_is_rejected() {
+    use billing::AllowanceCharge;
+
+    // 10 % of 1000.00 is 100.00, not 250.00.
+    let bad = LineItem::credit("Rabatt")
+        .fixed_amount(Amount::parse("250.00000").unwrap())
+        .allowance_charge(AllowanceCharge::percentage_of(
+            Amount::parse("1000.00000").unwrap(),
+            dec!(0.10),
+        ))
+        .build();
+    let err = bad.unwrap_err();
+    assert!(err.to_string().contains("R040"), "unhelpful: {err}");
+
+    // Inside Peppol's ±0.02 slack is accepted — rounding residuals are not errors.
+    assert!(
+        LineItem::credit("Rabatt")
+            .fixed_amount(Amount::parse("100.01000").unwrap())
+            .allowance_charge(AllowanceCharge::percentage_of(
+                Amount::parse("1000.00000").unwrap(),
+                dec!(0.10),
+            ))
+            .build()
+            .is_ok()
+    );
+}
+
+/// BR-DEC-02 / BR-DEC-06 cap BT-93 / BT-100 at two decimals in their own right,
+/// so the scale check has to look at them too.
+#[test]
+fn the_allowance_base_is_covered_by_the_amount_scale() {
+    let scaled = BillingDocument::builder()
+        .meta(meta("DEC02"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1234.567), "kWh"),
+                UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .extra_discount(
+            billing::PercentageDiscount::new("Rabatt", dec!(0.10))
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    // The base is reduced along with everything else …
+    let ac = scaled.discount_positions()[0]
+        .allowance_charge
+        .as_ref()
+        .unwrap();
+    assert_eq!(ac.base_amount, Some(Amount::parse("356.80000").unwrap()));
+    assert!(scaled.fits_amount_scale(2));
+    scaled.assert_valid();
+
+    // … and a hand-built document whose base carries five decimals is reported,
+    // naming the field rather than only the amount.
+    let mut item = scaled.discount_positions()[0].clone();
+    item.allowance_charge = Some(billing::AllowanceCharge {
+        reason_code: None,
+        base_amount: Some(Amount::parse("356.80221").unwrap()),
+        percentage: Some(dec!(10)),
+    });
+    let violation = billing::BillingDocument::from_positions(
+        DocumentMeta::default(),
+        vec![item],
+        vec![],
+        vec![],
+    )
+    .unwrap()
+    .amount_scale_violation(2);
+    assert!(
+        violation
+            .as_ref()
+            .is_some_and(|(what, _)| what.contains("BT-93")),
+        "expected the base to be named, got {violation:?}"
+    );
+}
+
+/// Reversing a document that carried **any** discount used to produce a document
+/// that failed its own `assert_valid()`: every amount is negated, so the
+/// allowances become positive, and check 9 tested against zero rather than
+/// against the document's own direction.
+#[test]
+fn a_document_with_discounts_can_be_reversed() {
+    for scale in [None, Some(AmountScale::EN16931)] {
+        let mut b = BillingDocument::builder()
+            .meta(meta("INV-D"))
+            .positions(vec![
+                LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ]);
+        if let Some(s) = scale {
+            b = b.amount_scale(s);
+        }
+        let doc = b
+            .extra_discount(
+                billing::FixedDiscount::new("Gutschein", Amount::parse("10.00000").unwrap())
+                    .unwrap()
+                    .boxed(),
+            )
+            .extra_discount(
+                billing::PercentageDiscount::new("Treue", dec!(0.05))
+                    .unwrap()
+                    .boxed(),
+            )
+            .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+            .build()
+            .unwrap();
+        doc.assert_valid();
+
+        let credit = doc.reverse(meta("CN-D")).unwrap();
+        credit.assert_valid();
+
+        // The allowances are positive on the credit note — that is the point.
+        assert!(
+            credit
+                .discount_positions()
+                .iter()
+                .all(|p| !p.net_amount.is_negative())
+        );
+        assert_eq!(
+            credit.discount_total(),
+            doc.discount_total().checked_neg().unwrap()
+        );
+        // And the pair still settles to nothing.
+        assert_eq!(
+            doc.gross_total().checked_add(credit.gross_total()).unwrap(),
+            Amount::<5>::ZERO
+        );
+        // Reversing twice is the identity.
+        let back = credit.reverse(meta("INV-D2")).unwrap();
+        back.assert_valid();
+        assert_eq!(back.gross_total(), doc.gross_total());
+        assert_eq!(back.discount_total(), doc.discount_total());
+    }
+}
+
+/// A genuine surcharge in the discount bucket is still rejected — the relative
+/// test must not become a no-op. Hand-edited JSON is the realistic route into
+/// that state, so this needs the `serde` feature.
+#[cfg(feature = "serde")]
+#[test]
+fn a_surcharge_in_the_discount_bucket_is_still_rejected() {
+    let doc = BillingDocument::builder()
+        .meta(meta("SUR"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::FixedDiscount::new("Rabatt", Amount::parse("10.00000").unwrap())
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    // A positive "discount" on a normal document is a surcharge.
+    {
+        let mut json: serde_json::Value = serde_json::to_value(&doc).unwrap();
+        json["discount_positions"][0]["net_amount"] = serde_json::json!("5.00000");
+        json["discount_positions"][0]["sign"] = serde_json::json!("Debit");
+        json["net_total"] = serde_json::json!("105.00000");
+        json["gross_total"] = serde_json::json!("105.00000");
+        json["discount_total"] = serde_json::json!("5.00000");
+        let err = serde_json::from_value::<BillingDocument>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("discount"),
+            "a surcharge must still be caught: {err}"
+        );
     }
 }

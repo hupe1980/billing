@@ -26,8 +26,261 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.8.0"`) if you need to schedule migrations yourself;
-`"0.8"` will pick up `0.8.x` patch fixes only.
+Pin exactly (`billing = "=0.9.0"`) if you need to schedule migrations yourself;
+`"0.9"` will pick up `0.9.x` patch fixes only.
+
+## [0.9.0]
+
+Driven by a review of every EN 16931 claim in this crate's documentation against
+the primary validation artefacts — the CEN artefacts
+(`ConnectingEurope/eInvoicing-EN16931` at `validation-1.3.16`), the Peppol BIS
+Billing 3.0 Schematron, and the KoSIT XRechnung rules. Several citations here were
+wrong, one VAT category was missing, and the per-position data an EN 16931 mapper
+needs was not observable after assembly. All of it is fixed, and the fixes are
+verified against those same artefacts rather than against secondary sources.
+
+Two changes are **breaking without being visible at the call site** — see ⚠️.
+
+### Migration
+
+| 0.8.0 | 0.9.0 |
+|---|---|
+| `LineItem { .. }` struct literal | add `vat: None, allowance_charge: None` |
+| `Quantity { value, unit }` struct literal | add `code: None`, or use `Quantity::new` |
+| `FixedRateTax::new(name, dec!(0))` | `FixedRateTax::zero_rated(name)` — see ⚠️ below |
+| two untagged `FixedRateTax` layers | tag them apart, or they now error — see ⚠️ below |
+| `doc.tax_total()` mapped to BT-110 | `doc.vat_total()?` (BT-110) and `doc.charge_total()?` (BT-108) |
+| `doc.net_total()` mapped to BT-109 | `doc.taxable_total()?` — see **Fixed — modelling** |
+| `doc.net_total()` mapped to BT-106 | `doc.line_total()?` |
+| `TaxBreakdownEntry { .. }` struct literal | add `exemption_reason_code: None` |
+| `item.reason_code` | `item.allowance_charge.as_ref().and_then(\|a\| a.reason_code.as_deref())` |
+| `LineItemBuilder::reason_code(c)` | `.allowance_charge(AllowanceCharge::coded(c))` |
+| `TaxLayer::reason_code` / `DiscountLayer::reason_code` impls | `allowance_charge() -> Option<AllowanceCharge>` |
+| `reverse(meta)` relying on `meta.kind` | BT-3 is forced to a credit-note code |
+| manual `fits_amount_scale` + `checked_round_to` | `Amount::exact_to::<2>()` |
+
+### Fixed — modelling
+
+- **A document with any discount could not be reversed.** `reverse()` negates
+  every amount, so a credit note's allowances are positive — but `validate()`
+  check 9 tested "discount positions <= 0" against zero rather than against the
+  document's own direction. `inv.reverse(..)` therefore returned a document that
+  failed its own `assert_valid()` whenever the original carried a discount, which
+  no test had ever combined. The check is now relative to the sign of BT-106, and
+  still rejects a genuine surcharge in either direction.
+- **`reverse()` produced a credit note carrying BT-3 = `380`.** It never touched
+  `DocumentMeta::kind`, and the idiomatic `..Default::default()` supplies
+  `CommercialInvoice` — so the documented way to build a Storno yielded negative
+  totals under an *invoice* type code. `BR-CL-01` is not one code list but **two
+  disjoint** ones, selected by the syntax element (`cbc:InvoiceTypeCode` vs
+  `cbc:CreditNoteTypeCode`), and `380` appears only in the first while `381`
+  appears only in the second — so the result was valid as neither document.
+  `reverse()` now forces a credit-note code, keeping an explicit one if given.
+  `DocumentKind::is_credit_note` is documented as *the* signal for which element
+  to emit, and `DocumentKind::ALL` was added.
+- **Percentage allowances and charges discarded their base and their rate.**
+  `PercentageDiscount` and `PercentageCharge` compute `base × rate` and kept only
+  the product, so a consumer could emit BT-92 / BT-99 but never BT-93 / BT-94 or
+  BT-100 / BT-101. Peppol makes those a matched pair in both directions, both
+  **fatal** — `PEPPOL-EN16931-R041` ("base amount MUST be provided when percentage
+  is provided") and `R042` (the converse). `LineItem::reason_code` is replaced by
+  `LineItem::allowance_charge: Option<AllowanceCharge>`, which carries the reason
+  code together with the base and percentage, populates them automatically, and
+  enforces the pairing as a type invariant. A charge whose min/max guard clamped
+  the result states neither, because the pair would no longer reproduce the
+  amount.
+- **`LineItemBuilder::build` did not validate the allowance/charge detail** — only
+  `LineItem::validate` did, so a half-stated percentage basis could reach a
+  document through the builder. It is checked in both places now, after the net
+  amount is final so the R040 arithmetic can be checked too.
+- **The allowance/charge basis did not survive any amount-changing transform.**
+  `PEPPOL-EN16931-R040` is not a presence rule — it recomputes `amount = base ×
+  percentage / 100` with a ±0.02 tolerance, **fatal**. Three paths broke it:
+  `LineItem::scaled` (allocation, proration) left BT-93 / BT-100 at the unscaled
+  value; `reverse()` negated the amount but not the base; and the penny correction
+  in allocation adjusts one line's amount alone. The first two now transform the
+  base with the amount; the third drops the basis and keeps the reason code, since
+  no basis is always valid. `AllowanceCharge::check_amount` enforces R040, and
+  `LineItem::validate` runs it — so any future transform that forgets fails loudly
+  in every existing test rather than silently producing an invoice Peppol rejects.
+- **BT-93 / BT-100 escaped the decimal caps.** `BR-DEC-02` and `BR-DEC-06` cap the
+  allowance and charge *base* amounts at two decimals in their own right.
+  `AmountScale` did not reduce them and `fits_amount_scale` did not check them, so
+  a document could pass the scale check while carrying a five-decimal BT-93.
+- **`net_total` was labelled BT-106 / BT-109; it is neither.** BR-CO-13 defines
+  `BT-109 = BT-106 − BT-107 + BT-108`, and a document level *charge* (a per-unit
+  levy, a commission) is produced by a `TaxLayer`, so it lands in `tax_positions`
+  even though EN 16931 counts it inside the taxable base. `net_total` is therefore
+  `BT-106 − BT-107`, and equals BT-109 only on a document with no charges — i.e.
+  never, on the levy-bearing utility invoices this crate exists for. Added
+  **`line_total()` (BT-106)** and **`taxable_total()` (BT-109)**, documented
+  `discount_total()` as `−BT-107`, and corrected the labels in
+  `amount_scale_violation`, which previously named the wrong BT in its diagnostic.
+- **BT-121 (exemption reason **code**) could not be expressed.** BR-E-10,
+  BR-AE-10, BR-IC-10, BR-G-10 and BR-O-10 each accept "a VAT exemption reason code
+  (BT-121) **or** a VAT exemption reason text (BT-120)" — the crate modelled only
+  the text and *required* it, forcing a caller who held a VATEX code to invent
+  prose. Added `TaxBreakdownEntry::exemption_reason_code`,
+  `with_exemption_reason_code`, `has_exemption_reason`,
+  `FixedRateTax::exempt_coded` and `FixedRateTax::with_exemption_reason_code`.
+  Symmetrically, BR-S-10 / BR-Z-10 / BR-AF-10 / BR-AG-10 forbid *both* forms, so
+  the prohibition now covers the code as well — checking only the text let a VATEX
+  code through on a standard-rated group.
+- **`merge_period_documents` could return a document that fails `validate()`.**
+  It builds via `from_raw`, which performs no checks, and two individually lawful
+  halves do not always compose into a lawful whole. It now re-validates its
+  result, as `AllocationRule` always has.
+
+### Added
+
+- **`TaxCategory::states_rate()`** — `O` is the only category that must not state
+  a VAT rate at all (BR-O-05 / BR-O-06 / BR-O-07 say the element "shall not
+  contain" it, where every other zero-tax category says it "shall be 0"). Because
+  `rate` is a plain `Decimal`, an `O` position stores `0`; this predicate tells a
+  serialiser to suppress the element rather than emit `0`, which is fatal.
+- **`validate()` check 13 — BR-O-11**: an `O` breakdown group must be the only
+  group. `merge_period_documents` can otherwise manufacture the forbidden
+  combination from two lawful halves.
+- **`verify_vat_attribution` also checks BR-CO-14 and BR-O-12/13/14** — `BT-110 =
+  Σ BT-117` exactly, and no non-`O` position on an `O` document. `validate()` can
+  only assert the weaker "component of `tax_total`", because it must also hold for
+  an allocated document.
+- **VAT charged on VAT is rejected at assembly.** A VAT breakdown group is not an
+  invoice line, a charge or an allowance, so it cannot appear in another group's
+  BT-116 under BR-S-08 — the construction has no EN 16931 representation. A levy
+  or commission compounding into a VAT base is unaffected: those are BG-21
+  charges, which is the legitimate version of the same shape.
+- **`TaxCategory::SplitPayment` (`B`)** — Italian *scissione dei pagamenti*.
+  `TaxCategory` had nine of the ten codes `BR-CL-17` / `BR-CL-18` permit, so
+  `from_code("B")` returned `None` and a lawful Italian invoice could not be
+  represented at all. Unlike `AE`, `B` **carries tax**: the artefacts contain no
+  `BR-B-09` forcing BT-117 to zero, no `BR-B-05` constraining its rate, and no
+  `BR-B-10` requiring an exemption reason — making it the one category where
+  `requires_exemption_reason()` and `forbids_exemption_reason()` are *both* false.
+  `TaxCategory::ALL` enumerates the full code list.
+- **`tags::VAT`** — applied by the engine to any tax position whose layer returned
+  a VAT breakdown entry. This makes the value-added-tax / document-level-charge
+  split **decidable** instead of a guess over `LEVY` / `PERCENTAGE_CHARGE` tags,
+  and it is total: a third-party `TaxLayer` is classified from its own `breakdown`
+  return value, exactly like a built-in one.
+- **`BillingDocument::vat_total` (BT-110), `charge_total` (BT-108),
+  `vat_positions`, `charge_positions`.** Mapping the whole of `tax_total` to
+  BT-110 — the obvious thing to do — breaks **BR-CO-14** (`BT-110 = Σ BT-117`) on
+  every document carrying a levy.
+- **Per-position VAT attribution.** `LineItem::vat: Option<LineVat>` carries
+  BT-151/BT-152 on a line, BT-95/BT-96 on an allowance, BT-102/BT-103 on a charge —
+  all mandatory under BR-CO-04, BR-32 and BR-37. The engine derives it during
+  assembly from the new `TaxLayer::covers`, which `FixedRateTax` implements with
+  the *same* predicate its taxable base uses, so the two cannot drift.
+  `LineItemBuilder::vat` sets it explicitly.
+- **`BillingDocument::verify_vat_attribution`** — checks the breakdown against that
+  attribution (**BR-S-08** and siblings). Deliberately outside `validate()`:
+  `AllocationRule` cannot preserve it, because it splits positions and breakdown
+  with independent penny corrections.
+- **`LineItem::reason_code`** — BT-98 (UNCL 5189) / BT-105 (UNCL 7161), with
+  `with_reason_code` on all four built-in allowance and charge layers, plus
+  `DiscountLayer::vat` / `reason_code` and `TaxLayer::vat` / `reason_code` as
+  defaulted trait methods.
+- **`Quantity::code`** — EN 16931 **BT-130**, the UN/ECE Rec 20/21 unit code
+  (`"KWH"`, `"H87"`). `Quantity::unit` stays display text, because the mapping is
+  not mechanical: `"Stk"`, `"Stück"`, `"pcs"` and `"pieces"` are all `H87`.
+  `PerUnitLevy::with_unit_code` stamps it on the generated position.
+- **`Amount::exact_to::<Q>()`** — narrow precision *without rounding*, or fail.
+  Completes the pair `checked_from_decimal` / `from_decimal_rounded` already had,
+  so no conversion path in the crate can silently lose money. Rounding at an
+  interchange boundary is exactly the mistake `AmountScale` exists to prevent.
+- **`Period::is_ordered`** — BR-29 / BR-30, for ISO 8601 endpoints. Returns `None`
+  rather than guessing when the strings are not `YYYY-MM-DD`.
+- **`validate()` check 12** — BR-CO-18 as actually written: a document that charges
+  VAT must have a BG-23, and a declared breakdown must have a VAT position behind
+  it.
+
+### Changed — breaking
+
+- `LineItem` gained the public fields `vat` and `allowance_charge`; `Quantity`
+  gained `code`; `TaxBreakdownEntry` gained `exemption_reason_code`. Struct
+  literals need updating; the constructors and builders do not.
+- `TaxLayer::reason_code` and `DiscountLayer::reason_code` are replaced by
+  `allowance_charge() -> Option<AllowanceCharge>`, which can carry the base and
+  percentage the reason code alone could not.
+- `TaxCategory` gained a variant. Exhaustive `match`es need a `B` arm — which is
+  the point of the enum not being `#[non_exhaustive]`.
+
+### Changed — ⚠️ silent
+
+- **A standard-rated 0 % layer is now refused.** `FixedRateTax::new(name, dec!(0))`
+  defaults to category `S`, and `BR-S-05` requires a standard-rated line's rate to
+  exceed zero — which makes an `(S, 0 %)` breakdown group unsatisfiable under
+  BR-S-08. The category for a supply taxed at zero is `Z`, and
+  `FixedRateTax::zero_rated` has always been its constructor. `L` and `M` are
+  deliberately unaffected: BR-AF-05 and BR-AG-05 explicitly permit a zero rate, and
+  `B` has no rate rule at all. Reported by `compute` / `breakdown`, not by `new`,
+  so the `with_category` builder chain can still reach a valid state.
+- **`tags::TAX` is now applied to *every* `TaxLayer` output**, by the engine
+  rather than by each layer. `PercentageCharge` previously produced positions
+  tagged only `percentage-charge`, contradicting the documented meaning of `TAX`
+  and leaving them out of `PerUnitLevy`'s "exclude other layers' output" filter.
+  `positions_by_tag("tax")` therefore returns more positions than before.
+- **`"vat"` joined the reserved tag namespace**, so a caller-supplied label of that
+  name — a time-of-use band named `"vat"`, say — is now rejected rather than
+  silently changing how a document is classified.
+- **`merge_period_documents` now validates its result**, so a merge that produces
+  an inconsistent or unlawful document returns `Err` where it previously returned
+  the document.
+- **Two VAT layers covering one position are now rejected** with
+  `BillingError::LayerError` naming both. That position is taxed twice and BR-S-08
+  cannot hold for either group; previously the document assembled silently. The
+  same check catches a caller-declared `LineItem::vat` that contradicts the layer
+  actually taxing the position.
+
+### Fixed — documentation
+
+Every correction below was verified against the primary artefact, not restated
+from a secondary source.
+
+- **BT-119 is *not* suppressed under category `O`** — a claim introduced earlier in
+  this same release cycle and wrong. BR-O-05 / BR-O-06 / BR-O-07 forbid the
+  *line*, *allowance* and *charge* rates (BT-152 / BT-96 / BT-103); the VAT
+  breakdown rate BT-119 is a different term, and XRechnung's **BR-DE-14** requires
+  it unconditionally (*"Das Element 'VAT category rate' (BT-119) muss übermittelt
+  werden"*, fatal, no category exception). Suppressing BT-119 for `O` on the
+  strength of BR-O-05 fails the KoSIT validator. `TaxCategory::states_rate` now
+  says explicitly that it does not apply to BG-23.
+- **`BR-CO-18` was cited for the wrong rule at five sites.** BR-CO-18 says *"An
+  Invoice shall at least have one VAT breakdown group (BG-23)"* — it is not the
+  rule that forces one breakdown line per `(category, rate)`. That comes from two
+  different places, and the standard's asymmetry between them is deliberate:
+  BR-S-08 / BR-AF-08 / BR-AG-08 for the taxed categories (which may appear at
+  several rates, hence *"at least one"*), and BR-Z-01 / BR-E-01 / BR-AE-01 /
+  BR-IC-01 / BR-G-01 / BR-O-01 for the zero-tax ones (*"exactly one"*). The
+  behaviour was always right; only the citation was wrong — and it appeared in a
+  `ValidationFailed` message users would look up in a validator's rule index.
+- **`BT-131 = BT-129 × BT-146` is not an EN 16931 warning.** EN 16931 has no such
+  rule. It is `PEPPOL-EN16931-R120`, flagged **fatal**, and the real expression
+  divides by the price base quantity (BT-149) and adds line-level charges and
+  allowances: `BT-131 = BT-129 × (BT-146 / BT-149) + BG-28 − BG-27`, with a ±0.02
+  tolerance. That is a *stronger* argument for what `reduce_position` does than the
+  one previously written — rounding once keeps the residual under half a minor
+  unit, rounding twice can exceed 0.02 and every Peppol access point then rejects
+  the invoice.
+- **The BR-CO-17 rounding-mode claim was stronger than the evidence.** The
+  Schematron uses XPath `round()` — half-up toward positive infinity, not half away
+  from zero; the two differ on negative midpoints. Half-away-from-zero is still the
+  right default, but for a narrower reason: BR-CO-17 and BR-S-09 apply `abs()` to
+  both operands before rounding, so the modes coincide there, and those rules then
+  compare with a **±1.00 tolerance** anyway. In the totals chain `round()` operates
+  on already-2-decimal sums and is a no-op.
+- **`Currency::XXX` passes BR-CL-04.** It is a real ISO 4217 code and the
+  Schematron's 178-code list contains it, so a document that was never configured
+  validates as an EN 16931 invoice claiming no currency is involved. Documented
+  with a pointer at `is_unset()`.
+- **`with_advances` now says which formats can carry the per-advance tax.** ZUGFeRD
+  EXTENDED has `BG-X-46`; XRechnung and Peppol BIS have *nowhere* to put it and
+  will silently drop it — which is precisely the §14c Abs. 1 UStG double-taxation
+  scenario the module exists to prevent. Against those formats a residual invoice
+  is not a preference but the only correct construction.
+- **`Period` ordering is the caller's responsibility**, and now says so, with
+  BR-29 / BR-30 named and `is_ordered` offered.
 
 ## [0.8.0]
 

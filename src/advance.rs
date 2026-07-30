@@ -157,11 +157,61 @@ impl DocumentKind {
         })
     }
 
-    /// Whether this kind represents a credit rather than a charge.
+    /// Whether this kind represents a credit rather than a charge — and therefore
+    /// **which document element a consumer must emit**.
+    ///
+    /// This is not a cosmetic distinction. `BR-CL-01` does not police one code
+    /// list; it polices **two disjoint ones**, chosen by the syntax element:
+    ///
+    /// | Element | Permitted codes (excerpt) |
+    /// |---|---|
+    /// | `cbc:InvoiceTypeCode` | `326`, `380`, `383`, `384`, `386`, `389`, `875`, `876`, `877`, … |
+    /// | `cbc:CreditNoteTypeCode` | `81`, `83`, `261`, `262`, `296`, `308`, **`381`**, `396`, … |
+    ///
+    /// The lists barely overlap, so putting `381` on a UBL `<Invoice>` — or `380`
+    /// on a `<CreditNote>` — is a **fatal** violation, not a warning. Of the ten
+    /// codes modelled here, [`CreditNote`](Self::CreditNote) is the only member of
+    /// the credit-note list; every other one, including
+    /// [`DebitNote`](Self::DebitNote) (`383`), belongs to the invoice list.
+    ///
+    /// So: `true` here means emit a UBL `<CreditNote>` (or CII type `381`), and
+    /// `false` means emit an `<Invoice>`.
+    ///
+    /// ```rust
+    /// use billing::DocumentKind;
+    ///
+    /// assert!(DocumentKind::CreditNote.is_credit_note());
+    /// // A debit note is an *invoice*-family document despite the name.
+    /// assert!(!DocumentKind::DebitNote.is_credit_note());
+    /// assert!(!DocumentKind::CommercialInvoice.is_credit_note());
+    /// ```
     #[must_use]
     pub fn is_credit_note(&self) -> bool {
         matches!(self, Self::CreditNote)
     }
+
+    /// Every document kind this crate models, for exhaustive iteration.
+    ///
+    /// ```rust
+    /// use billing::DocumentKind;
+    /// // Exactly one of them is a credit note (see `is_credit_note`).
+    /// assert_eq!(DocumentKind::ALL.iter().filter(|k| k.is_credit_note()).count(), 1);
+    /// for k in DocumentKind::ALL {
+    ///     assert_eq!(DocumentKind::from_code(k.code()), Some(k));
+    /// }
+    /// ```
+    pub const ALL: [Self; 10] = [
+        Self::CommercialInvoice,
+        Self::PartialInvoice,
+        Self::PrepaymentInvoice,
+        Self::CorrectedInvoice,
+        Self::CreditNote,
+        Self::DebitNote,
+        Self::SelfBilledInvoice,
+        Self::PartialConstructionInvoice,
+        Self::PartialFinalConstructionInvoice,
+        Self::FinalConstructionInvoice,
+    ];
 }
 
 impl std::fmt::Display for DocumentKind {

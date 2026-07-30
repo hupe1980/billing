@@ -52,6 +52,15 @@ impl Currency {
     /// ISO 4217 `XXX` — "no currency involved". The default for every builder.
     ///
     /// Seeing `XXX` on a rendered invoice means a currency was never configured.
+    ///
+    /// # A downstream consumer must reject it explicitly
+    ///
+    /// EN 16931 will not do it for you. `XXX` is a real ISO 4217 code, and rule
+    /// **BR-CL-04** ("Invoice currency code MUST be coded using ISO code list
+    /// 4217 alpha-3") accepts it along with the other 177 — so a document that was
+    /// never configured validates cleanly as an EN 16931 invoice claiming no
+    /// currency is involved. [`Currency::is_unset`] is the check to run at the
+    /// boundary before emitting.
     pub const XXX: Self = Self(*b"XXX");
     /// Euro.
     pub const EUR: Self = Self(*b"EUR");

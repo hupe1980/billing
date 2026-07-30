@@ -108,8 +108,29 @@ impl TryFrom<AmountScaleRepr> for AmountScale {
 
 impl AmountScale {
     /// The precision EN 16931 mandates: **two decimals**, rounded half away from
-    /// zero (German commercial rounding, and the behaviour every EN 16931 validator
-    /// assumes for BR-CO-17).
+    /// zero — German commercial rounding.
+    ///
+    /// # Why the rounding mode is safe rather than mandated
+    ///
+    /// The CEN Schematron rounds with XPath `round()`, which is half-up *toward
+    /// positive infinity* — not half away from zero. The two disagree on negative
+    /// midpoints (`round(-200.5)` is `-200`; half-away gives `-201`), so "the mode
+    /// every validator assumes" would be an overstatement. What makes the choice
+    /// safe is narrower and checkable:
+    ///
+    /// - **BR-CO-17** and **BR-S-09** apply `abs()` to *both* sides before
+    ///   rounding, so the rounded argument is never negative and the two modes
+    ///   coincide there. Those same rules then compare with a **±1.00 tolerance**
+    ///   (`abs(BT-117) - 1 < … and abs(BT-117) + 1 > …`), which swallows any
+    ///   last-place disagreement anyway.
+    /// - In the totals chain (**BR-CO-10** … **BR-CO-16**) `round()` is applied to
+    ///   sums of values that already carry two decimals, where it is a no-op.
+    ///
+    /// So half away from zero is safe everywhere the standard actually rounds, and
+    /// it is what German commercial practice expects. Choose a different mode with
+    /// [`AmountScale::new`] if a jurisdiction requires one — the identities hold
+    /// under any mode, because this crate rounds the leaves and recomputes the
+    /// aggregates rather than rounding both.
     pub const EN16931: Self = Self {
         decimals: 2,
         strategy: RoundingStrategy::MidpointAwayFromZero,
@@ -969,6 +990,55 @@ impl<const P: u8> Amount<P> {
         strategy: RoundingStrategy,
     ) -> Result<Amount<Q>, BillingError> {
         Amount::<Q>::from_decimal_rounded(self.into_decimal(), strategy)
+    }
+
+    /// Convert to `Q` decimals **without rounding**, or fail.
+    ///
+    /// The counterpart to [`Amount::checked_round_to`] for the case where losing
+    /// precision is a bug rather than a policy — narrowing a document's amounts on
+    /// the way into an interchange format, for instance. Rounding *there* is
+    /// precisely the mistake [`AmountScale`] exists to prevent: it rounds the
+    /// leaves and the aggregates independently, which breaks the totals identities
+    /// (BR-CO-10, BR-CO-15) that the same format also checks. The right response to
+    /// an `Err` here is to rebuild with
+    /// [`amount_scale`](crate::BillingDocumentBuilder::amount_scale), not to round.
+    ///
+    /// This completes the pair the `Decimal` conversions already have —
+    /// [`checked_from_decimal`](Amount::checked_from_decimal) refuses excess
+    /// precision, [`from_decimal_rounded`](Amount::from_decimal_rounded) opts into
+    /// rounding — and extends it to precision-to-precision conversion, so no
+    /// conversion path in this crate can silently lose money.
+    ///
+    /// Widening (`Q > P`) is always exact and can only fail on overflow.
+    ///
+    /// ```rust
+    /// use billing::Amount;
+    ///
+    /// let exact = Amount::<5>::parse("356.80000").unwrap();
+    /// assert_eq!(exact.exact_to::<2>().unwrap(), Amount::<2>::parse("356.80").unwrap());
+    ///
+    /// // 356.80221 does not fit two decimals — say so rather than round it away.
+    /// let inexact = Amount::<5>::parse("356.80221").unwrap();
+    /// assert!(inexact.exact_to::<2>().is_err());
+    /// // `fits_scale` asks the same question without producing a value.
+    /// assert!(!inexact.fits_scale(2));
+    /// ```
+    ///
+    /// # Errors
+    /// - [`BillingError::InvalidInput`] if the value does not fit `Q` decimals
+    ///   exactly; ask first with [`Amount::fits_scale`].
+    /// - [`BillingError::MonetaryOverflow`] if the value is outside `Amount<Q>`'s
+    ///   representable range.
+    pub fn exact_to<const Q: u8>(self) -> Result<Amount<Q>, BillingError> {
+        if Q < P && !self.fits_scale(Q) {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "{self} does not fit {Q} decimal places exactly; \
+                     rebuild the document at that scale rather than rounding here"
+                ),
+            });
+        }
+        Amount::<Q>::checked_from_decimal(self.into_decimal())
     }
 
     /// Construct from an integer (exact, no rounding).

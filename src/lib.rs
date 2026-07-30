@@ -24,6 +24,7 @@
 //! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
 //! | [`AmountScale`] | Assemble every amount at an interchange format's decimal limit |
 //! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
+//! | [`LineVat`] | Per-position VAT category + rate (EN 16931 BT-151/152, BT-95/96, BT-102/103) |
 //! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
 //! | [`proportional_split`] | Penny-correct Hamilton split of a raw `Decimal` quantity |
 //! | [`RateLookup`] | Parameter-keyed rate table (installed capacity → rate) |
@@ -52,6 +53,12 @@
 //!   `Σ(recipient totals) == original total` with per-document penny correction.
 //! - **Invariants survive deserialisation** — validated types re-run their checks
 //!   via `#[serde(try_from = ...)]` rather than trusting reconstructed fields.
+//! - **Value added tax is distinguishable from a charge** — every tax position a
+//!   layer produced with a VAT breakdown is marked [`tags::VAT`], so
+//!   [`BillingDocument::vat_total`] (EN 16931 BT-110) and
+//!   [`BillingDocument::charge_total`] (BT-108) are exact rather than heuristic.
+//!   The mark comes from the layer's own `breakdown` return value, so it is as
+//!   accurate for a third-party [`TaxLayer`] as for a built-in one.
 //! - **Precision reduction happens at the leaves** — [`AmountScale`] rounds every
 //!   position and layer output *before* the totals are summed, so an interchange
 //!   format's decimal limit and its totals identities hold at once. Rounding a
@@ -99,7 +106,7 @@ pub use amount::{Amount, AmountScale, EuroAmount, InvoiceAmt, RoundingStrategy};
 pub use currency::Currency;
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
-pub use line_item::{LineItem, LineItemBuilder, Sign};
+pub use line_item::{AllowanceCharge, LineItem, LineItemBuilder, Sign};
 pub use lookup::{RateLookup, RateLookupBuilder};
 pub use minimum::minimum_charge;
 pub use period::{Period, merge_period_documents, prorate, prorate_amount};
@@ -114,7 +121,7 @@ pub use tax::{
 pub use tou::{
     DynamicPricing, DynamicPricingBuilder, TimeOfUsePricing, TimeOfUsePricingBuilder, TouBand,
 };
-pub use vat::{TaxBreakdownEntry, TaxCategory};
+pub use vat::{LineVat, TaxBreakdownEntry, TaxCategory};
 
 /// Tag values the engine assigns to generated positions to classify them.
 ///
@@ -127,6 +134,30 @@ pub use vat::{TaxBreakdownEntry, TaxCategory};
 pub mod tags {
     /// Applied to every position produced by a [`crate::TaxLayer`].
     pub const TAX: &str = "tax";
+    /// Applied to a tax position whose layer contributed a VAT breakdown entry —
+    /// in addition to [`TAX`].
+    ///
+    /// This is the marker that makes the value-added-tax / charge split
+    /// **decidable** rather than a guess. EN 16931 puts the two in completely
+    /// different places, and a consumer that conflates them produces an invoice no
+    /// validator accepts:
+    ///
+    /// | Position | EN 16931 | Contributes to |
+    /// |---|---|---|
+    /// | tagged [`VAT`] | value added tax (BG-23) | **BT-110**, the VAT total |
+    /// | tagged [`TAX`] but not [`VAT`] | document level charge (BG-21) | **BT-108** → BT-109, i.e. the *taxable base* |
+    ///
+    /// Mapping the whole of [`crate::BillingDocument::tax_total`] to BT-110 makes
+    /// **BR-CO-14** (`BT-110 = Σ BT-117`) fail on every document carrying a levy or
+    /// a commission. [`crate::BillingDocument::vat_total`] and
+    /// [`crate::BillingDocument::charge_total`] read this tag and give the two
+    /// figures directly.
+    ///
+    /// Unlike a heuristic over [`LEVY`] / [`PERCENTAGE_CHARGE`], this is **total**:
+    /// it is written by the engine from the layer's own
+    /// [`breakdown`](crate::TaxLayer::breakdown) return value, so a third-party
+    /// [`crate::TaxLayer`] is classified as accurately as a built-in one.
+    pub const VAT: &str = "vat";
     /// Applied to per-unit levy positions, in addition to [`TAX`].
     pub const LEVY: &str = "levy";
     /// Applied to [`crate::PercentageCharge`] positions.
@@ -137,7 +168,7 @@ pub mod tags {
     pub const MINIMUM_CHARGE: &str = "minimum-charge";
 
     /// Every reserved tag, for diagnostics.
-    pub const RESERVED: &[&str] = &[TAX, LEVY, PERCENTAGE_CHARGE, DISCOUNT, MINIMUM_CHARGE];
+    pub const RESERVED: &[&str] = &[TAX, VAT, LEVY, PERCENTAGE_CHARGE, DISCOUNT, MINIMUM_CHARGE];
 
     /// Whether `tag` is reserved by the engine.
     #[must_use]
@@ -175,12 +206,12 @@ pub(crate) fn validate_unit(unit: String) -> Result<String, BillingError> {
 /// Convenience glob import — covers all primary types and traits.
 pub mod prelude {
     pub use crate::{
-        AdvancePayment, AllocationRule, Amount, AmountScale, Billed, Billing, BillingDocument,
-        BillingDocumentBuilder, BillingError, CashRounding, CountAggregator, Currency,
-        DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EqualAllocation, EuroAmount,
-        FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineItem, MaxAggregator,
-        ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount, Period, Positions,
-        Prepayment, ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder,
+        AdvancePayment, AllocationRule, AllowanceCharge, Amount, AmountScale, Billed, Billing,
+        BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
+        Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EqualAllocation,
+        EuroAmount, FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineItem, LineVat,
+        MaxAggregator, ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount, Period,
+        Positions, Prepayment, ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder,
         RoundingStrategy, ScalarTariff, Sign, SumAggregator, Tariff, TariffBand, TariffSchedule,
         TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing, TouBand, UniqueCountAggregator,
         UnitPrice, UsageAggregator, WeightedSumAggregator, merge_period_documents, minimum_charge,

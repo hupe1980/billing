@@ -47,6 +47,10 @@ fn scale_with_target(
             // small debit), which would leave `Sign::Credit` on a positive amount —
             // a state `LineItem::validate` rejects.
             last.normalize_sign();
+            // The corrected amount is no longer `base x percentage`, so the stated
+            // basis would be a claim PEPPOL-EN16931-R040 disproves. Drop it and keep
+            // the reason code; no basis is always valid.
+            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
         }
     }
     Ok(items)
@@ -83,9 +87,12 @@ fn scale_combined_net(
         if let Some(last) = scaled_disc.last_mut() {
             last.net_amount = last.net_amount.checked_add(correction)?;
             last.normalize_sign();
+            // See `scale_with_target`: the basis no longer reproduces the amount.
+            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
         } else if let Some(last) = scaled_net.last_mut() {
             last.net_amount = last.net_amount.checked_add(correction)?;
             last.normalize_sign();
+            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
         }
     }
     Ok((scaled_net, scaled_disc))
@@ -293,6 +300,7 @@ impl AllocationRule for ProportionalAllocation {
                     taxable_base: base,
                     tax_amount: tax,
                     exemption_reason: src.exemption_reason.clone(),
+                    exemption_reason_code: src.exemption_reason_code.clone(),
                 });
             }
 

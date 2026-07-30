@@ -36,8 +36,14 @@ fn arb_positive_amount() -> impl Strategy<Value = Amount<5>> {
 }
 
 /// A VAT rate in [0, 1] with at most 4 decimal places.
+/// A VAT rate in (0, 1], with four decimals.
+///
+/// Zero is excluded on purpose: these generators feed `FixedRateTax::new`, which
+/// defaults to category `S`, and BR-S-05 requires a standard-rated rate above
+/// zero. A supply taxed at zero is zero-*rated* (`Z`) and has its own constructor,
+/// `FixedRateTax::zero_rated`.
 fn arb_rate() -> impl Strategy<Value = Decimal> {
-    (0u32..=10_000u32).prop_map(|n| Decimal::new(n as i64, 4))
+    (1u32..=10_000u32).prop_map(|n| Decimal::new(n as i64, 4))
 }
 
 fn arb_strategy() -> impl Strategy<Value = RoundingStrategy> {
