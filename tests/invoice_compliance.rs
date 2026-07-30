@@ -2024,8 +2024,9 @@ fn vat_on_vat_is_rejected_but_a_levy_in_the_vat_base_is_not() {
 // Document type code (BT-3) and the credit-note syntax split
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `BR-CL-01` polices two **disjoint** UNTDID 1001 lists, chosen by the syntax
-/// element. A reversal carrying `380` is fatal in either element.
+/// `BR-CL-01` polices two UNTDID 1001 lists, chosen by the syntax element — they
+/// share only `81`, and `380` / `381` sit one in each. A reversal carrying `380`
+/// is fatal in either element.
 #[test]
 fn reverse_sets_a_credit_note_type_code() {
     use billing::DocumentKind;
@@ -2479,4 +2480,768 @@ fn a_surcharge_in_the_discount_bucket_is_still_rejected() {
             "a surcharge must still be caught: {err}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BG-29 PRICE DETAILS — BT-146 … BT-150
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// EN 16931-1 **Annex A.1.3**, *Example 2 — Item price base quantity*: the
+/// ordinary "EUR 12,00 per 100 pieces" quote.
+///
+/// The point of BT-149 is that the seller's own price survives onto the invoice.
+/// Pre-dividing to EUR 0,12 states a BT-146 nobody quoted, and
+/// `PEPPOL-EN16931-R120` — which computes the line net amount as
+/// `BT-129 × (BT-146 ÷ BT-149)` — has no way to reconstruct it.
+#[test]
+fn a_price_base_quantity_keeps_the_quoted_price() {
+    let line = LineItem::for_usage(
+        "Schrauben",
+        Quantity::new(dec!(250), "pcs").with_code("H87"),
+        UnitPrice::new(dec!(12.00), "EUR/100 pcs")
+            .per(dec!(100))
+            .with_base_quantity_code("H87"),
+    )
+    .build()
+    .unwrap();
+
+    // R120: 250 × (12.00 / 100) = 30.00
+    assert_eq!(line.net_amount, Amount::<5>::parse("30.00000").unwrap());
+
+    let price = line.unit_price.as_ref().unwrap();
+    assert_eq!(price.value, dec!(12.00)); // BT-146 — as quoted, not 0.12
+    assert_eq!(price.base_quantity, Some(dec!(100))); // BT-149
+    assert_eq!(price.base_quantity_code.as_deref(), Some("H87")); // BT-150
+    assert_eq!(price.per_unit_value().unwrap(), dec!(0.12));
+    line.validate().unwrap();
+}
+
+/// A base quantity that does not divide evenly is exactly the case that pushes a
+/// pre-dividing caller into a rounding error, so the engine must not introduce
+/// one either: it multiplies before it divides.
+#[test]
+fn a_non_dividing_price_base_quantity_does_not_lose_cents() {
+    // EUR 12,00 per 7 pieces. 12/7 = 1.714285714… — non-terminating.
+    let price = UnitPrice::new(dec!(12.00), "EUR/7 pcs").per(dec!(7));
+    let line = LineItem::for_usage("Teile", Quantity::new(dec!(7000), "pcs"), price)
+        .build()
+        .unwrap();
+
+    // (7000 × 12.00) / 7 = 12000 exactly. Rounding 12/7 to any finite scale first
+    // and *then* multiplying by 7000 would not land here.
+    assert_eq!(line.net_amount, Amount::<5>::parse("12000.00000").unwrap());
+}
+
+/// EN 16931-1 **Annex A.1.6**, *Example 5*: item gross price 9,50 less an item
+/// price discount 1,00 gives the item net price 8,50.
+///
+/// This moves the *price*, not BT-131 — unlike a BG-27 line allowance, which is
+/// what [`AllowanceCharge`] models. Peppol keeps them apart too: `R044` forbids a
+/// *charge* at price level outright.
+#[test]
+fn a_gross_price_and_discount_derive_the_net_price() {
+    let price = UnitPrice::discounted(dec!(9.50), dec!(1.00), "EUR/pcs");
+    assert_eq!(price.gross_price, Some(dec!(9.50))); // BT-148
+    assert_eq!(price.price_discount, Some(dec!(1.00))); // BT-147
+    assert_eq!(price.value, dec!(8.50)); // BT-146, derived — R046 by construction
+
+    let line = LineItem::for_usage("Ware", Quantity::new(dec!(20), "pcs"), price)
+        .build()
+        .unwrap();
+    // BT-131 follows the *net* price; the discount never enters the line total
+    // twice, which is what modelling it as a BG-27 allowance would have done.
+    assert_eq!(line.net_amount, Amount::<5>::parse("170.00000").unwrap());
+    assert!(line.allowance_charge.is_none());
+    line.validate().unwrap();
+}
+
+/// `PEPPOL-EN16931-R046` is an **exact** equality — unlike `R040`, it has no
+/// `u:slack`. A hand-assembled price whose parts do not add up is rejected.
+#[test]
+fn a_net_price_that_contradicts_the_gross_price_is_rejected() {
+    let mut price = UnitPrice::discounted(dec!(9.50), dec!(1.00), "EUR/pcs");
+    price.value = dec!(8.51); // one cent out — fatal under R046, tolerance zero
+
+    let err = price.validate().unwrap_err();
+    assert!(err.to_string().contains("R046"), "{err}");
+
+    // …and the builder refuses it rather than leaving `validate` as the only guard.
+    let err = LineItem::for_usage("Ware", Quantity::new(dec!(20), "pcs"), price)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("R046"), "{err}");
+}
+
+/// Half-stated BG-29 pairs. BT-147 is *defined* as a subtraction from BT-148, and
+/// BT-150 is an attribute of BT-149 in UBL — neither can stand alone.
+#[test]
+fn half_stated_price_details_are_rejected() {
+    let mut discount_only = UnitPrice::new(dec!(8.50), "EUR/pcs");
+    discount_only.price_discount = Some(dec!(1.00));
+    let err = discount_only.validate().unwrap_err();
+    assert!(err.to_string().contains("BT-147"), "{err}");
+
+    let code_only = UnitPrice::new(dec!(8.50), "EUR/pcs").with_base_quantity_code("H87");
+    let err = code_only.validate().unwrap_err();
+    assert!(err.to_string().contains("BT-150"), "{err}");
+}
+
+/// `PEPPOL-EN16931-R121` — the base quantity is a divisor, so zero is not merely
+/// invalid, it is arithmetically fatal.
+#[test]
+fn a_non_positive_price_base_quantity_is_rejected() {
+    for base in [dec!(0), dec!(-100)] {
+        let price = UnitPrice::new(dec!(12.00), "EUR/pcs").per(base);
+        let err = price.validate().unwrap_err();
+        assert!(err.to_string().contains("R121"), "base {base}: {err}");
+
+        let err = LineItem::for_usage("Teile", Quantity::new(dec!(10), "pcs"), price)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("R121"), "base {base}: {err}");
+    }
+}
+
+/// `PEPPOL-EN16931-R130` — BT-150 must equal BT-130. A cross-field rule: only the
+/// line sees both codes.
+#[test]
+fn a_price_base_unit_that_differs_from_the_quantity_unit_is_rejected() {
+    let err = LineItem::for_usage(
+        "Schrauben",
+        Quantity::new(dec!(250), "pcs").with_code("H87"), // BT-130
+        UnitPrice::new(dec!(12.00), "EUR/100 pcs")
+            .per(dec!(100))
+            .with_base_quantity_code("KGM"), // BT-150 — disagrees
+    )
+    .build()
+    .unwrap_err();
+    assert!(err.to_string().contains("R130"), "{err}");
+
+    // Stating only one of the two codes is not a contradiction, and the engine
+    // does not invent BT-130 from a display label.
+    LineItem::for_usage(
+        "Schrauben",
+        Quantity::new(dec!(250), "pcs"),
+        UnitPrice::new(dec!(12.00), "EUR/100 pcs")
+            .per(dec!(100))
+            .with_base_quantity_code("H87"),
+    )
+    .build()
+    .unwrap();
+}
+
+/// `rounded()` re-derives BT-146 from the rounded BT-148 / BT-147 rather than
+/// rounding it independently, because R046 admits no residual.
+#[test]
+fn rounding_a_discounted_price_keeps_r046_exact() {
+    let p = UnitPrice::discounted(dec!(9.5049), dec!(1.0049), "EUR/pcs")
+        .rounded(2, RoundingStrategy::MidpointAwayFromZero);
+
+    assert_eq!(p.gross_price, Some(dec!(9.50)));
+    assert_eq!(p.price_discount, Some(dec!(1.00)));
+    assert_eq!(p.value, dec!(8.50)); // exactly 9.50 − 1.00
+    p.validate().unwrap();
+
+    // Without a gross price the behaviour is unchanged: BT-146 is rounded directly.
+    let plain = UnitPrice::new(dec!(0.123456), "EUR/kWh")
+        .rounded(4, RoundingStrategy::MidpointAwayFromZero);
+    assert_eq!(plain.value, dec!(0.1235));
+}
+
+/// Scaling a line (proration, allocation) leaves BG-29 alone and moves the
+/// quantity, so `R120` still reproduces the net amount.
+#[test]
+fn scaling_a_line_preserves_the_price_base_quantity() {
+    let full = LineItem::for_usage(
+        "Schrauben",
+        Quantity::new(dec!(250), "pcs"),
+        UnitPrice::new(dec!(12.00), "EUR/100 pcs").per(dec!(100)),
+    )
+    .build()
+    .unwrap();
+    let half = full
+        .scaled(dec!(0.5), RoundingStrategy::MidpointAwayFromZero)
+        .unwrap();
+
+    assert_eq!(half.quantity_value(), Some(dec!(125)));
+    assert_eq!(half.unit_price.as_ref().unwrap().value, dec!(12.00));
+    assert_eq!(
+        half.unit_price.as_ref().unwrap().base_quantity,
+        Some(dec!(100))
+    );
+    // R120 recomputed: 125 × (12.00 / 100) = 15.00
+    assert_eq!(half.net_amount, Amount::<5>::parse("15.00000").unwrap());
+    half.validate().unwrap();
+}
+
+/// Deserialisation re-runs the BG-29 checks, so untrusted JSON cannot introduce a
+/// price that violates R046 or R121.
+#[cfg(feature = "serde")]
+#[test]
+fn deserialising_a_price_re_runs_the_bg29_checks() {
+    let price = UnitPrice::discounted(dec!(9.50), dec!(1.00), "EUR/pcs")
+        .per(dec!(10))
+        .with_base_quantity_code("H87");
+    let json = serde_json::to_string(&price).unwrap();
+    assert_eq!(serde_json::from_str::<UnitPrice>(&json).unwrap(), price);
+
+    let mut broken: serde_json::Value = serde_json::from_str(&json).unwrap();
+    broken["value"] = serde_json::json!("8.51");
+    let err = serde_json::from_value::<UnitPrice>(broken).unwrap_err();
+    assert!(err.to_string().contains("R046"), "{err}");
+
+    let mut broken: serde_json::Value = serde_json::from_str(&json).unwrap();
+    broken["base_quantity"] = serde_json::json!("0");
+    let err = serde_json::from_value::<UnitPrice>(broken).unwrap_err();
+    assert!(err.to_string().contains("R121"), "{err}");
+}
+
+/// A price built with no BG-29 extras behaves exactly as before — the subgroup is
+/// additive, not a new requirement.
+#[test]
+fn a_plain_price_is_unaffected_by_bg29() {
+    let line = LineItem::for_usage(
+        "Arbeit",
+        Quantity::new(dec!(1000), "kWh"),
+        UnitPrice::new(dec!(0.289), "EUR/kWh"),
+    )
+    .build()
+    .unwrap();
+    assert_eq!(line.net_amount, Amount::<5>::parse("289.00000").unwrap());
+
+    let price = line.unit_price.as_ref().unwrap();
+    assert_eq!(price.base_quantity, None);
+    assert_eq!(price.per_unit_value().unwrap(), dec!(0.289));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Profile layering above BR-CL-01 (P0100 / P0101 / P0112)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Passing `BR-CL-01` says nothing about whether Peppol BIS Billing accepts the
+/// code: the CEN lists hold 50 and 13 codes, the Peppol ones 26 and five.
+#[test]
+fn peppol_billing_narrows_the_document_type_code_list() {
+    use billing::DocumentKind;
+
+    // `389` is in BR-CL-01's invoice list but not in PEPPOL-EN16931-P0100.
+    assert!(!DocumentKind::SelfBilledInvoice.is_peppol_billing_code());
+    assert_eq!(DocumentKind::SelfBilledInvoice.code(), 389);
+
+    // Everything else this crate models survives the Billing profile.
+    for kind in DocumentKind::ALL {
+        if kind == DocumentKind::SelfBilledInvoice {
+            continue;
+        }
+        assert!(kind.is_peppol_billing_code(), "{kind:?} ({})", kind.code());
+    }
+
+    // P0112 layers a *party* condition on two of them, which is why the narrowing
+    // cannot live in this crate.
+    assert!(DocumentKind::PartialInvoice.requires_german_parties()); // 326
+    assert!(DocumentKind::CorrectedInvoice.requires_german_parties()); // 384
+    assert_eq!(
+        DocumentKind::ALL
+            .iter()
+            .filter(|k| k.requires_german_parties())
+            .count(),
+        2
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BG-27 / BG-28 — invoice line allowances and charges (BT-136 … BT-145)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The full `PEPPOL-EN16931-R120` identity, which needs all three of BT-149,
+/// BG-27 and BG-28 to be expressible at once:
+///
+/// > BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
+#[test]
+fn r120_holds_with_a_base_quantity_and_line_allowances() {
+    use billing::LineAllowanceCharge;
+
+    let line = LineItem::for_usage(
+        "Schrauben",
+        Quantity::new(dec!(250), "pcs"),
+        UnitPrice::new(dec!(12.00), "EUR/100 pcs").per(dec!(100)), // BT-149
+    )
+    .line_allowance(
+        LineAllowanceCharge::allowance(Amount::parse("3.00000").unwrap(), "Mengenrabatt")
+            .of(Amount::parse("30.00000").unwrap(), dec!(0.10)), // BT-137 / BT-138
+    )
+    .line_allowance(LineAllowanceCharge::charge(
+        Amount::parse("1.50000").unwrap(),
+        "Verpackung",
+    ))
+    .build()
+    .unwrap();
+
+    // 250 × (12.00 / 100) = 30.00, − 3.00 + 1.50 = 28.50
+    assert_eq!(line.net_amount, Amount::<5>::parse("28.50000").unwrap());
+    assert_eq!(line.line_allowances.len(), 2);
+
+    // The parts are carried, not just their effect — a consumer can emit BG-27/28.
+    let a = &line.line_allowances[0];
+    assert_eq!(a.kind, billing::AllowanceKind::Allowance);
+    assert!(!a.kind.charge_indicator()); // cbc:ChargeIndicator = false
+    assert_eq!(a.base_amount, Some(Amount::parse("30.00000").unwrap())); // BT-137
+    assert_eq!(a.percentage, Some(dec!(10))); // BT-138
+    assert_eq!(
+        a.signed_amount().unwrap(),
+        Amount::parse("-3.00000").unwrap()
+    );
+    assert!(line.line_allowances[1].kind.charge_indicator());
+    line.validate().unwrap();
+}
+
+/// BR-42 / BR-44, restated by BR-CO-23 / BR-CO-24: a line allowance or charge
+/// needs a reason **or** a reason code. Unlike a document level allowance it has
+/// no `description` to fall back on for BT-97 / BT-104.
+#[test]
+fn a_line_allowance_without_any_reason_is_rejected() {
+    use billing::LineAllowanceCharge;
+
+    let mut naked = LineAllowanceCharge::allowance(Amount::parse("5.00000").unwrap(), "Rabatt");
+    naked.reason = None;
+    let err = naked.validate().unwrap_err();
+    assert!(err.to_string().contains("BR-42"), "{err}");
+
+    // Whitespace is not a reason.
+    let mut blank = LineAllowanceCharge::charge(Amount::parse("5.00000").unwrap(), "   ");
+    assert!(blank.validate().is_err());
+    blank.reason_code = Some("ZZZ".into()); // BT-145 alone satisfies BR-44
+    blank.validate().unwrap();
+
+    // The charge variant names its own terms.
+    let mut naked_charge = LineAllowanceCharge::charge(Amount::parse("5.00000").unwrap(), "x");
+    naked_charge.reason = None;
+    let err = naked_charge.validate().unwrap_err();
+    assert!(err.to_string().contains("BR-44"), "{err}");
+    assert!(err.to_string().contains("BT-145"), "{err}");
+
+    // A code-only constructor is fine from the start.
+    LineAllowanceCharge::coded_allowance(Amount::parse("5.00000").unwrap(), "95")
+        .validate()
+        .unwrap();
+    LineAllowanceCharge::coded_charge(Amount::parse("5.00000").unwrap(), "AAA")
+        .validate()
+        .unwrap();
+
+    // And the builder refuses it rather than leaving `validate` as the only guard.
+    let err = LineItem::fixed("Ware", Amount::parse("100.00000").unwrap())
+        .line_allowance(naked)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("BR-42"), "{err}");
+}
+
+/// `PEPPOL-EN16931-R040` / `R041` / `R042` list `cac:InvoiceLine/cac:AllowanceCharge`
+/// in their contexts alongside the document level one, so a line allowance is held
+/// to the same base-and-percentage rules.
+#[test]
+fn a_line_allowance_basis_obeys_the_same_peppol_rules() {
+    use billing::LineAllowanceCharge;
+
+    // R042: a base without a percentage.
+    let mut half = LineAllowanceCharge::allowance(Amount::parse("5.00000").unwrap(), "Rabatt");
+    half.base_amount = Some(Amount::parse("100.00000").unwrap());
+    let err = half.validate().unwrap_err();
+    assert!(err.to_string().contains("R042"), "{err}");
+
+    // R040: a basis that does not reproduce the amount.
+    let wrong = LineAllowanceCharge::allowance(Amount::parse("5.00000").unwrap(), "Rabatt")
+        .of(Amount::parse("100.00000").unwrap(), dec!(0.10)); // claims 10.00
+    let err = wrong.validate().unwrap_err();
+    assert!(err.to_string().contains("R040"), "{err}");
+
+    // Dropping the basis is always valid.
+    wrong.without_basis().validate().unwrap();
+}
+
+/// Line allowances are components of BT-131, so scaling and reversal must move
+/// them with it — otherwise the stated parts contradict the line total.
+#[test]
+fn line_allowances_follow_scaling_and_reversal() {
+    use billing::LineAllowanceCharge;
+
+    let full = LineItem::for_usage(
+        "Ware",
+        Quantity::new(dec!(100), "pcs"),
+        UnitPrice::new(dec!(10.00), "EUR/pcs"),
+    )
+    .line_allowance(
+        LineAllowanceCharge::allowance(Amount::parse("100.00000").unwrap(), "Rabatt")
+            .of(Amount::parse("1000.00000").unwrap(), dec!(0.10)),
+    )
+    .build()
+    .unwrap();
+    assert_eq!(full.net_amount, Amount::<5>::parse("900.00000").unwrap());
+
+    // Scaling: amount and base both halve, so R040 still holds and the parts still
+    // sum to BT-131.
+    let half = full
+        .scaled(dec!(0.5), RoundingStrategy::MidpointAwayFromZero)
+        .unwrap();
+    assert_eq!(half.net_amount, Amount::<5>::parse("450.00000").unwrap());
+    assert_eq!(
+        half.line_allowances[0].amount,
+        Amount::parse("50.00000").unwrap()
+    );
+    assert_eq!(
+        half.line_allowances[0].base_amount,
+        Some(Amount::parse("500.00000").unwrap())
+    );
+    assert_eq!(half.line_allowances[0].percentage, Some(dec!(10))); // a rate: unscaled
+    half.validate().unwrap();
+    // 50 × (10.00/1) … 500 − 50 = 450 ✓ R120 still reproduces the net amount.
+    assert_eq!(
+        half.quantity_value().unwrap() * half.unit_price.as_ref().unwrap().value
+            - half.line_allowances[0].amount.into_decimal(),
+        half.net_amount.into_decimal()
+    );
+
+    // Reversal negates them alongside everything else.
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-LA"))
+        .positions(vec![full])
+        .build()
+        .unwrap();
+    let credit = doc.reverse(meta("CN-LA")).unwrap();
+    let reversed = &credit.net_positions()[0];
+    assert_eq!(
+        reversed.net_amount,
+        Amount::<5>::parse("-900.00000").unwrap()
+    );
+    assert_eq!(
+        reversed.line_allowances[0].amount,
+        Amount::parse("-100.00000").unwrap()
+    );
+    reversed.validate().unwrap(); // R040 compares magnitudes, so it survives
+    credit.assert_valid();
+}
+
+/// A line allowance moves BT-131 only. The document totals chain needs no special
+/// case, because BT-106 is the sum of the BT-131s.
+#[test]
+fn line_allowances_reach_the_totals_only_through_bt_131() {
+    use billing::LineAllowanceCharge;
+
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-LA2"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Ware",
+                Quantity::new(dec!(100), "pcs"),
+                UnitPrice::new(dec!(10.00), "EUR/pcs"),
+            )
+            .line_allowance(LineAllowanceCharge::allowance(
+                Amount::parse("100.00000").unwrap(),
+                "Rabatt",
+            ))
+            .build()
+            .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // BT-106 = Σ BT-131 = 900,00 — the allowance is already inside the line.
+    assert_eq!(
+        doc.line_total().unwrap(),
+        Amount::parse("900.00000").unwrap()
+    );
+    // It is NOT a document level allowance (BT-92), so BT-107 is untouched.
+    assert_eq!(doc.discount_total(), Amount::<5>::ZERO);
+    // VAT is charged on the reduced base, which is the point.
+    assert_eq!(
+        doc.vat_total().unwrap(),
+        Amount::parse("171.00000").unwrap()
+    );
+    doc.assert_valid();
+}
+
+/// Deserialisation re-runs the BG-27 / BG-28 checks.
+#[cfg(feature = "serde")]
+#[test]
+fn deserialising_a_line_allowance_re_runs_its_checks() {
+    use billing::LineAllowanceCharge;
+
+    let lac = LineAllowanceCharge::allowance(Amount::parse("10.00000").unwrap(), "Rabatt")
+        .of(Amount::parse("100.00000").unwrap(), dec!(0.10));
+    let json = serde_json::to_string(&lac).unwrap();
+    assert_eq!(
+        serde_json::from_str::<LineAllowanceCharge>(&json).unwrap(),
+        lac
+    );
+
+    // Reason stripped → BR-42.
+    let mut broken: serde_json::Value = serde_json::from_str(&json).unwrap();
+    broken["reason"] = serde_json::Value::Null;
+    let err = serde_json::from_value::<LineAllowanceCharge>(broken).unwrap_err();
+    assert!(err.to_string().contains("BR-42"), "{err}");
+
+    // Basis no longer reproduces the amount → R040.
+    let mut broken: serde_json::Value = serde_json::from_str(&json).unwrap();
+    broken["amount"] = serde_json::json!("50.00000");
+    let err = serde_json::from_value::<LineAllowanceCharge>(broken).unwrap_err();
+    assert!(err.to_string().contains("R040"), "{err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interchange-scale reduction must see the new BG-27 / BG-28 / BT-149 leaves
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The crate's headline precision guarantee is that every leaf is rounded **once**
+/// from its exact value. A price base quantity divides, so the quotient is exactly
+/// where a double rounding hurts — and `reduce_position` must reconstruct
+/// `BT-129 × (BT-146 ÷ BT-149)`, not `BT-129 × BT-146`, or it silently falls back
+/// to reducing the already-rounded five-decimal amount.
+#[test]
+fn scale_reduction_rounds_once_through_a_price_base_quantity() {
+    // The decisive shape from the README: 1 × (0.014997 ÷ 3) is exactly 0.004999.
+    // Rounded once to 2 decimals that is 0.00. Rounded to the engine's 5 first it
+    // becomes 0.00500, and *then* to 2 it becomes 0.01 — a whole minor unit away.
+    let line = || {
+        LineItem::for_usage(
+            "Teil",
+            Quantity::new(dec!(1), "pcs"),
+            UnitPrice::new(dec!(0.014997), "EUR/3 pcs").per(dec!(3)),
+        )
+        .build()
+        .unwrap()
+    };
+    assert_eq!(line().net_amount, Amount::<5>::parse("0.00500").unwrap());
+
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-BQ"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![line()])
+        .build()
+        .unwrap();
+
+    // Reduced from the exact quotient, not from the stored five decimals. Getting
+    // this wrong is invisible: both answers are plausible two-decimal amounts.
+    assert_eq!(
+        doc.net_positions()[0].net_amount,
+        Amount::<5>::parse("0.00000").unwrap(),
+        "reduced twice — `reduce_position` did not divide by BT-149"
+    );
+    assert!(doc.fits_amount_scale(2));
+
+    // And the ordinary non-terminating case still lands where R120 needs it.
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-BQ2"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::for_usage(
+                "Teile",
+                Quantity::new(dec!(7), "pcs"),
+                UnitPrice::new(dec!(10.00), "EUR/3 pcs").per(dec!(3)),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(
+        doc.net_positions()[0].net_amount,
+        Amount::<5>::parse("23.33000").unwrap()
+    );
+    // R120 recomputed at the emitted precision: |23.33 − 7 × (10.00/3)| ≤ 0.02.
+    let r120 = dec!(7) * (dec!(10.00) / dec!(3));
+    assert!((doc.net_positions()[0].net_amount.into_decimal() - r120).abs() <= dec!(0.02));
+}
+
+/// BT-136 / BT-141 are capped at two decimals in their own right by BR-DEC-24 /
+/// BR-DEC-27, and they are components of BT-131 — so scale reduction has to touch
+/// them, and `fits_amount_scale` has to look at them.
+#[test]
+fn scale_reduction_covers_line_allowance_amounts() {
+    use billing::LineAllowanceCharge;
+
+    let raw = BillingDocument::builder()
+        .meta(meta("INV-LA3"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Ware",
+                Quantity::new(dec!(100), "pcs"),
+                UnitPrice::new(dec!(10.00), "EUR/pcs"),
+            )
+            .line_allowance(
+                // 3.333 % of 1000,00 → 33.33000, a base with more than 2 decimals.
+                LineAllowanceCharge::allowance(Amount::parse("33.33300").unwrap(), "Rabatt")
+                    .of(Amount::parse("1000.00000").unwrap(), dec!(0.033333)),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+
+    // Un-reduced, the line allowance amount is not emittable as EN 16931. It is
+    // reported through BT-131, which carries the same third decimal.
+    let (label, _) = raw
+        .amount_scale_violation(2)
+        .expect("BT-136 has 3 decimals, and so does the BT-131 it feeds");
+    assert!(label.contains("position[0]"), "{label}");
+
+    // BT-137 is capped in its own right (BR-DEC-25), so a base with more decimals
+    // than its amount is caught even when every total is clean. Nothing but the
+    // new check can see this one: 1000,00 − 10,00 = 990,00 fits perfectly.
+    let base_only = BillingDocument::builder()
+        .meta(meta("INV-LA3b"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Ware",
+                Quantity::new(dec!(100), "pcs"),
+                UnitPrice::new(dec!(10.00), "EUR/pcs"),
+            )
+            .line_allowance(
+                LineAllowanceCharge::allowance(Amount::parse("10.00000").unwrap(), "Rabatt")
+                    .of(Amount::parse("1000.00500").unwrap(), dec!(0.01)),
+            )
+            .build()
+            .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(
+        base_only.net_positions()[0].net_amount,
+        Amount::<5>::parse("990.00000").unwrap()
+    );
+    let (label, amount) = base_only
+        .amount_scale_violation(2)
+        .expect("BT-137 has 3 decimals");
+    assert!(label.contains("BT-137"), "{label}");
+    assert_eq!(amount, Amount::parse("1000.00500").unwrap());
+
+    // … and with a scale everything is reduced along with the line total.
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-LA4"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(raw.net_positions().to_vec())
+        .build()
+        .unwrap();
+    assert!(
+        doc.fits_amount_scale(2),
+        "{:?}",
+        doc.amount_scale_violation(2)
+    );
+
+    let line = &doc.net_positions()[0];
+    assert_eq!(
+        line.line_allowances[0].amount,
+        Amount::parse("33.33000").unwrap()
+    );
+    // BT-131 equals the sum of the very parts a consumer emits: 1000,00 − 33,33.
+    assert_eq!(line.net_amount, Amount::<5>::parse("966.67000").unwrap());
+    assert_eq!(
+        line.net_amount,
+        Amount::<5>::parse("1000.00000")
+            .unwrap()
+            .checked_sub(line.line_allowances[0].amount)
+            .unwrap()
+    );
+}
+
+/// BG-27 / BG-28 are children of an invoice line (BG-25); BG-20 / BG-21 are
+/// children of the document. A position cannot be both.
+#[test]
+fn a_document_level_allowance_cannot_carry_line_allowances() {
+    use billing::{AllowanceCharge, LineAllowanceCharge};
+
+    let err = LineItem::credit_fixed("Rabatt", Amount::parse("50.00000").unwrap())
+        .allowance_charge(AllowanceCharge::coded("95")) // declares BG-20
+        .line_allowance(LineAllowanceCharge::allowance(
+            Amount::parse("5.00000").unwrap(),
+            "Sub-Rabatt",
+        ))
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("BG-27/BG-28"), "{err}");
+
+    // Either alone is fine.
+    LineItem::credit_fixed("Rabatt", Amount::parse("50.00000").unwrap())
+        .allowance_charge(AllowanceCharge::coded("95"))
+        .build()
+        .unwrap();
+    LineItem::fixed("Ware", Amount::parse("100.00000").unwrap())
+        .line_allowance(LineAllowanceCharge::allowance(
+            Amount::parse("5.00000").unwrap(),
+            "Rabatt",
+        ))
+        .build()
+        .unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BR-22 / BR-23 / BR-26 — every invoice line needs BT-129, BT-130 and BT-146
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `LineItem::fixed` states an amount and nothing else, which is three fatal rules
+/// short of a complete invoice line. `flat_fee` states the same amount as the
+/// line EN 16931 actually requires.
+#[test]
+fn flat_fee_is_a_complete_invoice_line_where_fixed_is_not() {
+    use billing::UNIT_CODE_ONE;
+
+    let bare = LineItem::fixed("Grundpreis", Amount::parse("8.50000").unwrap())
+        .build()
+        .unwrap();
+    // BR-22, BR-23 and BR-26 all unsatisfied — a consumer must synthesise them.
+    assert!(bare.quantity.is_none());
+    assert!(bare.unit_price.is_none());
+
+    let complete = LineItem::flat_fee("Grundpreis", Amount::parse("8.50000").unwrap())
+        .build()
+        .unwrap();
+    assert_eq!(complete.net_amount, bare.net_amount); // same money
+    let q = complete.quantity.as_ref().unwrap();
+    assert_eq!(q.value, dec!(1)); // BR-22 — BT-129
+    assert_eq!(q.code.as_deref(), Some(UNIT_CODE_ONE)); // BR-23 — BT-130 = C62
+    assert_eq!(complete.unit_price.as_ref().unwrap().value, dec!(8.5)); // BR-26 — BT-146
+    complete.validate().unwrap();
+
+    // R120 is trivially satisfied: 1 × 8,50 = 8,50.
+    assert_eq!(
+        q.value * complete.unit_price.as_ref().unwrap().value,
+        complete.net_amount.into_decimal()
+    );
+
+    // The credit counterpart is symmetric.
+    let refund = LineItem::credit_flat_fee("Gutschrift", Amount::parse("8.50000").unwrap())
+        .build()
+        .unwrap();
+    assert_eq!(refund.net_amount, Amount::<5>::parse("-8.50000").unwrap());
+    assert!(refund.is_credit());
+    refund.validate().unwrap();
+}
+
+/// A flat fee still reduces correctly at the interchange scale, and does not lose
+/// the amount to the price/quantity round trip.
+#[test]
+fn flat_fee_survives_scale_reduction_and_vat() {
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-FF"))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::flat_fee("Grundpreis", Amount::parse("8.50000").unwrap())
+                .build()
+                .unwrap(),
+            LineItem::flat_fee("Zählermiete", Amount::parse("2.33000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        doc.line_total().unwrap(),
+        Amount::parse("10.83000").unwrap()
+    );
+    assert_eq!(doc.vat_total().unwrap(), Amount::parse("2.06000").unwrap()); // 10.83 × 0.19
+    assert!(doc.fits_amount_scale(2));
+    doc.assert_valid();
 }

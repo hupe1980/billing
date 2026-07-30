@@ -13,7 +13,7 @@
 //! subsequent run, so a failure found once becomes a permanent regression test.
 
 use billing::prelude::*;
-use billing::{CashRounding, FixedRateTax, TaxCategory};
+use billing::{CashRounding, FixedRateTax, LineAllowanceCharge, TaxCategory};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
@@ -498,5 +498,113 @@ proptest! {
         prop_assert!(padded.trim_start().starts_with(&plain));
         // And it matches what the equivalent string formatting would produce.
         prop_assert_eq!(padded, format!("{plain:>width$}"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PEPPOL-EN16931-R120 — one derivation, two precisions
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `LineItemBuilder::build` and `BillingDocument::reduce_position` both evaluate
+//
+//     BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
+//
+// at different precisions. They are meant to share one implementation
+// (`line_item::compose_bt131`) precisely because they once drifted: BT-149 and
+// BG-27 / BG-28 were added to `build` and not to `reduce_position`, which then
+// stopped recognising such a line, fell back to reducing the already-rounded
+// five-decimal amount, and rounded **twice** — silently, and by up to a whole
+// minor unit.
+//
+// The law below re-derives the expression independently of both, so any future
+// drift fails here rather than in a customer's invoice.
+
+/// Divisors chosen so the quotient is usually non-terminating: that is exactly
+/// where rounding once and rounding twice disagree.
+fn arb_base_quantity() -> impl Strategy<Value = Option<Decimal>> {
+    prop_oneof![
+        Just(None),
+        Just(Some(Decimal::from(3))),
+        Just(Some(Decimal::from(7))),
+        Just(Some(Decimal::from(100))),
+        Just(Some(Decimal::from(1000))),
+    ]
+}
+
+/// Six-decimal prices, so `quantity × price` carries a long tail into the
+/// division and the two-decimal boundary is approached from every side.
+fn arb_long_tail_price() -> impl Strategy<Value = Decimal> {
+    (1i64..2_000_000i64).prop_map(|n| Decimal::new(n, 6))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    /// Reducing a line to the interchange scale must round the whole R120
+    /// expression **once**, from its exact value — never the stored five-decimal
+    /// amount, and never each half by a different route.
+    #[test]
+    fn line_reduction_rounds_the_r120_expression_exactly_once(
+        qty_raw in 1i64..1_000_000i64,
+        price in arb_long_tail_price(),
+        base in arb_base_quantity(),
+        allowance_raw in 0i64..500_000i64,
+        charge_raw in 0i64..500_000i64,
+        credit in any::<bool>(),
+    ) {
+        let quantity = Quantity::new(Decimal::new(qty_raw, 3), "pcs");
+        let mut unit_price = UnitPrice::new(price, "EUR/pcs");
+        if let Some(b) = base {
+            unit_price = unit_price.per(b);
+        }
+        // BT-136 and BT-141, at the engine's precision.
+        let allowance = Amount::<5>::from_raw_units(allowance_raw);
+        let charge = Amount::<5>::from_raw_units(charge_raw);
+
+        let mut builder = if credit {
+            LineItem::credit_for_usage("Ware", quantity.clone(), unit_price.clone())
+        } else {
+            LineItem::for_usage("Ware", quantity.clone(), unit_price.clone())
+        };
+        builder = builder
+            .line_allowance(LineAllowanceCharge::allowance(allowance, "Rabatt"))
+            .line_allowance(LineAllowanceCharge::charge(charge, "Verpackung"));
+        let line = builder.build().unwrap();
+
+        let doc = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .amount_scale(AmountScale::EN16931)
+            .positions(vec![line])
+            .build()
+            .unwrap();
+        let reduced = &doc.net_positions()[0];
+
+        // Re-derive R120 here, from the inputs, independently of the engine.
+        let exact = quantity.value * price / base.unwrap_or(Decimal::ONE);
+        let round2 = |d: Decimal| d.round_dp_with_strategy(
+            2, rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+        );
+        let expected_unsigned =
+            round2(exact) - round2(allowance.into_decimal()) + round2(charge.into_decimal());
+        let expected = if credit && expected_unsigned > Decimal::ZERO {
+            -expected_unsigned
+        } else {
+            expected_unsigned
+        };
+
+        prop_assert_eq!(
+            reduced.net_amount.into_decimal(),
+            expected,
+            "R120 was not rounded once from the exact value \
+             (qty={}, price={}, base={:?})",
+            quantity.value, price, base,
+        );
+
+        // The emitted parts reproduce the emitted total — what a validator checks.
+        prop_assert!(reduced.net_amount.fits_scale(2));
+        for lac in &reduced.line_allowances {
+            prop_assert!(lac.amount.fits_scale(2));
+        }
+        prop_assert!(doc.fits_amount_scale(2));
     }
 }

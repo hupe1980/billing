@@ -3,7 +3,7 @@ use crate::advance::{AdvancePayment, DocumentKind, Prepayment};
 use crate::amount::{Amount, AmountScale};
 use crate::currency::Currency;
 use crate::error::BillingError;
-use crate::line_item::LineItem;
+use crate::line_item::{LineAllowanceCharge, LineItem};
 use crate::period::Period;
 use crate::settlement::CashRounding;
 use crate::tariff::Billing;
@@ -449,6 +449,31 @@ impl BillingDocument {
                     base,
                 ));
             }
+            // BR-DEC-24 / BR-DEC-27 cap the line allowance and charge amounts, and
+            // BR-DEC-25 / BR-DEC-28 their base amounts — each in its own right, not
+            // merely as components of BT-131.
+            for (j, lac) in p.line_allowances.iter().enumerate() {
+                let terms = match lac.kind {
+                    crate::AllowanceKind::Allowance => ("BT-136", "BT-137"),
+                    crate::AllowanceKind::Charge => ("BT-141", "BT-142"),
+                };
+                checks.push((
+                    format!(
+                        "position[{i}] {:?} line_allowances[{j}] ({})",
+                        p.description, terms.0
+                    ),
+                    lac.amount,
+                ));
+                if let Some(base) = lac.base_amount {
+                    checks.push((
+                        format!(
+                            "position[{i}] {:?} line_allowances[{j}] base ({})",
+                            p.description, terms.1
+                        ),
+                        base,
+                    ));
+                }
+            }
         }
         checks.extend([
             // `net_total` is BT-106 − BT-107, which is BT-109 only when the
@@ -664,34 +689,73 @@ impl BillingDocument {
     /// alongside a quantity is deliberately not `quantity × unit_price`, and that
     /// stated amount is authoritative — it is reduced as-is.
     fn reduce_position(item: &LineItem, scale: AmountScale) -> Result<Amount<5>, BillingError> {
-        let (Some(qty), Some(price)) = (item.quantity.as_ref(), item.unit_price.as_ref()) else {
+        // The R120 expression is derived in exactly one place — see
+        // `line_item::compose_bt131` for why that matters. Here it is evaluated
+        // twice over the same inputs: once at the engine's precision to ask "is
+        // this line the expression, or a stated amount?", and once at the
+        // interchange scale to produce the answer.
+        let Ok(price_part) =
+            crate::line_item::exact_price_part(item.quantity.as_ref(), item.unit_price.as_ref())
+        else {
             return scale.apply(item.net_amount);
         };
-        let Some(product) = qty.value.checked_mul(price.value) else {
+        if price_part.is_none() {
+            // Nothing to round once *from* — the amount is stated, not derived.
             return scale.apply(item.net_amount);
-        };
-        // Reconstruct what `build()` would have stored, sign convention included.
-        let engine_value = {
-            let rounded = Amount::<5>::from_decimal_rounded(
-                product,
-                crate::amount::RoundingStrategy::MidpointAwayFromZero,
-            );
-            match rounded {
-                Ok(v) if item.is_credit() && v.is_positive() => v.checked_neg()?,
-                Ok(v) => v,
-                Err(_) => return scale.apply(item.net_amount),
+        }
+        let engine_value = crate::line_item::compose_bt131(
+            price_part,
+            &item.line_allowances,
+            item.sign,
+            |exact| {
+                Amount::<5>::from_decimal_rounded(
+                    exact,
+                    crate::amount::RoundingStrategy::MidpointAwayFromZero,
+                )
+            },
+            Ok,
+            item.net_amount,
+        );
+        if engine_value.map(|v| v != item.net_amount).unwrap_or(true) {
+            // A stated amount that is not the R120 expression, or one that cannot
+            // be reconstructed at all — honour it verbatim.
+            return scale.apply(item.net_amount);
+        }
+        // Reduce each leaf once and re-sum, so BT-131 equals the sum of the very
+        // BT-136 / BT-141 values a consumer emits. BR-DEC-24 / BR-DEC-27 cap those
+        // in their own right, so they are reduced here too — see `reduce_line`,
+        // which writes them back.
+        crate::line_item::compose_bt131(
+            price_part,
+            &item.line_allowances,
+            item.sign,
+            |exact| scale.apply_decimal(exact),
+            |amount| scale.apply(amount),
+            item.net_amount,
+        )
+    }
+
+    /// Reduce a whole position to `scale`: its amount **and** its BG-27 / BG-28
+    /// leaves.
+    ///
+    /// BT-136 / BT-141 are capped at two decimals by BR-DEC-24 / BR-DEC-27, and
+    /// their base amounts BT-137 / BT-142 by BR-DEC-25 / BR-DEC-28 — independently
+    /// of BT-131, exactly as BR-DEC-02 caps a document level allowance base. They
+    /// are also *components* of BT-131 under `PEPPOL-EN16931-R120`, so reducing the
+    /// line total without reducing them would leave the emitted parts unable to
+    /// reproduce the emitted total.
+    fn reduce_line(item: &mut LineItem, scale: AmountScale) -> Result<(), BillingError> {
+        // Computed before the leaves are overwritten: `reduce_position` has to
+        // reconstruct what `build` stored, which used the unreduced amounts.
+        let reduced_net = Self::reduce_position(item, scale)?;
+        for lac in &mut item.line_allowances {
+            lac.amount = scale.apply(lac.amount)?;
+            if let Some(base) = lac.base_amount {
+                lac.base_amount = Some(scale.apply(base)?);
             }
-        };
-        if engine_value != item.net_amount {
-            // A stated amount that is not the product — honour it verbatim.
-            return scale.apply(item.net_amount);
         }
-        let reduced = scale.apply_decimal(product)?;
-        if item.is_credit() && reduced.is_positive() {
-            reduced.checked_neg()
-        } else {
-            Ok(reduced)
-        }
+        item.net_amount = reduced_net;
+        Ok(())
     }
 
     /// Reduce an allowance/charge base amount (BT-93 / BT-100) to `scale`.
@@ -748,7 +812,7 @@ impl BillingDocument {
             Some(s) => positions
                 .into_iter()
                 .map(|mut p| {
-                    p.net_amount = Self::reduce_position(&p, s)?;
+                    Self::reduce_line(&mut p, s)?;
                     Ok(p)
                 })
                 .collect::<Result<Vec<_>, BillingError>>()?,
@@ -1182,11 +1246,13 @@ impl BillingDocument {
     ///
     /// [`DocumentMeta::kind`] (BT-3) is forced to a credit-note code, because
     /// getting it wrong is fatal rather than cosmetic. `BR-CL-01` polices **two
-    /// disjoint** UNTDID 1001 lists — one for `cbc:InvoiceTypeCode`, one for
-    /// `cbc:CreditNoteTypeCode` — and `380` appears only in the first. A reversal
-    /// built from `DocumentMeta { .. ..Default::default() }` would otherwise carry
-    /// `380` on a document with negative totals, which no validator accepts as
-    /// either kind.
+    /// UNTDID 1001 lists selected by the syntax element** — one for
+    /// `cbc:InvoiceTypeCode`, one for `cbc:CreditNoteTypeCode` — and `380` appears
+    /// only in the first. A reversal built from
+    /// `DocumentMeta { .. ..Default::default() }` would otherwise carry `380` on a
+    /// document with negative totals, which no validator accepts as either kind.
+    /// See [`DocumentKind::is_credit_note`] for the two lists and how Peppol
+    /// narrows them further.
     ///
     /// If `meta.kind` already names a credit-note code it is kept; anything else
     /// becomes [`DocumentKind::CreditNote`] (`381`). See
@@ -1238,6 +1304,14 @@ impl BillingDocument {
                     if let Some(ac) = out.allowance_charge.as_ref() {
                         out.allowance_charge = Some(ac.negated()?);
                     }
+                    // BG-27 / BG-28 are components of the line's own net amount,
+                    // so they negate with it — leaving them positive would make
+                    // the stated parts contradict BT-131 on the credit note.
+                    out.line_allowances = out
+                        .line_allowances
+                        .iter()
+                        .map(LineAllowanceCharge::negated)
+                        .collect::<Result<Vec<_>, _>>()?;
                     // Derive the sign from the negated amount rather than blindly
                     // swapping Debit↔Credit. A `Debit` with a NEGATIVE net (a
                     // negative-spot-price line, or VAT on a negative base) would

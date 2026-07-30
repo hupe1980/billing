@@ -106,7 +106,9 @@ pub use amount::{Amount, AmountScale, EuroAmount, InvoiceAmt, RoundingStrategy};
 pub use currency::Currency;
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
-pub use line_item::{AllowanceCharge, LineItem, LineItemBuilder, Sign};
+pub use line_item::{
+    AllowanceCharge, AllowanceKind, LineAllowanceCharge, LineItem, LineItemBuilder, Sign,
+};
 pub use lookup::{RateLookup, RateLookupBuilder};
 pub use minimum::minimum_charge;
 pub use period::{Period, merge_period_documents, prorate, prorate_amount};
@@ -122,6 +124,23 @@ pub use tou::{
     DynamicPricing, DynamicPricingBuilder, TimeOfUsePricing, TimeOfUsePricingBuilder, TouBand,
 };
 pub use vat::{LineVat, TaxBreakdownEntry, TaxCategory};
+
+/// UN/ECE Recommendation 20 code for **one** — a countable item with no other
+/// unit of measure. EN 16931 **BT-130** / **BT-150**, constrained by BR-CL-23.
+///
+/// The conventional unit for a flat charge that is billed once: a standing charge,
+/// a monthly fee, a connection fee. [`LineItem::flat_fee`] uses it so that a
+/// position with no natural quantity still satisfies BR-23.
+///
+/// ```rust
+/// use billing::{LineItem, Amount, UNIT_CODE_ONE};
+///
+/// assert_eq!(UNIT_CODE_ONE, "C62");
+/// let fee = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap())
+///     .build().unwrap();
+/// assert_eq!(fee.quantity.unwrap().code.as_deref(), Some(UNIT_CODE_ONE));
+/// ```
+pub const UNIT_CODE_ONE: &str = "C62";
 
 /// Tag values the engine assigns to generated positions to classify them.
 ///
@@ -209,12 +228,13 @@ pub mod prelude {
         AdvancePayment, AllocationRule, AllowanceCharge, Amount, AmountScale, Billed, Billing,
         BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
         Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EqualAllocation,
-        EuroAmount, FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineItem, LineVat,
-        MaxAggregator, ParseAmountError, PerUnitLevy, PercentageCharge, PercentageDiscount, Period,
-        Positions, Prepayment, ProportionalAllocation, Quantity, RateLookup, RateLookupBuilder,
-        RoundingStrategy, ScalarTariff, Sign, SumAggregator, Tariff, TariffBand, TariffSchedule,
-        TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing, TouBand, UniqueCountAggregator,
-        UnitPrice, UsageAggregator, WeightedSumAggregator, merge_period_documents, minimum_charge,
-        proportional_split, prorate, prorate_amount, residual_breakdown,
+        EuroAmount, FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineAllowanceCharge,
+        LineItem, LineVat, MaxAggregator, ParseAmountError, PerUnitLevy, PercentageCharge,
+        PercentageDiscount, Period, Positions, Prepayment, ProportionalAllocation, Quantity,
+        RateLookup, RateLookupBuilder, RoundingStrategy, ScalarTariff, Sign, SumAggregator, Tariff,
+        TariffBand, TariffSchedule, TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing,
+        TouBand, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice, UsageAggregator,
+        WeightedSumAggregator, merge_period_documents, minimum_charge, proportional_split, prorate,
+        prorate_amount, residual_breakdown,
     };
 }

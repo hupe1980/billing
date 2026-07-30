@@ -26,8 +26,263 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.9.0"`) if you need to schedule migrations yourself;
-`"0.9"` will pick up `0.9.x` patch fixes only.
+Pin exactly (`billing = "=0.10.0"`) if you need to schedule migrations yourself;
+`"0.10"` will pick up `0.10.x` patch fixes only.
+
+## [0.10.0]
+
+Driven by a second review pass over the same primary artefacts as 0.9.0 — the CEN
+artefacts (`ConnectingEurope/eInvoicing-EN16931` at `validation-1.3.16`) and the
+Peppol BIS Billing 3.0 Schematron — this time working through **Annex A** of
+EN 16931-1, whose eight worked examples 0.9.0's review had not covered.
+
+Two of those eight exist specifically to demonstrate business terms this crate had
+no field for. Auditing the rest of BG-25 against the standard's own subgroup list
+then turned up a second, larger gap: of BG-25's four subgroups, **two** had no
+representation at all. BG-26 (line period) and BG-30 (line VAT) were modelled;
+BG-27 / BG-28 (line allowances and charges) and BG-29 (price details) were not.
+Both are closed here, and every part of both is fatal-rule territory in Peppol.
+
+The immediate consequence is that `PEPPOL-EN16931-R120` —
+
+> BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
+
+— is now expressible in full. Three of its five terms did not exist in 0.9.0, and
+`LineItemBuilder::build` computed only `BT-129 × BT-146`.
+
+### Migration
+
+| 0.9.0 | 0.10.0 |
+|---|---|
+| `UnitPrice { value, unit }` struct literal | use `UnitPrice::new`, or add `base_quantity: None, base_quantity_code: None, gross_price: None, price_discount: None` |
+| `LineItem { .. }` struct literal | add `line_allowances: vec![]` |
+| pre-dividing to state "EUR 12,00 per 100" as `0.12` | `UnitPrice::new(dec!(12.00), …).per(dec!(100))` |
+| a line-level discount modelled as a document level `AllowanceCharge` position | `.line_allowance(LineAllowanceCharge::allowance(amount, reason))` |
+| `LineItem::fixed` for a standing charge on an emitted invoice line | `LineItem::flat_fee` — see BR-22 / BR-23 / BR-26 below |
+| a line discount modelled as an allowance when it moved the *price* | `UnitPrice::discounted(gross, discount, unit)` |
+
+### Added — EN 16931 BG-27 / BG-28 line allowances and charges
+
+`LineAllowanceCharge` (with `AllowanceKind`) models the group the crate was missing
+entirely — BT-136 … BT-140 for an allowance, BT-141 … BT-145 for a charge —
+attached to a position through `LineItem::line_allowances` and
+`LineItemBuilder::line_allowance`.
+
+**This is a different group from the existing `AllowanceCharge`, which was already
+correct but is easy to mistake for it.** The three now-modelled allowance concepts
+differ in what they move, which is the only distinction that matters
+arithmetically:
+
+| Group | Type | Terms | Moves |
+|---|---|---|---|
+| BG-27 / BG-28 | `LineAllowanceCharge` *(new)* | BT-136 … BT-145 | **BT-131**, one line's net amount |
+| BG-20 / BG-21 | `AllowanceCharge` | BT-92 … BT-105 | **BT-107 / BT-108** → BT-109 |
+| BG-29 | `UnitPrice::discounted` *(new)* | BT-147 / BT-148 | **BT-146**, the price |
+
+- `build` folds them into `net_amount`, completing `R120`. Because BT-106 is the
+  sum of the BT-131s, the totals chain and the VAT breakdown need no special case
+  — and VAT falls on the reduced base, which is the point of a line allowance.
+- **BR-42 / BR-44**, restated by **BR-CO-23 / BR-CO-24**, are enforced as a type
+  invariant: a line allowance needs a reason (BT-139 / BT-144) or a reason code
+  (BT-140 / BT-145). A *document* level allowance can lean on the position's
+  `description` for BT-97 / BT-104; a line allowance has no description of its own,
+  so the constructors take the reason.
+- **`PEPPOL-EN16931-R040` / `R041` / `R042` apply here identically.** Their
+  Schematron contexts list `ubl-invoice:Invoice/cac:InvoiceLine/cac:AllowanceCharge`
+  alongside the document level element, so the base-and-percentage pairing and the
+  ±0.02 recomputation are the same rules — the checks are shared with
+  `AllowanceCharge` rather than reimplemented.
+- `scaled` and `BillingDocument::reverse` move line allowances with the line, so
+  the stated parts never contradict BT-131 after proration, allocation or a Storno.
+
+### Added — EN 16931 BG-29 PRICE DETAILS
+
+`UnitPrice` now carries all five business terms of the subgroup rather than only
+the mandatory one:
+
+| BT | Name | Field | Rules |
+|---|---|---|---|
+| BT-146 | Item net price | `value` (unchanged) | BR-26, BR-27 |
+| BT-147 | Item price discount | `price_discount` | `PEPPOL-EN16931-R046` |
+| BT-148 | Item gross price | `gross_price` | BR-28, `R046` |
+| BT-149 | Item price base quantity | `base_quantity` | `R120`, `R121` |
+| BT-150 | …its unit of measure code | `base_quantity_code` | BR-CL-23, `R130` |
+
+- **`UnitPrice::per(base_quantity)` — BT-149 / BT-150.** EN 16931-1 Annex A.1.3
+  (*Example 2 — Item price base quantity*) is an entire worked example about the
+  ordinary "EUR 12,00 per 100 pieces" quote. Pre-dividing to EUR 0,12 loses the
+  term, states a BT-146 the seller never quoted — which is what a human reads off
+  the rendered invoice — and, for a price that does not divide evenly, injects a
+  rounding error into BT-146 that `R120`'s ±0.02 then has to absorb. The base
+  quantity is also load-bearing arithmetic rather than decoration:
+  `PEPPOL-EN16931-R120` computes `BT-131 = BT-129 × (BT-146 ÷ BT-149) + BG-28 −
+  BG-27`, so `LineItemBuilder::build` now divides by it. `None` means 1, exactly
+  as `R120`'s own `$baseQuantity` variable is defined (including its treatment of
+  zero). `UnitPrice::per_unit_value()` exposes the quotient for display.
+- **`UnitPrice::discounted(gross, discount, unit)` — BT-147 / BT-148.** Annex A.1.6
+  (*Example 5 — Negative Invoice line*) uses this on every line: gross `9,50` less
+  discount `1,00` gives net `8,50`. This is **not** `AllowanceCharge`, which is
+  BG-27 / BG-28 — those move BT-131 and the VAT base, while BT-147 / BT-148 sit
+  inside BG-29 and move the *price*, leaving BT-131 alone. Peppol keeps them apart
+  too: `PEPPOL-EN16931-R044` forbids a *charge* at price level outright while
+  allowing the discount. BT-146 is **derived** rather than accepted, because
+  `PEPPOL-EN16931-R046` is an *exact* equality — unlike `R040` it carries no
+  `u:slack` — so a caller cannot compute the net price and be a cent out.
+- **`UnitPrice::validate`**, run by `LineItemBuilder::build`, `LineItem::validate`
+  and deserialisation: `R046`, `R121` (base quantity strictly above zero — it is a
+  divisor), and the two half-stated pairs (BT-147 without BT-148, which the
+  standard defines as a subtraction *from* BT-148; BT-150 without BT-149, which is
+  unrepresentable in UBL where it is an attribute of `cbc:BaseQuantity`).
+- **`PEPPOL-EN16931-R130` is enforced** — **fatal**, and a rule the prose-only
+  reading of BT-150 misses:
+
+  > `[PEPPOL-EN16931-R130]` Unit code of price base quantity MUST be same as
+  > invoiced quantity.
+
+  A cross-field rule: `Quantity` holds BT-130 and `UnitPrice` holds BT-150, so
+  neither type can check it and `LineItem` does. Only when both codes are stated —
+  supplying one is not a contradiction, and this crate does not invent BT-130 from
+  a display label.
+
+BR-27 and BR-28 (BT-146 / BT-148 shall not be negative) are deliberately **not**
+enforced, consistent with this crate's existing acceptance of negative unit prices
+for spot markets (EPEX negative-price hours, §27 EEG 2023). This is now stated
+explicitly in the type docs rather than left implicit.
+
+### Added — BR-22 / BR-23 / BR-26 on a flat charge
+
+- **`LineItem::flat_fee` / `credit_flat_fee`, and `UNIT_CODE_ONE`.** Every invoice
+  line needs an invoiced quantity (BR-22, BT-129), its unit code (BR-23, BT-130)
+  and an item net price (BR-26, BT-146) — all three fatal, all three with
+  `$Invoice_Line` as their Schematron context, so there is no exception for a line
+  that has no natural quantity. `LineItem::fixed` states an amount and nothing
+  else, leaving a consumer to synthesise all three from a position that does not
+  say how.
+
+  `flat_fee` states the same money as the line the standard asks for: quantity `1`,
+  unit code `C62` (UN/ECE Rec 20 "one"), item net price the full amount. `1 × amount`
+  is exactly `amount`, so `R120` holds trivially and nothing is rounded that was
+  not rounded before.
+
+  `fixed` is unchanged and still correct where the position is *not* an invoice
+  line — a document level allowance or charge has no BG-25 terms at all — and now
+  documents what it does not supply.
+
+### Changed — one derivation of BT-131 instead of two
+
+Not a behaviour change; a structural one, and the reason the two silent bugs below
+were possible.
+
+`LineItemBuilder::build` and `BillingDocument::reduce_position` both evaluate
+`R120`, at different precisions — the builder at the engine's five decimals, the
+reducer at the interchange scale. They were separate implementations of the same
+formula, so adding a term to one and not the other compiled, passed every test, and
+silently degraded rounding. They now share `line_item::compose_bt131`, parameterised
+by how each leaf is reduced, so a new term is written once.
+
+`tests/properties.rs` additionally asserts over 2 048 generated lines that reducing
+a line equals rounding the exact `R120` expression once — re-derived in the test,
+independently of both call sites. Its generators favour non-terminating quotients
+(base quantities of 3, 7, 100, 1000 against six-decimal prices), which is where
+single and double rounding actually diverge. The check was verified to fail when
+the drift is deliberately reintroduced, and the shrunk counterexample from that run
+is committed as a proptest seed.
+
+### Added — profile layering above `BR-CL-01`
+
+- **`DocumentKind::is_peppol_billing_code()`.** Passing `BR-CL-01` says nothing
+  about whether a Peppol Access Point will take the document: the CEN lists hold
+  50 and 13 codes, `PEPPOL-EN16931-P0100` and `P0101` hold 26 and five. Exactly one
+  kind modelled here falls in the gap — `SelfBilledInvoice` (`389`) is in
+  `BR-CL-01`'s invoice list but **not** in `P0100`, because self-billing is a
+  separate Peppol profile with its own `CustomizationID`. Emitting it under the
+  Billing customization is fatal. This was not previously documented anywhere.
+- **`DocumentKind::requires_german_parties()`.** `PEPPOL-EN16931-P0112` restricts
+  `326` and `384` to invoices where **both** parties are German organisations. So
+  the admissible BT-3 set is not merely profile-dependent but *party*-dependent —
+  which is why `DocumentKind` stays a plain code list here and the narrowing lives
+  in the layer above, which knows both.
+
+### Fixed — precision and structure
+
+These three were introduced by the BG-29 and BG-27 / BG-28 work above and found by
+re-auditing it, so they never shipped. They are listed because two of them are
+**silent** — the kind that produces a plausible wrong number rather than an error.
+
+- **⚠️ Interchange-scale reduction ignored BT-149 and the line allowances.**
+  `reduce_position` reconstructs a line as `BT-129 × BT-146` to decide whether it
+  may round once from the exact product — the crate's headline precision
+  guarantee. Adding a price base quantity and line allowances changed what a line
+  *is* without changing that reconstruction, so any line using them no longer
+  matched, silently fell back to reducing the already-rounded five-decimal amount,
+  and rounded twice. It now reconstructs `R120` in full.
+
+  Not academic: `1 × (0,014997 ÷ 3)` is exactly `0,004999`. Rounded once to two
+  decimals that is `0,00`; rounded to five first it becomes `0,00500` and then
+  `0,01` — a whole minor unit, from an amount that looks perfectly ordinary either
+  way. This is the same defect class the crate's precision section was written
+  about, reintroduced through a new field.
+
+- **⚠️ `fits_amount_scale` could not see BT-136 / BT-137 / BT-141 / BT-142.**
+  BR-DEC-24 and BR-DEC-27 cap the line allowance and charge amounts at two
+  decimals, and BR-DEC-25 / BR-DEC-28 their base amounts — each in its own right,
+  not merely as components of BT-131. A document could therefore report
+  `fits_amount_scale(2) == true` while carrying a BT-137 with three decimals that
+  a validator rejects. `amount_scale_violation` now names them, and scale
+  reduction reduces them alongside the line total so the emitted parts still sum
+  to the emitted BT-131.
+
+- **A position could be a document level allowance *and* carry line allowances.**
+  BG-27 / BG-28 are children of an invoice line (BG-25); BG-20 / BG-21 are children
+  of the document. UBL says the same structurally — only `cac:InvoiceLine` nests
+  `cac:AllowanceCharge`. Combining them described a document no syntax can express,
+  and is now rejected by `LineItem::validate` and the builder.
+
+### Fixed — documentation
+
+- **`BR-CL-01`'s two lists were described as "disjoint".** They are not: they share
+  exactly one code, `81` (credit note related to goods or services). They *are*
+  disjoint on `380` / `381`, which is the part that matters and the part the 0.9.0
+  fix turned on, but "disjoint" as written is false. The crate now says
+  "two lists selected by the syntax element", gives both sizes, quotes the
+  Schematron, and names the single overlap. Corrected in `DocumentKind::is_credit_note`,
+  `BillingDocument::reverse`, the README and the 0.9.0 changelog entry.
+
+  For the avoidance of doubt, since this is easy to misread: `BR-CL-01`'s *context*
+  matches both elements, but its *test* is a disjunction over `self::`, so it does
+  select per element. `381` on a `cbc:InvoiceTypeCode` fails `BR-CL-01` itself — no
+  profile required.
+
+- **BG-27 / BG-28 were described as covered by `AllowanceCharge`.** They are not,
+  and never were: `AllowanceCharge` carries BT-92 … BT-105, which is BG-20 / BG-21
+  at *document* level. BG-27 / BG-28 are BT-136 … BT-145 at *line* level, bound to
+  a different abstract Schematron context (`$Invoice_line_allowances` versus
+  `$Document_level_allowances`) and mandated by different rules (BR-41 … BR-44
+  versus BR-31 … BR-38). The types are now both present and each says plainly what
+  it moves.
+
+- **Undocumented panic in `UnitPrice::discounted` and `UnitPrice::rounded`.**
+  `gross - discount` uses `Decimal`'s `Sub`, which panics on overflow rather than
+  returning. That is consistent with this crate's "overflow is visible, never
+  silent" rule for infallible operators, and matches `Amount`'s own `Sub`, but it
+  was not stated. Both now carry a `# Panics` section. Only reachable with operands
+  within one of each other of `Decimal::MAX` (~7.9 × 10²⁸).
+
+### Changed — breaking
+
+- `UnitPrice` gained four fields and `LineItem` gained `line_allowances`.
+  Struct-literal construction of either breaks; `UnitPrice::new` is unaffected and
+  still means "this price, per one unit", and `line_allowances` defaults to empty
+  on every builder path.
+- `UnitPrice` now validates on deserialisation (`#[serde(try_from)]`), so JSON that
+  was accepted before and would have produced a fatal `R046` / `R121` violation is
+  now rejected at the boundary.
+- `LineItemBuilder::build` and `LineItem::validate` can return `InvalidInput` for
+  the BG-29 and BG-27 / BG-28 rules above. A line built without any of them is
+  unaffected — `base_quantity: None` divides by nothing and an empty
+  `line_allowances` sums to nothing.
+- `LineItem::scaled` now scales `line_allowances` too. Documents built before this
+  release carry none, so nothing changes for them.
 
 ## [0.9.0]
 
@@ -71,10 +326,14 @@ Two changes are **breaking without being visible at the call site** — see ⚠�
 - **`reverse()` produced a credit note carrying BT-3 = `380`.** It never touched
   `DocumentMeta::kind`, and the idiomatic `..Default::default()` supplies
   `CommercialInvoice` — so the documented way to build a Storno yielded negative
-  totals under an *invoice* type code. `BR-CL-01` is not one code list but **two
-  disjoint** ones, selected by the syntax element (`cbc:InvoiceTypeCode` vs
-  `cbc:CreditNoteTypeCode`), and `380` appears only in the first while `381`
-  appears only in the second — so the result was valid as neither document.
+  totals under an *invoice* type code. `BR-CL-01` is not one code list but **two,
+  selected by the syntax element** (`cbc:InvoiceTypeCode` vs
+  `cbc:CreditNoteTypeCode`) — its Schematron context matches both while its test
+  branches on which one it found — and `380` appears only in the first while `381`
+  appears only in the second, so the result was valid as neither document.
+  <sup>Corrected in 0.10.0: the two lists (50 and 13 codes) are not *disjoint* —
+  they share `81`. They are disjoint on `380` / `381`, which is what the fix turns
+  on.</sup>
   `reverse()` now forces a credit-note code, keeping an explicit one if given.
   `DocumentKind::is_credit_note` is documented as *the* signal for which element
   to emit, and `DocumentKind::ALL` was added.

@@ -99,6 +99,12 @@ pub enum DocumentKind {
     /// `383` — debit note.
     DebitNote,
     /// `389` — self-billed invoice, issued by the buyer.
+    ///
+    /// Valid EN 16931 (`BR-CL-01` lists it), but **outside Peppol BIS Billing
+    /// 3.0**: `PEPPOL-EN16931-P0100` admits 26 invoice codes and `389` is not one
+    /// of them, so this is a *fatal* rejection under the Billing customization.
+    /// Self-billing has its own Peppol profile. See
+    /// [`is_peppol_billing_code`](Self::is_peppol_billing_code).
     SelfBilledInvoice,
     /// `875` — partial construction invoice (Abschlagsrechnung, VOB/B §16).
     PartialConstructionInvoice,
@@ -160,22 +166,43 @@ impl DocumentKind {
     /// Whether this kind represents a credit rather than a charge — and therefore
     /// **which document element a consumer must emit**.
     ///
-    /// This is not a cosmetic distinction. `BR-CL-01` does not police one code
-    /// list; it polices **two disjoint ones**, chosen by the syntax element:
+    /// This is not a cosmetic distinction. `BR-CL-01` reads as one rule but is
+    /// really **two code lists selected by the syntax element**. Its Schematron
+    /// context matches both elements while its test branches on which one it
+    /// found (`eInvoicing-EN16931`, `validation-1.3.16`):
     ///
-    /// | Element | Permitted codes (excerpt) |
-    /// |---|---|
-    /// | `cbc:InvoiceTypeCode` | `326`, `380`, `383`, `384`, `386`, `389`, `875`, `876`, `877`, … |
-    /// | `cbc:CreditNoteTypeCode` | `81`, `83`, `261`, `262`, `296`, `308`, **`381`**, `396`, … |
+    /// ```xml
+    /// <rule context="cbc:InvoiceTypeCode | cbc:CreditNoteTypeCode" flag="fatal">
+    ///   <assert id="BR-CL-01" test="
+    ///        (self::cbc:InvoiceTypeCode    and contains(' 71 80 81 … 380 382 … 935 ', …))
+    ///     or (self::cbc:CreditNoteTypeCode and contains(' 81 83 261 262 296 308 381 396 … ', …))"/>
+    /// ```
     ///
-    /// The lists barely overlap, so putting `381` on a UBL `<Invoice>` — or `380`
-    /// on a `<CreditNote>` — is a **fatal** violation, not a warning. Of the ten
+    /// | Element | Size | Codes (excerpt) |
+    /// |---|---|---|
+    /// | `cbc:InvoiceTypeCode` | 50 | `81`, `326`, **`380`**, `383`, `384`, `386`, `389`, `875`, `876`, `877`, … |
+    /// | `cbc:CreditNoteTypeCode` | 13 | `81`, `83`, `261`, `262`, `296`, `308`, **`381`**, `396`, `420`, `458`, `502`, `503`, `532` |
+    ///
+    /// The two share exactly one code, `81` (credit note related to goods or
+    /// services). Everything else is in one list or the other — in particular
+    /// `380` is only in the first and `381` only in the second, so putting `381`
+    /// on a UBL `<Invoice>`, or `380` on a `<CreditNote>`, is a **fatal**
+    /// violation of `BR-CL-01` itself, before any profile gets a say. Of the ten
     /// codes modelled here, [`CreditNote`](Self::CreditNote) is the only member of
     /// the credit-note list; every other one, including
     /// [`DebitNote`](Self::DebitNote) (`383`), belongs to the invoice list.
     ///
     /// So: `true` here means emit a UBL `<CreditNote>` (or CII type `381`), and
     /// `false` means emit an `<Invoice>`.
+    ///
+    /// # Profiles narrow this further — see [`DocumentKind::is_peppol_billing_code`]
+    ///
+    /// `BR-CL-01` is the floor, not the ceiling. Peppol BIS Billing 3.0 cuts the
+    /// invoice list from 50 codes to 26 (`PEPPOL-EN16931-P0100`) and the
+    /// credit-note list from 13 to five (`P0101`), and `P0112` narrows two of
+    /// those by the *parties'* countries. That is why this crate keeps
+    /// `DocumentKind` a plain code list and leaves the narrowing to the layer that
+    /// knows the profile.
     ///
     /// ```rust
     /// use billing::DocumentKind;
@@ -188,6 +215,70 @@ impl DocumentKind {
     #[must_use]
     pub fn is_credit_note(&self) -> bool {
         matches!(self, Self::CreditNote)
+    }
+
+    /// Whether Peppol BIS Billing 3.0 accepts this code — `PEPPOL-EN16931-P0100`
+    /// (invoice) and `P0101` (credit note), both **fatal**.
+    ///
+    /// `BR-CL-01` admits 50 invoice codes and 13 credit-note codes; the Peppol
+    /// Billing profile admits 26 and five. Passing `BR-CL-01` therefore says
+    /// nothing about whether a Peppol Access Point will take the document, and
+    /// exactly one kind modelled here falls in the gap:
+    ///
+    /// | Kind | BT-3 | `BR-CL-01` | Peppol Billing |
+    /// |---|---|---|---|
+    /// | [`SelfBilledInvoice`](Self::SelfBilledInvoice) | `389` | ✅ invoice list | ❌ **not in `P0100`** |
+    ///
+    /// Self-billing is not forbidden in Peppol — it is a *different profile*
+    /// (Peppol BIS Self-Billing), with its own `CustomizationID`. Emitting `389`
+    /// under the Billing customization is fatal, which is a failure mode worth
+    /// catching before transmission rather than at the Access Point.
+    ///
+    /// Two further conditions this predicate deliberately does **not** answer,
+    /// because neither is a property of the code alone:
+    ///
+    /// - `P0112` narrows `326` and `384` by the parties' countries — see
+    ///   [`requires_german_parties`](Self::requires_german_parties).
+    /// - XRechnung's `BR-DE-17` admits a different set again.
+    ///
+    /// ```rust
+    /// use billing::DocumentKind;
+    ///
+    /// assert!(DocumentKind::CommercialInvoice.is_peppol_billing_code()); // 380, P0100
+    /// assert!(DocumentKind::CreditNote.is_peppol_billing_code());        // 381, P0101
+    /// assert!(DocumentKind::PrepaymentInvoice.is_peppol_billing_code()); // 386, P0100
+    ///
+    /// // Valid EN 16931, fatal under the Peppol *Billing* profile.
+    /// assert!(!DocumentKind::SelfBilledInvoice.is_peppol_billing_code()); // 389
+    /// ```
+    #[must_use]
+    pub fn is_peppol_billing_code(&self) -> bool {
+        !matches!(self, Self::SelfBilledInvoice)
+    }
+
+    /// Whether `PEPPOL-EN16931-P0112` restricts this code to a domestic German
+    /// exchange — **fatal** when it applies and the parties are not both German.
+    ///
+    /// > `[PEPPOL-EN16931-P0112]` Invoice type code 326 or 384 are only allowed
+    /// > when both buyer and seller are German organizations
+    ///
+    /// True for [`PartialInvoice`](Self::PartialInvoice) (`326`) and
+    /// [`CorrectedInvoice`](Self::CorrectedInvoice) (`384`). Both pass
+    /// `BR-CL-01` and `P0100` unconditionally; the country condition is layered on
+    /// top, which is why the admissible BT-3 set is not merely profile-dependent
+    /// but *party*-dependent — and why narrowing it belongs above this crate,
+    /// where the parties are known.
+    ///
+    /// ```rust
+    /// use billing::DocumentKind;
+    ///
+    /// assert!(DocumentKind::PartialInvoice.requires_german_parties());   // 326
+    /// assert!(DocumentKind::CorrectedInvoice.requires_german_parties()); // 384
+    /// assert!(!DocumentKind::CommercialInvoice.requires_german_parties());
+    /// ```
+    #[must_use]
+    pub fn requires_german_parties(&self) -> bool {
+        matches!(self, Self::PartialInvoice | Self::CorrectedInvoice)
     }
 
     /// Every document kind this crate models, for exhaustive iteration.

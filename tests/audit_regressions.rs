@@ -1326,6 +1326,7 @@ fn from_positions_rejects_an_empty_unit_label() {
         tags: vec![],
         vat: None,
         allowance_charge: None,
+        line_allowances: vec![],
         metadata: Default::default(),
     };
     assert!(

@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+
+# Found by deliberately reintroducing the `reduce_position` drift described in
+# `line_item::compose_bt131` — a line whose R120 expression, rounded once to two
+# decimals, differs from the same value rounded to five and then to two. Kept as a
+# seed so every run exercises that boundary before any random case.
+cc b082243906d864fe1d224a2f34999653ba2f6571fe9b164b4e0acdee178a046e # shrinks to qty_raw = 378857, price = 0.039593, base = Some(100), allowance_raw = 45082, charge_raw = 500, credit = false

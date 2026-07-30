@@ -251,6 +251,487 @@ impl AllowanceCharge {
     }
 }
 
+// ── Line allowances and charges (BG-27 / BG-28) ───────────────────────────────
+
+/// Which side of `cbc:ChargeIndicator` a [`LineAllowanceCharge`] is on.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AllowanceKind {
+    /// EN 16931 **BG-27** — an invoice line allowance. Subtracts from BT-131.
+    Allowance,
+    /// EN 16931 **BG-28** — an invoice line charge. Adds to BT-131.
+    Charge,
+}
+
+impl AllowanceKind {
+    /// The UBL `cbc:ChargeIndicator` value: `true` for a charge, `false` for an
+    /// allowance.
+    #[must_use]
+    pub fn charge_indicator(&self) -> bool {
+        matches!(self, Self::Charge)
+    }
+}
+
+/// An **invoice line** allowance (**BG-27**) or charge (**BG-28**) — a deduction
+/// or addition that moves *this line's* net amount.
+///
+/// | Field | Allowance (BG-27) | Charge (BG-28) |
+/// |---|---|---|
+/// | [`amount`](Self::amount) | BT-136 | BT-141 |
+/// | [`base_amount`](Self::base_amount) | BT-137 | BT-142 |
+/// | [`percentage`](Self::percentage) | BT-138 | BT-143 |
+/// | [`reason`](Self::reason) | BT-139 | BT-144 |
+/// | [`reason_code`](Self::reason_code) | BT-140 (UNCL 5189) | BT-145 (UNCL 7161) |
+///
+/// # Not to be confused with [`AllowanceCharge`]
+///
+/// The two look alike and are three different things in the standard. They differ
+/// in *what they move*, which is the only distinction that matters arithmetically:
+///
+/// | Group | Type | Terms | Moves |
+/// |---|---|---|---|
+/// | BG-27 / BG-28 | **this type** | BT-136 … BT-145 | **BT-131**, this line's net amount |
+/// | BG-20 / BG-21 | [`AllowanceCharge`] | BT-92 … BT-105 | **BT-107 / BT-108** → BT-109, the document totals |
+/// | BG-29 | [`UnitPrice::discounted`] | BT-147 / BT-148 | **BT-146**, the price itself |
+///
+/// A line allowance never reaches the document totals directly. It is folded into
+/// BT-131 by [`LineItemBuilder::build`], and BT-106 is the sum of the BT-131s —
+/// so the totals chain needs no special case, and neither does the VAT breakdown.
+///
+/// # Rules
+///
+/// - **BR-41 / BR-43** — an amount is mandatory. It is not `Option` here.
+/// - **BR-42 / BR-44**, restated by **BR-CO-23 / BR-CO-24** — a reason *or* a
+///   reason code is mandatory. Unlike a document level allowance, which can lean
+///   on [`LineItem::description`] for BT-97 / BT-104, a line allowance has no
+///   description of its own to fall back on. The constructors therefore take the
+///   reason, and [`validate`](Self::validate) rejects a pair with neither.
+/// - **`PEPPOL-EN16931-R040` / `R041` / `R042`** — the base-and-percentage pairing
+///   and the ±0.02 recomputation. Their Schematron contexts list
+///   `cac:InvoiceLine/cac:AllowanceCharge` alongside the document level one, so
+///   these apply here *identically*; the checks are shared with
+///   [`AllowanceCharge`] rather than reimplemented.
+/// - **`PEPPOL-EN16931-R120`** — `BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 −
+///   Σ BG-27`, which is what `build` computes.
+/// - **BR-CL-19 / BR-CL-20** constrain the reason code; membership is not checked
+///   here, for the same reason it is not for [`AllowanceCharge`].
+///
+/// # Sign
+///
+/// [`amount`](Self::amount) is a **magnitude**: the direction lives in
+/// [`kind`](Self::kind), exactly as UBL puts it in `cbc:ChargeIndicator` rather
+/// than in the number. `build` subtracts an allowance and adds a charge. The one
+/// place negative values appear is after
+/// [`BillingDocument::reverse`](crate::BillingDocument::reverse), which negates
+/// every amount in the document including these.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "LineAllowanceChargeRepr"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineAllowanceCharge {
+    /// Allowance (BG-27) or charge (BG-28) — UBL's `cbc:ChargeIndicator`.
+    pub kind: AllowanceKind,
+    /// BT-136 (allowance) / BT-141 (charge) — mandatory under BR-41 / BR-43.
+    pub amount: Amount<5>,
+    /// BT-137 (allowance) / BT-142 (charge) — the amount the percentage applied
+    /// to. Must be present exactly when [`percentage`](Self::percentage) is.
+    pub base_amount: Option<Amount<5>>,
+    /// BT-138 (allowance) / BT-143 (charge) — the rate as a **percentage**
+    /// (`10` for 10 %), matching the wire format.
+    pub percentage: Option<Decimal>,
+    /// BT-139 (allowance) / BT-144 (charge) — free-text reason. Required unless
+    /// [`reason_code`](Self::reason_code) is given (BR-42 / BR-44).
+    pub reason: Option<String>,
+    /// BT-140 (allowance, UNCL 5189) / BT-145 (charge, UNCL 7161) — coded reason.
+    pub reason_code: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct LineAllowanceChargeRepr {
+    kind: AllowanceKind,
+    amount: Amount<5>,
+    #[serde(default)]
+    base_amount: Option<Amount<5>>,
+    #[serde(default)]
+    percentage: Option<Decimal>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    reason_code: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LineAllowanceChargeRepr> for LineAllowanceCharge {
+    type Error = BillingError;
+    fn try_from(r: LineAllowanceChargeRepr) -> Result<Self, Self::Error> {
+        let lac = LineAllowanceCharge {
+            kind: r.kind,
+            amount: r.amount,
+            base_amount: r.base_amount,
+            percentage: r.percentage,
+            reason: r.reason,
+            reason_code: r.reason_code,
+        };
+        lac.validate()?;
+        Ok(lac)
+    }
+}
+
+impl LineAllowanceCharge {
+    /// A line **allowance** (BG-27) of `amount`, with its BT-139 reason.
+    ///
+    /// ```rust
+    /// use billing::{LineItem, Amount, Quantity, UnitPrice, LineAllowanceCharge};
+    /// use rust_decimal::dec;
+    ///
+    /// // 100 × 10,00 = 1000,00, less a 50,00 line allowance.
+    /// let line = LineItem::for_usage(
+    ///     "Ware",
+    ///     Quantity::new(dec!(100), "pcs"),
+    ///     UnitPrice::new(dec!(10.00), "EUR/pcs"),
+    /// )
+    /// .line_allowance(LineAllowanceCharge::allowance(
+    ///     Amount::parse("50.00000").unwrap(), "Mengenrabatt",
+    /// ))
+    /// .build().unwrap();
+    ///
+    /// assert_eq!(line.net_amount, Amount::<5>::parse("950.00000").unwrap());
+    /// ```
+    #[must_use]
+    pub fn allowance(amount: Amount<5>, reason: impl Into<String>) -> Self {
+        Self::new(AllowanceKind::Allowance, amount, Some(reason.into()), None)
+    }
+
+    /// A line **charge** (BG-28) of `amount`, with its BT-144 reason.
+    #[must_use]
+    pub fn charge(amount: Amount<5>, reason: impl Into<String>) -> Self {
+        Self::new(AllowanceKind::Charge, amount, Some(reason.into()), None)
+    }
+
+    /// A line allowance identified only by its UNCL 5189 reason code (BT-140).
+    ///
+    /// BR-42 is satisfied by the code alone; a free-text reason is then optional.
+    #[must_use]
+    pub fn coded_allowance(amount: Amount<5>, reason_code: impl Into<String>) -> Self {
+        Self::new(
+            AllowanceKind::Allowance,
+            amount,
+            None,
+            Some(reason_code.into()),
+        )
+    }
+
+    /// A line charge identified only by its UNCL 7161 reason code (BT-145).
+    #[must_use]
+    pub fn coded_charge(amount: Amount<5>, reason_code: impl Into<String>) -> Self {
+        Self::new(
+            AllowanceKind::Charge,
+            amount,
+            None,
+            Some(reason_code.into()),
+        )
+    }
+
+    fn new(
+        kind: AllowanceKind,
+        amount: Amount<5>,
+        reason: Option<String>,
+        reason_code: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            amount,
+            base_amount: None,
+            percentage: None,
+            reason,
+            reason_code,
+        }
+    }
+
+    /// State the percentage basis — BT-137 / BT-138 (allowance) or BT-142 /
+    /// BT-143 (charge).
+    ///
+    /// `rate` is the fraction the engine works in (`0.10`); it is stored as the
+    /// percentage the wire format expects (`10`), exactly as
+    /// [`AllowanceCharge::percentage_of`] does. Both members are set together
+    /// because `PEPPOL-EN16931-R041` / `R042` make them a matched pair here too.
+    ///
+    /// `PEPPOL-EN16931-R040` then recomputes `base × rate` against
+    /// [`amount`](Self::amount) with a ±0.02 tolerance, so this is a claim a
+    /// validator checks rather than free annotation.
+    #[must_use]
+    pub fn of(mut self, base: Amount<5>, rate: Decimal) -> Self {
+        let basis = AllowanceCharge::percentage_of(base, rate);
+        self.base_amount = basis.base_amount;
+        self.percentage = basis.percentage;
+        self
+    }
+
+    /// Attach the BT-140 / BT-145 reason code alongside the free-text reason.
+    #[must_use]
+    pub fn with_reason_code(mut self, code: impl Into<String>) -> Self {
+        self.reason_code = Some(code.into());
+        self
+    }
+
+    /// The signed contribution to BT-131: negative for an allowance, positive for
+    /// a charge.
+    ///
+    /// # Errors
+    /// [`BillingError::MonetaryOverflow`] if negating [`amount`](Self::amount)
+    /// leaves range.
+    pub fn signed_amount(&self) -> Result<Amount<5>, BillingError> {
+        match self.kind {
+            AllowanceKind::Charge => Ok(self.amount),
+            AllowanceKind::Allowance => self.amount.checked_neg(),
+        }
+    }
+
+    /// The document level view of the basis, for the checks the two groups share.
+    fn basis(&self) -> AllowanceCharge {
+        AllowanceCharge {
+            reason_code: self.reason_code.clone(),
+            base_amount: self.base_amount,
+            percentage: self.percentage,
+        }
+    }
+
+    /// Check BR-42 / BR-44 and the shared `PEPPOL-EN16931-R040` / `R041` / `R042`.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] naming the violated rule, or
+    /// [`BillingError::MonetaryOverflow`] if the R040 product cannot be
+    /// represented.
+    pub fn validate(&self) -> Result<(), BillingError> {
+        let has_reason = self.reason.as_ref().is_some_and(|r| !r.trim().is_empty());
+        let has_code = self
+            .reason_code
+            .as_ref()
+            .is_some_and(|c| !c.trim().is_empty());
+        if !has_reason && !has_code {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "line {} states neither a reason ({}) nor a reason code ({}); {} requires one",
+                    match self.kind {
+                        AllowanceKind::Allowance => "allowance (BG-27)",
+                        AllowanceKind::Charge => "charge (BG-28)",
+                    },
+                    match self.kind {
+                        AllowanceKind::Allowance => "BT-139",
+                        AllowanceKind::Charge => "BT-144",
+                    },
+                    match self.kind {
+                        AllowanceKind::Allowance => "BT-140",
+                        AllowanceKind::Charge => "BT-145",
+                    },
+                    match self.kind {
+                        AllowanceKind::Allowance => "BR-42 / BR-CO-23",
+                        AllowanceKind::Charge => "BR-44 / BR-CO-24",
+                    },
+                ),
+            });
+        }
+        let basis = self.basis();
+        basis.validate()?;
+        basis.check_amount(self.amount)
+    }
+
+    /// Scale amount and base by `factor`, keeping `R040` true.
+    ///
+    /// # Errors
+    /// [`BillingError::MonetaryOverflow`] if either scaled value leaves range.
+    pub fn scaled(
+        &self,
+        factor: Decimal,
+        strategy: crate::amount::RoundingStrategy,
+    ) -> Result<Self, BillingError> {
+        let scaled_amount = self.amount.into_decimal().checked_mul(factor).ok_or(
+            BillingError::MonetaryOverflow {
+                precision: 5,
+                input_value: None,
+            },
+        )?;
+        let basis = self.basis().scaled(factor, strategy)?;
+        Ok(Self {
+            amount: Amount::<5>::from_decimal_rounded(scaled_amount, strategy)?,
+            base_amount: basis.base_amount,
+            ..self.clone()
+        })
+    }
+
+    /// Negate amount and base, for [`crate::BillingDocument::reverse`].
+    ///
+    /// # Errors
+    /// [`BillingError::MonetaryOverflow`] if either value is `Amount::MIN`.
+    pub fn negated(&self) -> Result<Self, BillingError> {
+        Ok(Self {
+            amount: self.amount.checked_neg()?,
+            base_amount: self.basis().negated()?.base_amount,
+            ..self.clone()
+        })
+    }
+
+    /// Drop the percentage basis, keeping both reasons.
+    ///
+    /// The honest response to an operation that moves the amount in a way the base
+    /// cannot follow — see [`AllowanceCharge::without_basis`].
+    #[must_use]
+    pub fn without_basis(mut self) -> Self {
+        self.base_amount = None;
+        self.percentage = None;
+        self
+    }
+}
+
+/// **PEPPOL-EN16931-R130** — the price base quantity's unit code (BT-150) must
+/// equal the invoiced quantity's (BT-130).
+///
+/// > `[PEPPOL-EN16931-R130]` Unit code of price base quantity MUST be same as
+/// > invoiced quantity.
+///
+/// — **fatal**. EN 16931-1 states the same thing in prose under BT-150 ("shall be
+/// the same as the Invoiced quantity unit of measure"), and BR-CL-23 separately
+/// pins both to UN/ECE Rec 20 / 21.
+///
+/// A cross-field rule: [`Quantity`] holds one code and [`UnitPrice`] the other, so
+/// neither can check it, and only the line sees both. Enforced only when *both*
+/// codes are stated — a caller who supplies neither, or only one, has not made a
+/// contradictory claim, and this crate does not invent BT-130 from a display
+/// label (see [`Quantity::code`]).
+fn check_price_base_unit(
+    quantity: Option<&Quantity>,
+    price: Option<&UnitPrice>,
+) -> Result<(), BillingError> {
+    let (Some(q), Some(p)) = (quantity, price) else {
+        return Ok(());
+    };
+    if let (Some(qc), Some(pc)) = (q.code.as_deref(), p.base_quantity_code.as_deref())
+        && qc != pc
+    {
+        return Err(BillingError::InvalidInput {
+            reason: format!(
+                "item price base quantity unit code {pc:?} (BT-150) differs from the invoiced \
+                 quantity unit code {qc:?} (BT-130); PEPPOL-EN16931-R130 requires them equal"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// **The one place BT-131 is derived** — `PEPPOL-EN16931-R120`, parameterised by
+/// how each leaf is reduced.
+///
+/// > BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
+///
+/// Two callers need this expression at two different precisions, and they must not
+/// drift apart:
+///
+/// | Caller | `reduce_price` | `reduce_allowance` |
+/// |---|---|---|
+/// | [`LineItemBuilder::build`] | round to the engine's 5 decimals | identity |
+/// | `BillingDocument::reduce_position` | round to the interchange scale | round to the interchange scale |
+///
+/// They drifted once. `reduce_position` re-derives the line to decide whether it
+/// may round **once** from the exact value rather than from the stored
+/// five-decimal amount — the crate's central precision guarantee — and when BT-149
+/// and BG-27 / BG-28 were added to `build` without being added there, every line
+/// using them silently fell back to rounding twice. Two roundings of `0,004999`
+/// give `0,01`; one gives `0,00`.
+///
+/// Routing both through this function makes that failure structural rather than
+/// incidental: a new term in the expression is written once and both callers get
+/// it. `tests/properties.rs` additionally asserts the two agree for random lines.
+///
+/// `price_part` is `None` for a position built from an explicit `fixed_amount`,
+/// which states BT-131 directly instead of deriving it.
+pub(crate) fn compose_bt131(
+    price_part: Option<Decimal>,
+    allowances: &[LineAllowanceCharge],
+    sign: Sign,
+    reduce_price: impl Fn(Decimal) -> Result<Amount<5>, BillingError>,
+    reduce_allowance: impl Fn(Amount<5>) -> Result<Amount<5>, BillingError>,
+    stated: Amount<5>,
+) -> Result<Amount<5>, BillingError> {
+    let base = match price_part {
+        Some(exact) => reduce_price(exact)?,
+        None => stated,
+    };
+    let total = allowances.iter().try_fold(base, |acc, lac| {
+        let amount = reduce_allowance(lac.amount)?;
+        // The direction lives in `kind`, not in the number — as UBL puts it in
+        // `cbc:ChargeIndicator` rather than in `cbc:Amount`.
+        let signed = if lac.kind.charge_indicator() {
+            amount
+        } else {
+            amount.checked_neg()?
+        };
+        acc.checked_add(signed)
+    })?;
+    // A credit position's amount is negative by construction; `build` flips the
+    // whole R120 sum rather than the price part alone, so this must too.
+    if sign == Sign::Credit && total.is_positive() {
+        total.checked_neg()
+    } else {
+        Ok(total)
+    }
+}
+
+/// The exact value of R120's price-derived part, `BT-129 × (BT-146 ÷ BT-149)`.
+///
+/// Kept as an unrounded [`Decimal`] so the single rounding happens in
+/// [`compose_bt131`]. Multiplies before dividing — mathematically identical to the
+/// rule's `BT-146 div BT-149` but without rounding a possibly non-terminating
+/// quotient before scaling it up. A missing BT-149 means 1, exactly as `R120`'s own
+/// `$baseQuantity` variable is defined.
+///
+/// Returns `None` when the position is not quantity-derived at all.
+pub(crate) fn exact_price_part(
+    quantity: Option<&Quantity>,
+    price: Option<&UnitPrice>,
+) -> Result<Option<Decimal>, BillingError> {
+    let (Some(qty), Some(price)) = (quantity, price) else {
+        return Ok(None);
+    };
+    let overflow = || BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    };
+    let product = qty.value.checked_mul(price.value).ok_or_else(overflow)?;
+    match price.base_quantity {
+        None => Ok(Some(product)),
+        Some(base) => Ok(Some(product.checked_div(base).ok_or_else(overflow)?)),
+    }
+}
+
+/// A document level allowance or charge cannot itself carry line allowances.
+///
+/// In EN 16931 the two groups sit at different levels of the document: BG-27 and
+/// BG-28 are children of an **invoice line** (BG-25), while BG-20 and BG-21 are
+/// children of the *document*. UBL says the same thing structurally —
+/// `cac:AllowanceCharge` at document level has no nested `cac:AllowanceCharge`,
+/// only `cac:InvoiceLine` does.
+///
+/// A position with an [`AllowanceCharge`] is declaring itself a BG-20 / BG-21, so
+/// attaching BG-27 / BG-28 to it describes a document no syntax can express. The
+/// caller almost certainly wanted the line allowances on the *line the discount
+/// applies to*, which is a different position.
+fn check_allowance_nesting(
+    document_level: Option<&AllowanceCharge>,
+    line_level: &[LineAllowanceCharge],
+) -> Result<(), BillingError> {
+    if document_level.is_some() && !line_level.is_empty() {
+        return Err(BillingError::InvalidInput {
+            reason: format!(
+                "position is a document level allowance/charge (BG-20/BG-21) and also carries \
+                 {} line allowance(s)/charge(s) (BG-27/BG-28); those attach to an invoice line \
+                 (BG-25), not to a document level allowance",
+                line_level.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// The atomic billing unit: a single charge or credit position.
 ///
 /// Every `LineItem` has a `net_amount`: positive = debit (charge), negative = credit.
@@ -318,8 +799,22 @@ pub struct LineItem {
     ///
     /// `None` on an ordinary invoice line, which is neither — see
     /// [`AllowanceCharge`] for what it carries and why the parts travel together.
+    ///
+    /// Not to be confused with [`line_allowances`](Self::line_allowances), which
+    /// is the *line* level group (BG-27 / BG-28) and moves this line's own net
+    /// amount rather than the document totals.
     #[cfg_attr(feature = "serde", serde(default))]
     pub allowance_charge: Option<AllowanceCharge>,
+    /// EN 16931 **BG-27** (line allowance) and **BG-28** (line charge) — the
+    /// deductions and additions folded into this line's own `net_amount`.
+    ///
+    /// `PEPPOL-EN16931-R120` defines BT-131 as
+    /// `BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27`, and
+    /// [`LineItemBuilder::build`] computes exactly that, so these are already
+    /// reflected in `net_amount` — they are carried for the consumer to emit, not
+    /// re-applied. Empty on an ordinary line.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub line_allowances: Vec<LineAllowanceCharge>,
     /// Arbitrary key-value metadata for ERP export.
     pub metadata: HashMap<String, String>,
 }
@@ -343,6 +838,8 @@ struct LineItemRepr {
     #[serde(default)]
     allowance_charge: Option<AllowanceCharge>,
     #[serde(default)]
+    line_allowances: Vec<LineAllowanceCharge>,
+    #[serde(default)]
     metadata: HashMap<String, String>,
 }
 
@@ -360,6 +857,7 @@ impl TryFrom<LineItemRepr> for LineItem {
             tags: r.tags,
             vat: r.vat,
             allowance_charge: r.allowance_charge,
+            line_allowances: r.line_allowances,
             metadata: r.metadata,
         };
         item.validate()?;
@@ -443,7 +941,9 @@ impl LineItem {
         }
         if let Some(p) = &self.unit_price {
             crate::check_unit("LineItem unit_price", &p.unit)?;
+            p.validate()?;
         }
+        check_price_base_unit(self.quantity.as_ref(), self.unit_price.as_ref())?;
         if self.sign == Sign::Credit && self.net_amount.is_positive() {
             return Err(BillingError::InvalidInput {
                 reason: format!(
@@ -459,6 +959,10 @@ impl LineItem {
             ac.validate()?;
             ac.check_amount(self.net_amount)?;
         }
+        for lac in &self.line_allowances {
+            lac.validate()?;
+        }
+        check_allowance_nesting(self.allowance_charge.as_ref(), &self.line_allowances)?;
         Ok(())
     }
 
@@ -478,6 +982,27 @@ impl LineItem {
     ///
     /// Returns a `LineItemBuilder` so you can add `.tag()` / `.meta()` before `.build()`.
     ///
+    /// # This shape is not a complete EN 16931 invoice line
+    ///
+    /// **Every** invoice line needs three terms this constructor does not supply,
+    /// each mandated by a **fatal** rule with `$Invoice_Line` as its context:
+    ///
+    /// | Rule | Requires |
+    /// |---|---|
+    /// | BR-22 | Invoiced quantity (BT-129) |
+    /// | BR-23 | Invoiced quantity unit of measure code (BT-130) |
+    /// | BR-26 | Item net price (BT-146) |
+    ///
+    /// A consumer emitting this position as a `cac:InvoiceLine` must therefore
+    /// synthesise all three. [`LineItem::flat_fee`] does it up front instead, with
+    /// the conventional "1 unit at the full amount" reading, so the position that
+    /// leaves this crate is already emittable.
+    ///
+    /// `fixed` remains the right constructor when the position is **not** an
+    /// invoice line — a document level allowance or charge (BG-20 / BG-21), which
+    /// has no BG-25 terms at all — or when the caller maps to a syntax with no such
+    /// requirement.
+    ///
     /// # Example
     /// ```rust
     /// use billing::{LineItem, Amount};
@@ -486,10 +1011,67 @@ impl LineItem {
     ///     .build()
     ///     .unwrap();
     /// assert_eq!(item.net_amount, Amount::<5>::parse("8.50000").unwrap());
+    /// // No BT-129 / BT-130 / BT-146 — see `flat_fee`.
+    /// assert!(item.quantity.is_none() && item.unit_price.is_none());
     /// ```
     #[must_use]
     pub fn fixed(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
         LineItemBuilder::new(description.into(), Sign::Debit).fixed_amount(amount)
+    }
+
+    /// A flat charge stated as a **complete EN 16931 invoice line**: one unit, at a
+    /// unit price equal to the whole amount.
+    ///
+    /// The standing-charge case — Grundpreis, monthly seat fee, connection fee —
+    /// where there is a single amount and no natural quantity. [`LineItem::fixed`]
+    /// expresses that as a bare amount, which is convenient but leaves BT-129,
+    /// BT-130 and BT-146 unstated and so fails BR-22, BR-23 and BR-26. This
+    /// constructor fills them in the conventional way:
+    ///
+    /// | Term | Value |
+    /// |---|---|
+    /// | BT-129 invoiced quantity | `1` |
+    /// | BT-130 unit code | [`UNIT_CODE_ONE`] — `C62`, UN/ECE Rec 20 "one", the code for a countable item with no other unit |
+    /// | BT-146 item net price | the full amount |
+    ///
+    /// `1 × amount` is exactly `amount`, so `PEPPOL-EN16931-R120` holds trivially
+    /// and nothing is rounded that was not rounded before. The `unit` labels are
+    /// display text only and are deliberately terse: the description carries the
+    /// meaning.
+    ///
+    /// ```rust
+    /// use billing::{LineItem, Amount, UNIT_CODE_ONE};
+    /// use rust_decimal::dec;
+    ///
+    /// let item = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert_eq!(item.net_amount, Amount::<5>::parse("8.50000").unwrap());
+    /// assert_eq!(item.quantity.as_ref().unwrap().value, dec!(1));            // BT-129
+    /// assert_eq!(item.quantity.as_ref().unwrap().code.as_deref(),
+    ///            Some(UNIT_CODE_ONE));                                       // BT-130
+    /// assert_eq!(item.unit_price.as_ref().unwrap().value, dec!(8.50));       // BT-146
+    /// ```
+    #[must_use]
+    pub fn flat_fee(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
+        Self::flat(description, amount, Sign::Debit)
+    }
+
+    /// The credit counterpart of [`LineItem::flat_fee`] — a flat refund stated as a
+    /// complete EN 16931 invoice line.
+    #[must_use]
+    pub fn credit_flat_fee(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
+        Self::flat(description, amount, Sign::Credit)
+    }
+
+    fn flat(description: impl Into<String>, amount: Amount<5>, sign: Sign) -> LineItemBuilder {
+        // `normalize()` strips the five trailing zeros an `Amount<5>` carries, so
+        // BT-146 renders as the price a human quoted (`8.50`, not `8.50000`).
+        let price = amount.into_decimal().normalize();
+        LineItemBuilder::new(description.into(), sign)
+            .quantity(Quantity::new(Decimal::ONE, "×").with_code(crate::UNIT_CODE_ONE))
+            .unit_price(UnitPrice::new(price, "EUR"))
     }
 
     /// Create a fixed-amount credit position (negative net amount).
@@ -630,9 +1212,11 @@ impl LineItem {
 
     /// Scale this position by `factor`, keeping it internally consistent.
     ///
-    /// Both `net_amount` **and** `quantity` are multiplied by `factor`; `unit_price`
-    /// is left untouched.  This preserves the invoice-line identity
-    /// `quantity × unit_price ≈ net_amount`, which naive net-only scaling breaks.
+    /// `net_amount`, `quantity` and every BG-27 / BG-28 line allowance are
+    /// multiplied by `factor`; `unit_price` is left untouched, because a price is
+    /// a rate and does not scale. This preserves the whole `PEPPOL-EN16931-R120`
+    /// identity — `BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27` —
+    /// which naive net-only scaling breaks.
     ///
     /// `net_amount` is rounded to 5 dp with `strategy`.  `quantity` is scaled
     /// exactly (no rounding) so that the displayed quantity keeps full precision.
@@ -681,6 +1265,14 @@ impl LineItem {
         if let Some(ac) = out.allowance_charge.as_ref() {
             out.allowance_charge = Some(ac.scaled(factor, strategy)?);
         }
+        // BG-27 / BG-28 are components of the very amount being scaled, so they
+        // move with it — otherwise the parts stop summing to BT-131 and the line
+        // fails R120 by the whole un-scaled remainder rather than by a residual.
+        out.line_allowances = out
+            .line_allowances
+            .iter()
+            .map(|lac| lac.scaled(factor, strategy))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(q) = out.quantity.as_mut() {
             // Bound the scale of the scaled quantity. An exact product such as
             // 1000 × (1/3) carries 28 significant decimals, which both renders
@@ -741,6 +1333,7 @@ pub struct LineItemBuilder {
     tags: Vec<String>,
     vat: Option<LineVat>,
     allowance_charge: Option<AllowanceCharge>,
+    line_allowances: Vec<LineAllowanceCharge>,
     metadata: HashMap<String, String>,
 }
 
@@ -756,6 +1349,7 @@ impl LineItemBuilder {
             tags: vec![],
             vat: None,
             allowance_charge: None,
+            line_allowances: Vec::new(),
             metadata: HashMap::new(),
         }
     }
@@ -823,6 +1417,42 @@ impl LineItemBuilder {
         self
     }
 
+    /// Add a line allowance (BG-27) or line charge (BG-28) to this position.
+    ///
+    /// Repeatable — EN 16931 allows any number of each, and `PEPPOL-EN16931-R120`
+    /// sums them. [`build`](Self::build) folds the total into `net_amount`:
+    /// `BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27`.
+    ///
+    /// ```rust
+    /// use billing::{LineItem, Amount, Quantity, UnitPrice, LineAllowanceCharge};
+    /// use rust_decimal::dec;
+    ///
+    /// let line = LineItem::for_usage(
+    ///     "Ware",
+    ///     Quantity::new(dec!(100), "pcs"),
+    ///     UnitPrice::new(dec!(10.00), "EUR/pcs"),
+    /// )
+    /// // 5 % volume discount off the 1000,00 line…
+    /// .line_allowance(
+    ///     LineAllowanceCharge::allowance(Amount::parse("50.00000").unwrap(), "Mengenrabatt")
+    ///         .of(Amount::parse("1000.00000").unwrap(), dec!(0.05)),
+    /// )
+    /// // …plus a flat handling charge.
+    /// .line_allowance(LineAllowanceCharge::charge(
+    ///     Amount::parse("12.50000").unwrap(), "Verpackung",
+    /// ))
+    /// .build().unwrap();
+    ///
+    /// // 1000,00 − 50,00 + 12,50
+    /// assert_eq!(line.net_amount, Amount::<5>::parse("962.50000").unwrap());
+    /// assert_eq!(line.line_allowances.len(), 2);
+    /// ```
+    #[must_use]
+    pub fn line_allowance(mut self, lac: LineAllowanceCharge) -> Self {
+        self.line_allowances.push(lac);
+        self
+    }
+
     #[must_use]
     /// Add a key-value metadata pair.
     pub fn meta(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
@@ -853,17 +1483,24 @@ impl LineItemBuilder {
 
     /// Build the `LineItem`.
     ///
-    /// Net amount is:
+    /// The line base is:
     /// 1. `fixed_amount` if set (ignores quantity/unit_price)
-    /// 2. `quantity.value × unit_price.value` rounded to 5dp — **both signs allowed**
+    /// 2. `quantity.value × (unit_price.value ÷ base_quantity)` rounded to 5dp —
+    ///    **both signs allowed**
     /// 3. `Err` if neither is provided
+    ///
+    /// then every [`line_allowance`](Self::line_allowance) is folded in — charges
+    /// added, allowances subtracted — giving `PEPPOL-EN16931-R120` in full:
+    ///
+    /// > BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
     ///
     /// Negative `unit_price` is valid and produces a negative `net_amount` (e.g.
     /// EPEX negative-price hours under §27 EEG 2023).
     ///
     /// # Errors
     /// Returns `Err` if description is empty, quantity is negative, a unit label is
-    /// empty, or neither `fixed_amount` nor `quantity + unit_price` is provided.
+    /// empty, neither `fixed_amount` nor `quantity + unit_price` is provided, a
+    /// BG-29 or BG-27 / BG-28 rule is violated, or any sum overflows.
     pub fn build(self) -> Result<LineItem, BillingError> {
         // A line item without a description is not auditable.
         if self.description.trim().is_empty() {
@@ -879,43 +1516,56 @@ impl LineItemBuilder {
         }
         if let Some(p) = &self.unit_price {
             crate::check_unit("LineItem unit_price", &p.unit)?;
+            // BG-29's own invariants (R046, R121, and the two half-stated pairs).
+            p.validate()?;
         }
-        let net = if let Some(fixed) = self.fixed_amount {
-            fixed
-        } else if let (Some(qty), Some(price)) = (&self.quantity, &self.unit_price) {
-            // Quantity must be non-negative; a negative quantity on a debit or
-            // credit line is a caller error (model refunds via Sign::Credit, not
-            // by negating the quantity).
-            if qty.value < rust_decimal::Decimal::ZERO {
-                return Err(BillingError::InvalidInput {
-                    reason: "LineItem quantity must be non-negative".into(),
-                });
-            }
-            // Negative unit_price is allowed — it produces a negative net amount.
-            // This is correct for spot-market negative prices (e.g. EPEX §27 EEG 2023).
-            //
-            // `Decimal * Decimal` panics on overflow, so the checked form is required
-            // to honour this method's `Result` contract for extreme quantities/prices.
-            let raw = qty
-                .value
-                .checked_mul(price.value)
-                .ok_or(BillingError::MonetaryOverflow {
-                    precision: 5,
-                    input_value: None,
-                })?;
-            Amount::<5>::from_decimal_rounded(raw, crate::RoundingStrategy::MidpointAwayFromZero)?
-        } else {
+        // PEPPOL-EN16931-R130 — needs both BT-130 and BT-150, so neither type can
+        // check it alone.
+        check_price_base_unit(self.quantity.as_ref(), self.unit_price.as_ref())?;
+        if self.fixed_amount.is_none() && (self.quantity.is_none() || self.unit_price.is_none()) {
             return Err(BillingError::InvalidInput {
                 reason: "LineItem requires either fixed_amount or both quantity and unit_price"
                     .into(),
             });
+        }
+        // Quantity must be non-negative; a negative quantity on a debit or credit
+        // line is a caller error (model refunds via Sign::Credit, not by negating
+        // the quantity).
+        if let Some(q) = &self.quantity
+            && q.value < rust_decimal::Decimal::ZERO
+        {
+            return Err(BillingError::InvalidInput {
+                reason: "LineItem quantity must be non-negative".into(),
+            });
+        }
+        // Each BG-27 / BG-28 entry is validated before it reaches the arithmetic —
+        // BR-42 / BR-44 want a reason, and R040 / R041 / R042 apply to a line
+        // allowance exactly as they do to a document level one.
+        for lac in &self.line_allowances {
+            lac.validate()?;
+        }
+        // A stated `fixed_amount` wins over `quantity × unit_price`, so the price
+        // part is only derived when there is no stated amount.
+        //
+        // Negative `unit_price` is allowed and produces a negative net amount —
+        // correct for spot-market negative prices (e.g. EPEX §27 EEG 2023).
+        let price_part = match self.fixed_amount {
+            Some(_) => None,
+            None => exact_price_part(self.quantity.as_ref(), self.unit_price.as_ref())?,
         };
-
-        let net = if self.sign == Sign::Credit && net.is_positive() {
-            -net
-        } else {
-            net
-        };
+        let net = compose_bt131(
+            price_part,
+            &self.line_allowances,
+            self.sign,
+            |exact| {
+                Amount::<5>::from_decimal_rounded(
+                    exact,
+                    crate::RoundingStrategy::MidpointAwayFromZero,
+                )
+            },
+            Ok, // the engine's own precision — the leaves are already `Amount<5>`
+            self.fixed_amount.unwrap_or(Amount::<5>::ZERO),
+        )?;
 
         // A half-stated percentage basis is fatal in Peppol (R041 / R042), and a
         // basis that does not reproduce the amount is fatal under R040. Checked
@@ -925,6 +1575,7 @@ impl LineItemBuilder {
             ac.validate()?;
             ac.check_amount(net)?;
         }
+        check_allowance_nesting(self.allowance_charge.as_ref(), &self.line_allowances)?;
 
         Ok(LineItem {
             description: self.description,
@@ -936,6 +1587,7 @@ impl LineItemBuilder {
             tags: self.tags,
             vat: self.vat,
             allowance_charge: self.allowance_charge,
+            line_allowances: self.line_allowances,
             metadata: self.metadata,
         })
     }
