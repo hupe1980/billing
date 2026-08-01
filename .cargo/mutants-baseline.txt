@@ -1,0 +1,62 @@
+# Mutants that survive the test suite, and why each one is allowed to.
+#
+# `just mutants-gate` runs the full sweep and diffs its survivors against this
+# file. A new survivor fails the gate; so does a listed one that is now caught,
+# because that means the entry is stale and the list should shrink.
+#
+# Line and column numbers are stripped before comparison, so ordinary edits do
+# not churn this file — only a genuine change in what survives does.
+#
+# Blank lines and `#` comments are ignored. Entries are sorted.
+#
+# Nothing here is an `exclude_re`. An exclusion is a permanent blind spot: the
+# regex that hides `builder -> Default::default()` today also hides it once
+# `builder()` starts doing real work. These mutants are still generated, still
+# run, and still reported — they are merely expected.
+#
+# ── Provably equivalent — the rewrite cannot change behaviour ─────────────────
+#
+# `Amount::parse`: at `frac_str.len() == P` the widened branch slices an empty
+# tail, so its `any()` is false and nothing is rejected that was not before.
+src/amount.rs: replace > with >= in Amount<P>::parse
+#
+# `Amount::allocate`: `neg` is read only to re-apply a sign to a magnitude, and
+# the sign of a zero magnitude is not observable.
+src/amount.rs: replace < with <= in Amount<P>::allocate
+#
+# `Amount::round_to_increment`, `Truncate` arm: `value <= 0` differs from
+# `value < 0` only at zero, where `r == 0` makes the `&&` short-circuit anyway.
+src/amount.rs: replace < with <= in Amount<P>::round_to_increment
+#
+# `Amount::exact_to`: a value always fits its own scale, so admitting `Q == P`
+# to the `fits_scale` check adds a case that can only answer "it fits".
+src/amount.rs: replace < with <= in Amount<P>::exact_to
+#
+# `PercentageCharge::compute`, min and max clamps: clamping a value to a bound
+# it already sits on assigns what is already there. The `charge == uncapped`
+# test below compares by value, so the BT-100 / BT-101 decision is unchanged too.
+src/tax.rs: replace < with <= in <impl TaxLayer for PercentageCharge>::compute
+src/tax.rs: replace > with >= in <impl TaxLayer for PercentageCharge>::compute
+#
+# `TaxLayer::covers` and `TaxLayer::breakdown`: the mutant is the default body.
+# (The *other* mutants on these lines — `covers -> false` — are caught.)
+src/tax.rs: replace TaxLayer::covers -> bool with true
+src/tax.rs: replace TaxLayer::breakdown -> Result<Option<TaxBreakdownEntry>, BillingError> with Ok(None)
+#
+# `X::builder()`: every one of these has `XBuilder::default()` as its whole body.
+src/document.rs: replace BillingDocument::builder -> BillingDocumentBuilder with Default::default()
+src/lookup.rs: replace RateLookup::builder -> RateLookupBuilder with Default::default()
+src/tou.rs: replace TimeOfUsePricing::builder -> TimeOfUsePricingBuilder with Default::default()
+src/tou.rs: replace DynamicPricing::builder -> DynamicPricingBuilder with Default::default()
+#
+# ── Unreachable by construction — the branch exists, no input reaches it ──────
+#
+# `split_graduated`: `qty > 0` guards against emitting a zero-quantity tier line,
+# which needs a band of zero width — `cap == band.upper - prev_upper == 0`.
+# `TariffScheduleBuilder::build` refuses that: upper bounds must be strictly
+# increasing, and only the last band may be unbounded. Deserialisation cannot
+# route around it either, because `TariffSchedule` is `#[serde(try_from)]` onto
+# the builder. Verified against both paths rather than assumed — an identical
+# "unreachable" comment in `proportional_split` turned out to be wrong, and the
+# bug it hid is in the 0.11.0 changelog.
+src/schedule.rs: replace > with >= in TariffSchedule::split_graduated

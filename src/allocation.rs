@@ -444,10 +444,15 @@ impl AllocationRule for EqualAllocation {
 ///
 /// # Guarantees
 ///
-/// - `Σ(parts) == total.round_dp(scale)` — exact, no drift.
+/// - `Σ(parts) == total.round_dp(scale)` — exact, no drift, for every input the
+///   share check accepts.
 /// - Each part is rounded to exactly `scale` dp.
-/// - No single part absorbs a disproportionate correction: at most one smallest
-///   unit of adjustment is applied per fraction.
+/// - The correction is spread as evenly as the deficit allows: every fraction
+///   takes the same whole number of units, and only the leftover — fewer units
+///   than there are fractions — is awarded by remainder. Where the fractions sum
+///   to exactly one that leftover *is* the whole deficit, so no part is adjusted
+///   by more than a single unit. Shares that sum slightly under one add a second
+///   unit of deficit per fraction, and it is shared out rather than concentrated.
 ///
 /// # Use cases
 ///
@@ -644,18 +649,36 @@ pub fn proportional_split(
         remainders[b].cmp(&remainders[a]).then_with(|| a.cmp(&b)) // stable tie-break: earlier index first
     });
 
-    if n_units > parts.len() {
-        // Unreachable given the tolerance check above; asserted rather than silently
-        // truncated by `.take()`, which is how the old code lost units.
-        return Err(BillingError::InvalidInput {
-            reason: format!(
-                "proportional_split: deficit of {n_units} units exceeds the {} \
-                 fractions available to absorb it (fractions sum to {sum})",
-                parts.len()
-            ),
-        });
+    // `n_units` can exceed the number of fractions, so one unit each is not always
+    // enough to close the deficit.
+    //
+    // Two independent sources feed it. The floor in step 1 discards up to one unit
+    // per fraction, contributing almost `n` units on its own. The share-sum
+    // tolerance above then admits a `drift_value` worth up to another `n` units —
+    // that is precisely what it was widened to allow. Together they put `n_units`
+    // just under `2n`.
+    //
+    // Three `0.333333333` shares of `25_000_000` at scale 2 is a concrete case: the
+    // deficit is four units across three fractions. Treating that as an error
+    // rejected an input the tolerance check had already accepted, and `.take(n)`
+    // before it silently dropped the fourth unit, leaving Σ(parts) one cent short
+    // of `total` — the exact guarantee this function exists to provide.
+    //
+    // Distributing `n_units / n` to every fraction and the remaining `n_units % n`
+    // in Hamilton order is the same rule, generalised: Σ(parts) reaches `total` for
+    // any `n_units`, and the fractions with the largest discarded remainders are
+    // still the ones served first.
+    // Written without a `base > 0` guard: when the deficit is smaller than the
+    // number of fractions — the ordinary case — `base_units` is zero and the first
+    // loop adds nothing. Guarding it would only trade a no-op pass for a branch
+    // whose two sides are indistinguishable.
+    let n = parts.len();
+    let (base, extra) = (n_units / n, n_units % n);
+    let base_units = unit.checked_mul(Decimal::from(base)).ok_or_else(overflow)?;
+    for part in &mut parts {
+        *part = part.checked_add(base_units).ok_or_else(overflow)?;
     }
-    for &idx in order.iter().take(n_units) {
+    for &idx in order.iter().take(extra) {
         parts[idx] = parts[idx].checked_add(unit).ok_or_else(overflow)?;
     }
 

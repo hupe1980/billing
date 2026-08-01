@@ -1627,4 +1627,62 @@ mod tests {
         let result = std::panic::catch_unwind(|| -Amount::<5>(i64::MIN));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn debug_shows_the_precision_and_the_full_value() {
+        // `Debug` is what every failing `assert_eq!` in this crate and in every
+        // downstream test suite prints. It has to carry `P`, because two amounts
+        // that compare unequal often differ only in the scale they were built at,
+        // and it has to keep the trailing zeros, because that is where the scale
+        // is visible at all.
+        assert_eq!(
+            format!("{:?}", Amount::<5>::parse("1.50000").unwrap()),
+            "Amount<5>(1.50000)"
+        );
+        assert_eq!(
+            format!("{:?}", Amount::<2>::parse("1.50").unwrap()),
+            "Amount<2>(1.50)"
+        );
+        assert_eq!(format!("{:?}", Amount::<5>::ZERO), "Amount<5>(0.00000)");
+        assert_eq!(
+            format!("{:?}", Amount::<5>::parse("-0.00001").unwrap()),
+            "Amount<5>(-0.00001)"
+        );
+        // `Amount<0>` has no fractional part and no trailing dot.
+        assert_eq!(
+            format!("{:?}", Amount::<0>::parse("42").unwrap()),
+            "Amount<0>(42)"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialising_a_non_string_says_what_it_wanted_instead() {
+        // `Amount` is serialised as a decimal string precisely so a JSON number
+        // can never round-trip through an f64. When a payload carries one anyway,
+        // the error has to name the alternative — otherwise "invalid type:
+        // integer" leaves the author of the payload with no idea what to write.
+        let err = serde_json::from_str::<Amount<5>>("42")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a decimal string with at most 5 fractional digits"),
+            "{err}"
+        );
+
+        let err = serde_json::from_str::<Amount<2>>("1.5")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a decimal string with at most 2 fractional digits"),
+            "{err}"
+        );
+
+        // A string with too many digits is rejected by `parse`, with its own
+        // message rather than the visitor's.
+        let err = serde_json::from_str::<Amount<2>>(r#""1.005""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1.005"), "{err}");
+    }
 }

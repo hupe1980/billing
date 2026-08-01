@@ -7,7 +7,7 @@
 use billing::advance::residual_breakdown;
 use billing::prelude::*;
 use billing::{AdvancePayment, FixedRateTax, Prepayment, TaxBreakdownEntry};
-use rust_decimal::dec;
+use rust_decimal::{Decimal, dec};
 
 fn meta(number: &str) -> DocumentMeta {
     DocumentMeta {
@@ -331,6 +331,239 @@ fn document_kind_defaults_to_commercial_invoice_and_carries_untdid_codes() {
     assert_eq!(DocumentKind::PartialConstructionInvoice.code(), 875);
     assert_eq!(DocumentKind::FinalConstructionInvoice.code(), 877);
     assert_eq!(DocumentKind::PrepaymentInvoice.code(), 386);
+}
+
+#[test]
+fn prepayment_is_none_distinguishes_nothing_paid_from_nothing_itemised() {
+    // `Itemised(vec![])` and `Total(0)` both look empty from the outside, but
+    // neither is `None`: they say "advances were considered and came to nothing",
+    // which is what decides whether BT-113 appears on the document at all.
+    assert!(Prepayment::None.is_none());
+    assert!(Prepayment::default().is_none());
+
+    assert!(
+        !Prepayment::total_of(Amount::parse("100.00000").unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !Prepayment::total_of(Amount::parse("0.00000").unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let itemised = Prepayment::itemised(vec![advance("AB-1", "100.00000", "19.00000")]).unwrap();
+    assert!(!itemised.is_none());
+}
+
+#[test]
+fn residual_breakdown_rejects_over_deduction_of_either_base_or_tax() {
+    // The two halves of a breakdown group are checked independently. An advance
+    // that stays within the supply's net but overstates the tax it contained
+    // still understates output tax on the residual — and it is the likelier
+    // mistake of the two, because the net is what a human eyeballs.
+    let full = vec![TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("1000.00000").unwrap(),
+        Amount::parse("190.00000").unwrap(),
+    )];
+
+    // Both halves over-deduct together, because BR-CO-17 ties the tax to the base
+    // at a positive rate.
+    let over = AdvancePayment::new(vec![TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("1500.00000").unwrap(),
+        Amount::parse("285.00000").unwrap(),
+    )])
+    .unwrap();
+    assert!(residual_breakdown(&full, &[over]).is_err());
+
+    // A zero-rated group is where the two halves come apart: the tax is pinned at
+    // zero on both sides, so it never goes negative and the base is the only thing
+    // left that can. Checking the pair jointly instead of independently would let
+    // this through and hand back a residual with a negative taxable base — BR-Z-08
+    // reported as a negative supply.
+    let zero_rated = vec![TaxBreakdownEntry::new(
+        TaxCategory::ZeroRated,
+        Decimal::ZERO,
+        Amount::parse("100.00000").unwrap(),
+        Amount::parse("0.00000").unwrap(),
+    )];
+    let too_much = AdvancePayment::new(vec![TaxBreakdownEntry::new(
+        TaxCategory::ZeroRated,
+        Decimal::ZERO,
+        Amount::parse("200.00000").unwrap(),
+        Amount::parse("0.00000").unwrap(),
+    )])
+    .unwrap();
+    assert!(residual_breakdown(&zero_rated, &[too_much]).is_err());
+
+    // Both within the supply — the deduction stands.
+    let ok = AdvancePayment::new(vec![TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("500.00000").unwrap(),
+        Amount::parse("95.00000").unwrap(),
+    )])
+    .unwrap();
+    let residual = residual_breakdown(&full, &[ok]).unwrap();
+    assert_eq!(residual.len(), 1);
+    assert_eq!(
+        residual[0].taxable_base,
+        Amount::parse("500.00000").unwrap()
+    );
+    assert_eq!(residual[0].tax_amount, Amount::parse("95.00000").unwrap());
+}
+
+#[test]
+fn residual_breakdown_drops_only_groups_that_are_zero_on_both_halves() {
+    // A zero-rated group has a real taxable base and no tax by construction.
+    // Dropping a group the moment *either* half reaches zero would delete it from
+    // the breakdown, and BR-Z-08 requires a zero-rated supply to be reported with
+    // its base — a residual invoice that omits it is not a lawful invoice.
+    let full = vec![
+        TaxBreakdownEntry::new(
+            TaxCategory::Standard,
+            dec!(0.19),
+            Amount::parse("1000.00000").unwrap(),
+            Amount::parse("190.00000").unwrap(),
+        ),
+        TaxBreakdownEntry::new(
+            TaxCategory::ZeroRated,
+            Decimal::ZERO,
+            Amount::parse("400.00000").unwrap(),
+            Amount::parse("0.00000").unwrap(),
+        ),
+    ];
+
+    // Settle the standard-rated group completely; leave the zero-rated one alone.
+    let paid = AdvancePayment::new(vec![TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("1000.00000").unwrap(),
+        Amount::parse("190.00000").unwrap(),
+    )])
+    .unwrap();
+
+    let residual = residual_breakdown(&full, &[paid]).unwrap();
+
+    // The fully settled group goes; the untaxed-but-non-zero one stays.
+    assert_eq!(residual.len(), 1);
+    assert_eq!(residual[0].category, TaxCategory::ZeroRated);
+    assert_eq!(
+        residual[0].taxable_base,
+        Amount::parse("400.00000").unwrap()
+    );
+    assert!(residual[0].tax_amount.is_zero());
+
+    // Settling that one too empties the breakdown entirely.
+    let rest = AdvancePayment::new(vec![TaxBreakdownEntry::new(
+        TaxCategory::ZeroRated,
+        Decimal::ZERO,
+        Amount::parse("400.00000").unwrap(),
+        Amount::parse("0.00000").unwrap(),
+    )])
+    .unwrap();
+    assert!(residual_breakdown(&residual, &[rest]).unwrap().is_empty());
+}
+
+#[test]
+fn document_kind_displays_as_its_untdid_code_and_honours_format_specs() {
+    // `Display` renders the code, not the variant name — an e-invoicing profile
+    // writes BT-3 as the number, so `format!("{kind}")` has to be usable directly.
+    assert_eq!(DocumentKind::CommercialInvoice.to_string(), "380");
+    assert_eq!(DocumentKind::CreditNote.to_string(), "381");
+    assert_eq!(DocumentKind::FinalConstructionInvoice.to_string(), "877");
+
+    // The impl routes through `Formatter::pad` rather than writing directly, so
+    // width, fill and alignment work. A hand-rolled `write!` would silently
+    // ignore all three, which is exactly how fixed-width EDIFACT output breaks.
+    assert_eq!(format!("{:>6}", DocumentKind::CommercialInvoice), "   380");
+    assert_eq!(
+        format!("{:<6}|", DocumentKind::CommercialInvoice),
+        "380   |"
+    );
+    assert_eq!(format!("{:0>6}", DocumentKind::PrepaymentInvoice), "000386");
+    assert_eq!(format!("{:^7}|", DocumentKind::CreditNote), "  381  |");
+
+    // Every variant round-trips through its rendered code.
+    for kind in DocumentKind::ALL {
+        assert_eq!(kind.to_string(), kind.code().to_string());
+    }
+}
+
+#[test]
+fn an_advance_carries_its_invoice_reference_date_and_date_of_receipt() {
+    // BT-25 / BT-26 / BT-X-292. §14 Abs. 5 UStG only obliges deduction where
+    // advance invoices *were issued*, so these three fields are the evidence
+    // that the deduction on the final invoice is lawful — they have to survive
+    // being set, and they have to stay distinct from one another.
+    let plain = advance("AB-1", "100.00000", "19.00000");
+    assert_eq!(plain.reference(), Some("AB-1"));
+    assert_eq!(plain.reference_date(), None);
+    assert_eq!(plain.received_on(), None);
+
+    let dated = plain
+        .clone()
+        .with_reference_date("2026-01-15")
+        .with_received_on("2026-01-31");
+    assert_eq!(dated.reference(), Some("AB-1"));
+    assert_eq!(dated.reference_date(), Some("2026-01-15"));
+    assert_eq!(dated.received_on(), Some("2026-01-31"));
+
+    // Setting one must not disturb the others, and the builder must not mutate
+    // the value it was called on.
+    assert_eq!(plain.reference_date(), None);
+    assert_eq!(plain.received_on(), None);
+    assert_ne!(dated.reference_date(), dated.received_on());
+
+    // Later calls overwrite rather than accumulate.
+    let corrected = dated.with_reference_date("2026-02-01");
+    assert_eq!(corrected.reference_date(), Some("2026-02-01"));
+    assert_eq!(corrected.received_on(), Some("2026-01-31"));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn advance_reference_metadata_survives_a_serde_roundtrip() {
+    // `AdvancePayment` deserialises through `try_from`, which rebuilds the value
+    // field by field. A field left out of that reconstruction is not a
+    // compile error and not a validation failure — it just silently disappears,
+    // taking BT-26 with it. Assert each one back individually.
+    let doc = full_supply("END-15")
+        .with_advances(vec![
+            advance("AB-1", "375.00000", "71.25000")
+                .with_reference_date("2026-01-15")
+                .with_received_on("2026-01-31"),
+        ])
+        .unwrap();
+
+    let json = serde_json::to_string(&doc).unwrap();
+    let back: BillingDocument = serde_json::from_str(&json).unwrap();
+
+    let restored = &back.advances()[0];
+    assert_eq!(restored.reference(), Some("AB-1"));
+    assert_eq!(restored.reference_date(), Some("2026-01-15"));
+    assert_eq!(restored.received_on(), Some("2026-01-31"));
+    assert_eq!(back, doc);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn advance_reference_metadata_is_optional_on_the_way_in() {
+    // The three fields are `#[serde(default)]`, so a payload that omits them
+    // must deserialise to `None` rather than fail — older documents and minimal
+    // hand-written payloads both rely on it.
+    let json = r#"{"tax":[{"category":"Standard","rate":"0.19",
+                   "taxable_base":"100.00000","tax_amount":"19.00000"}]}"#;
+    let advance: AdvancePayment = serde_json::from_str(json).unwrap();
+    assert_eq!(advance.reference(), None);
+    assert_eq!(advance.reference_date(), None);
+    assert_eq!(advance.received_on(), None);
+    assert_eq!(advance.tax().len(), 1);
+    assert_eq!(advance.net(), Amount::parse("100.00000").unwrap());
 }
 
 #[cfg(feature = "serde")]

@@ -130,6 +130,52 @@ jobs:
       - uses: actions/checkout@v4
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
+  # ── Mutation testing (incremental) ──────────────────────────────────────────
+  # Coverage proves a line ran. This proves someone would notice if it were
+  # wrong: cargo-mutants rewrites the code — flipping `<` to `<=`, replacing a
+  # rounding result with its default, deleting a guard — and fails if the suite
+  # still passes. For a billing engine that is the difference between "the VAT
+  # code is exercised" and "the VAT code is checked".
+  #
+  # Scoped to the pull request diff so it stays a fast gate. The whole crate is
+  # swept by the separate `mutants.yml` workflow.
+  mutants:
+    name: Mutation testing (diff)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [fmt, clippy]
+    env:
+      # cargo-mutants deliberately generates code that is dead, unused or
+      # unreachable. Those warnings describe the mutant, not the crate, and the
+      # clippy job above already holds the real line.
+      RUSTFLAGS: ""
+      RUSTDOCFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # --in-diff needs the merge base, not just the tip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          # `just` so this job runs the *same* baseline check as `just mutants-gate`
+          # locally. Two implementations of "is this survivor expected?" would
+          # drift, and the one that drifts silently is the one in CI.
+          tool: cargo-mutants,just
+      - name: Diff against the base branch
+        run: git diff origin/${{ github.base_ref }}.. | tee mutants.diff
+      - name: Mutate the changed lines
+        # Survivors already recorded in .cargo/mutants-baseline.txt do not fail
+        # the build — otherwise editing any line near a known-equivalent mutant
+        # would turn a no-op change red. Anything unrecorded does fail.
+        run: just mutants-diff-gate mutants.diff
+      - name: Archive mutants.out
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-incremental.out
+          path: target/mutants-diff
+
   # ── Benchmarks ──────────────────────────────────────────────────────────────
   # Compile-only: benchmark timings are too noisy on shared runners to gate on,
   # but a benchmark that no longer builds is a real break.

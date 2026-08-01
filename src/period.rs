@@ -362,4 +362,44 @@ mod tests {
         assert_eq!(merged.net_total(), Amount::parse("150.00000").unwrap());
         assert_eq!(merged.net_positions().len(), 2);
     }
+
+    #[test]
+    fn is_ordered_declines_anything_that_is_not_a_zero_padded_iso_date() {
+        // A lexicographic compare orders `YYYY-MM-DD` the way a calendar does and
+        // orders nothing else correctly — `01.06.2026` sorts after `30.06.2025`.
+        // So the shape check has to be exact in both directions, and it has to
+        // hold for *both* endpoints. Returning `Some` for a string it merely
+        // guessed at is worse than returning `None`: BR-29 would then be checked
+        // against an ordering that means nothing.
+        assert_eq!(
+            Period::new("2026-06-01", "2026-06-30").is_ordered(),
+            Some(true)
+        );
+
+        // Right length, wrong separators — the length alone must not be enough.
+        assert_eq!(Period::new("2026/06/01", "2026/06/30").is_ordered(), None);
+        assert_eq!(Period::new("2026-06-01", "2026/06/30").is_ordered(), None);
+        // Right shape at every position it has, but not ten characters — the
+        // pattern alone must not be enough either.
+        assert_eq!(Period::new("2026-06-0", "2026-06-3").is_ordered(), None);
+        assert_eq!(Period::new("2026-06-011", "2026-06-030").is_ordered(), None);
+        // Digits where the separators belong.
+        assert_eq!(Period::new("2026060111", "2026063011").is_ordered(), None);
+
+        // One good endpoint does not carry the other.
+        assert_eq!(Period::new("2026-06-01", "30.6.2026").is_ordered(), None);
+        assert_eq!(Period::new("1.6.2026", "2026-06-30").is_ordered(), None);
+        assert_eq!(Period::new("2026-06-01", "").is_ordered(), None);
+        assert_eq!(Period::new("", "2026-06-30").is_ordered(), None);
+
+        // And when both are ISO, the comparison itself is inclusive at equality.
+        assert_eq!(
+            Period::new("2026-06-30", "2026-06-01").is_ordered(),
+            Some(false)
+        );
+        assert_eq!(
+            Period::new("2026-06-01", "2026-06-01").is_ordered(),
+            Some(true)
+        );
+    }
 }

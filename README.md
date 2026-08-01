@@ -13,6 +13,12 @@
 maths — graduated pricing, compound taxes, proportional allocation, exact
 rounding — and leaves every domain decision to your crate.
 
+Need to *emit* the invoice as well as compute it? Pair it with
+[`en16931`](https://crates.io/crates/en16931) for the semantic model and its
+business rules, and [`en16931-formats`](https://crates.io/crates/en16931-formats)
+for UBL, CII, XRechnung and ZUGFeRD / Factur-X — see
+[The layer above](#the-layer-above-en16931). Neither is a dependency of this crate.
+
 > **Every Rust example in this README is compiled and run as a doctest.**
 > If it appears here, it works against the current release.
 
@@ -1694,8 +1700,10 @@ assert!(ProportionalAllocation::new(vec![dec!(1.5), dec!(-0.5)]).is_err());
 For splits that happen *before* a document exists — e.g. distributing kWh
 among tenants, or splitting a capacity block — use `proportional_split`.
 It uses the **Largest-Remainder (Hamilton) method**, guaranteeing
-`Σ(parts) == total` with at most one unit of adjustment per fraction
-(no single entry absorbs the full deficit).
+`Σ(parts) == total` for every input the share check accepts, with the correction
+spread as evenly as the deficit allows — no single entry absorbs it. Where the
+fractions sum to exactly one, that means at most one unit of adjustment per
+fraction.
 
 ```rust
 use billing::proportional_split;
@@ -1962,7 +1970,8 @@ decimals.
 ### What is still missing for a valid XRechnung
 
 Precision is the deepest gap but not the only one. To emit a document that passes
-the KoSIT validator you also need, in your own mapping layer:
+the KoSIT validator you also need the following — in your own mapping layer, or by
+handing off to [`en16931`](#the-layer-above-en16931), which models all of it:
 
 | Gap | What EN 16931 / XRechnung requires | Status here |
 |-----|-----------------------------------|-------------|
@@ -1996,8 +2005,35 @@ the UN/ECE Rec 20 and UNTDID code lists, and Schematron conformance fixtures to 
 trustworthy — none of which a pricing engine should carry, and all of which move on
 a different release cadence (XRechnung 4.0, implementing EN 16931-1:2026, is
 expected during 2026). Keeping it out means this crate does not inherit that
-cadence. Build it on top: this crate gives you amounts that are already
-representable, which is the part that is hard to get right.
+cadence.
+
+### The layer above: `en16931`
+
+That separate crate exists. [**`en16931`**](https://github.com/hupe1980/en16931)
+carries the EN 16931 semantic model and its 316 business rules as Rust types,
+validating the *model* rather than a serialised document — so a finding names
+BT-151 on line 3 instead of an XPath. Its companion **`en16931-formats`** does the
+serialisation this crate refuses: UBL 2.1 and UN/CEFACT CII in both directions, the
+XRechnung CIUS, and ZUGFeRD / Factur-X hybrid PDFs.
+
+The division of labour is the one this README argues for throughout:
+
+| Crate | Answers |
+|-------|---------|
+| **`billing`** | *What are the amounts?* Tariffs, metering, tax and discount layers, allocation, and every total exactly representable at the scale you will emit |
+| [**`en16931`**](https://crates.io/crates/en16931) | *Is this a lawful invoice?* The semantic model and the business rules, checked against the model |
+| [**`en16931-formats`**](https://crates.io/crates/en16931-formats) | *How does it go on the wire?* UBL, CII, XRechnung, ZUGFeRD / Factur-X |
+
+They are separate dependencies, not a framework: `billing` has no knowledge of
+them and does not depend on them. Use it alone if you only need the arithmetic.
+Both are younger than this crate and track a faster-moving target — XRechnung 4.0,
+implementing EN 16931-1:2026, is expected during 2026 — which is precisely the
+reason they are not merged into it.
+
+What `billing` contributes to that stack is the part that is hard to retrofit:
+amounts that are already representable at the target scale. A validator can tell
+you `BT-112 ≠ BT-109 + BT-110`; it cannot tell you which rounding decision three
+layers ago made them disagree.
 
 ---
 
@@ -2081,6 +2117,13 @@ assert!(serde_json::from_str::<BillingDocument>(tampered_json).is_err());
 | `money2` | Rust | Currency exchange only; no billing engine |
 | `use-invoice` | Rust | Basic invoice primitives; no tariff calculation |
 
+Not a competitor but a **companion**, by the same author:
+[`en16931`](https://crates.io/crates/en16931) (semantic model + business rules) and
+[`en16931-formats`](https://crates.io/crates/en16931-formats) (UBL, CII, XRechnung,
+ZUGFeRD / Factur-X). `billing` computes the amounts; those two decide whether the
+document is lawful and put it on the wire. See
+[The layer above](#the-layer-above-en16931).
+
 ---
 
 ## 🛠️ Development
@@ -2096,15 +2139,107 @@ just lint            # cargo clippy -D warnings
 just doc             # build & open docs
 just examples        # run all three examples
 just bench           # criterion benchmarks
+just mutants-gate    # full mutation sweep, pass/fail (slow — see below)
+just mutants-diff    # mutate only what your branch changed
 just release 0.7.0   # create an annotated git tag
 ```
 
-Correctness is covered at three levels: ~400 example-based tests, **property-based
-tests** (`proptest`) asserting the algebraic laws — money is conserved by every
-split, rounding is idempotent and bounded, allocation and reversal preserve every
-total — and every README example compiled as a doctest.
-
 All available tasks: `just --list`
+
+### How correctness is checked
+
+Four levels, each answering a question the one before it cannot:
+
+| Level | Question it answers |
+|-------|---------------------|
+| ~670 example-based tests | Does this input produce that output? |
+| **Property tests** (`proptest`) | Do the algebraic laws hold for *every* input? Money is conserved by every split, rounding is idempotent and bounded, allocation and reversal preserve every total. |
+| Every README example as a doctest | Does the documentation still compile and still say something true? |
+| **Mutation testing** (`cargo-mutants`) | Would any test fail if the code were wrong? |
+
+The fourth is the one that grades the other three. Coverage reports whether a line
+*ran*; mutation testing rewrites the line — flipping `<` to `<=`, replacing a
+computed amount with its default, deleting a guard — and reports every rewrite the
+suite still accepts. In a billing engine that distinction is the whole game: a
+rounding rule, a tolerance bound or a comparison operator can be executed by every
+test in the suite and still be silently wrong.
+
+It is not a hypothetical. The `proportional_split` deficit bug fixed in 0.11.0 was
+found this way, under a comment asserting the branch was unreachable. The property
+test covering that function conserved the total and passed, because the function
+returned an error rather than a wrong answer — and "errors instead of splitting" is
+not something a conservation law can see.
+
+It also grades the other three levels. That property test built its fractions to
+sum to *exactly* one, which is precisely the region where the bug cannot occur, so
+it could never have failed however long it ran; a second one drew allocation ratios
+from `1..1000`, so a recipient allocated nothing never appeared. Both generators
+were widened in 0.11.0. A property is only as strong as the inputs it is allowed to
+draw, and nothing but a deliberate look tells you which region it never reaches.
+
+```sh
+cargo install cargo-mutants --locked
+
+just mutants-gate           # whole crate, pass/fail — run before a release
+just mutants-diff           # only the lines your branch touched — the pre-push check
+just mutants-file src/vat.rs   # one file, while writing the tests to kill its survivors
+just mutants-iterate        # re-run only what was missed last time
+just mutants                # whole crate, report only
+```
+
+Configuration lives in [`.cargo/mutants.toml`](.cargo/mutants.toml), which also
+records why each setting is what it is.
+
+Current state — 958 mutants generated, 221 not viable (they do not compile):
+
+| | |
+|---|---|
+| **Caught** | 724 |
+| **Survived** | 13 |
+| **Score** | **98.2 %** of the viable set |
+
+### The gate
+
+`just mutants` reports; **`just mutants-gate` decides.** It runs the sweep and
+diffs the survivors against [`.cargo/mutants-baseline.txt`](.cargo/mutants-baseline.txt),
+which lists every tolerated survivor *with the reason it is tolerated*. The gate
+fails two ways, and both matter:
+
+- a mutant survives that is **not** recorded — a genuine new gap;
+- a **recorded** one no longer survives — the entry is stale, and the list should
+  shrink.
+
+Line and column numbers are stripped before the comparison, so ordinary edits do
+not churn the baseline; only a real change in what survives does.
+
+Nothing is suppressed with `exclude_re`. An exclusion is a permanent blind spot —
+the regex that hides `builder -> Default::default()` today also hides it once
+`builder()` starts doing real work. Every mutant is still generated, still run and
+still reported; the baseline only says which results are expected.
+
+Of the 13 recorded survivors, eleven are **provably equivalent** — `X::builder()`
+whose entire body *is* `Default::default()`, or a `<` → `<=` whose extra case
+assigns a value already there — and two sit in branches no input reaches. Both of
+the latter were checked against every construction path, including deserialisation,
+rather than assumed: an identical "unreachable" comment in `proportional_split`
+turned out to be wrong, and the bug it hid is in the 0.11.0 changelog.
+
+**CI runs the diff-scoped check only.** A full sweep takes tens of minutes and
+belongs on a developer's machine, not on the pull-request path; what CI enforces is
+that *newly written or changed* lines come with tests that would notice if they
+were wrong.
+
+What that does **not** catch, and `just mutants-gate` before a release does:
+
+- a pull request that only **deletes tests** — no source line changed, so no mutant
+  is generated and the job passes on an empty set;
+- a change that weakens coverage **elsewhere** — mutants are only generated for the
+  lines in the diff, and a refactor can strand a test that used to cover something
+  the diff never touches.
+
+Incremental checks are a fast filter, not a proof. The book that ships with
+cargo-mutants [says the same](https://mutants.rs/pr-diff.html), and it is worth
+repeating because a green tick invites the opposite conclusion.
 
 ---
 

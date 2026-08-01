@@ -554,4 +554,96 @@ mod tests {
         assert_eq!(item.unit_label(), Some("kWh"));
         assert_eq!(item.net_amount, Amount::parse("50.00000").unwrap());
     }
+
+    #[test]
+    fn the_plural_band_setter_and_the_currency_reach_the_built_pricing() {
+        // `bands` and `currency` are the two builder steps nothing else in the
+        // suite goes through — every other test appends bands one at a time and
+        // leaves the currency at its default. A setter that dropped what it was
+        // handed would leave `XXX/kWh` on the invoice, which reads as a price and
+        // is not one.
+        let pricing = TimeOfUsePricing::builder()
+            .unit("kWh")
+            .currency(Currency::EUR)
+            .bands([
+                TouBand::new("peak", Amount::parse("0.35000").unwrap()),
+                TouBand::new("offpeak", Amount::parse("0.22000").unwrap()),
+            ])
+            .band(TouBand::new("night", Amount::parse("0.15000").unwrap()))
+            .build()
+            .unwrap();
+
+        // All three arrived, in declaration order, with the plural setter's bands
+        // first because it was called first.
+        assert_eq!(
+            pricing.band_names().collect::<Vec<_>>(),
+            ["peak", "offpeak", "night"]
+        );
+        assert_eq!(pricing.unit(), "kWh");
+        assert_eq!(pricing.currency(), Currency::EUR);
+        assert_ne!(pricing.currency(), Currency::default());
+
+        // And the price labels carry that currency rather than the placeholder.
+        let items = pricing
+            .calculate(&[
+                ("peak", dec!(300)),
+                ("offpeak", dec!(700)),
+                ("night", dec!(100)),
+            ])
+            .unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].unit_price.as_ref().unwrap().unit, "EUR/kWh");
+        // 300 x 0.35 + 700 x 0.22 + 100 x 0.15 = 105 + 154 + 15 = 274.
+        let total: Amount<5> = items.iter().map(|i| i.net_amount).sum();
+        assert_eq!(total, Amount::parse("274.00000").unwrap());
+
+        // An empty plural call is a no-op, not a reset.
+        let still_there = TimeOfUsePricing::builder()
+            .unit("kWh")
+            .band(TouBand::new("flat", Amount::parse("0.30000").unwrap()))
+            .bands([])
+            .build()
+            .unwrap();
+        assert_eq!(still_there.band_names().collect::<Vec<_>>(), ["flat"]);
+    }
+
+    #[test]
+    fn dynamic_pricing_plural_intervals_and_currency_reach_the_built_value() {
+        // The same pair as the time-of-use builder: `intervals` and `currency` are
+        // the steps the rest of the suite never takes. A weighted-average price
+        // labelled `XXX/kWh` is the visible symptom, and it appears on the invoice
+        // rather than in any assertion.
+        let dp = DynamicPricing::builder()
+            .unit("kWh")
+            .currency(Currency::EUR)
+            .intervals([
+                (dec!(100), Amount::parse("0.10000").unwrap()),
+                (dec!(200), Amount::parse("0.20000").unwrap()),
+            ])
+            .interval(dec!(100), Amount::parse("0.30000").unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(dp.unit(), "kWh");
+        assert_eq!(dp.currency(), Currency::EUR);
+        assert_ne!(dp.currency(), Currency::default());
+
+        // 100 x 0.10 + 200 x 0.20 + 100 x 0.30 = 10 + 40 + 30 = 80 over 400 kWh.
+        let item = dp.calculate().unwrap();
+        assert_eq!(item.quantity_value(), Some(dec!(400)));
+        assert_eq!(item.net_amount, Amount::parse("80.00000").unwrap());
+        assert_eq!(item.unit_price.as_ref().unwrap().unit, "EUR/kWh (wtd avg)");
+
+        // An empty plural call adds nothing and removes nothing.
+        let kept = DynamicPricing::builder()
+            .unit("kWh")
+            .interval(dec!(10), Amount::parse("0.50000").unwrap())
+            .intervals([])
+            .build()
+            .unwrap();
+        assert_eq!(
+            kept.calculate().unwrap().net_amount,
+            Amount::parse("5.00000").unwrap()
+        );
+    }
 }

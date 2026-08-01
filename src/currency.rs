@@ -285,4 +285,66 @@ mod tests {
         let c: Currency = "gbp".parse().unwrap();
         assert_eq!(c.to_string(), "GBP");
     }
+
+    #[test]
+    fn every_conversion_entry_point_validates() {
+        // `FromStr`, `TryFrom<&str>` and `new` are three doors into the same
+        // check. A door that returns the default instead of the parsed code is
+        // the worst possible failure here, because `Currency::default()` is XXX
+        // — "no currency" — and a document labelled XXX still validates.
+        assert_eq!(Currency::try_from("EUR").unwrap(), Currency::EUR);
+        assert_eq!(Currency::try_from("usd").unwrap(), Currency::USD);
+        assert_ne!(Currency::try_from("EUR").unwrap(), Currency::default());
+        assert!(Currency::try_from("EURO").is_err());
+        assert!(Currency::try_from("").is_err());
+
+        assert_eq!("JPY".parse::<Currency>().unwrap(), Currency::JPY);
+        assert!("JP".parse::<Currency>().is_err());
+    }
+
+    #[test]
+    fn debug_names_the_type_and_the_code() {
+        // `Currency(EUR)` rather than the derived `Currency { code: [69,85,82] }`
+        // — the byte array is what a reader sees in a failing assertion message,
+        // and it is unreadable.
+        assert_eq!(format!("{:?}", Currency::EUR), "Currency(EUR)");
+        assert_eq!(format!("{:?}", Currency::default()), "Currency(XXX)");
+        assert_eq!(
+            format!("{:?}", Currency::new("chf").unwrap()),
+            "Currency(CHF)"
+        );
+    }
+
+    #[test]
+    fn minor_unit_increment_spans_the_scale_it_exactly_fits() {
+        // The increment exists whenever the currency's minor units fit within
+        // `P`, including when they use it up exactly. Requiring headroom would
+        // silently drop cash rounding for every 2-decimal currency assembled at
+        // `Amount<2>` — the natural scale for an EN 16931 document.
+        assert_eq!(
+            Currency::EUR.minor_unit_increment::<2>(),
+            Some(crate::Amount::<2>::parse("0.01").unwrap())
+        );
+        assert_eq!(
+            Currency::EUR.minor_unit_increment::<5>(),
+            Some(crate::Amount::<5>::parse("0.01000").unwrap())
+        );
+
+        // JPY has zero minor units, so it fits every scale down to `Amount<0>`.
+        assert_eq!(
+            Currency::JPY.minor_unit_increment::<0>(),
+            Some(crate::Amount::<0>::parse("1").unwrap())
+        );
+
+        // CLF has four; it fits at 4 and above, and not below.
+        let clf = Currency::new("CLF").unwrap();
+        assert_eq!(
+            clf.minor_unit_increment::<4>(),
+            Some(crate::Amount::<4>::parse("0.0001").unwrap())
+        );
+        assert_eq!(clf.minor_unit_increment::<3>(), None);
+
+        // XXX has no minor units at all, at any scale.
+        assert_eq!(Currency::XXX.minor_unit_increment::<5>(), None);
+    }
 }

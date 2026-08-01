@@ -1,0 +1,45 @@
+# cargo-mutants configuration — https://mutants.rs/
+#
+# Mutation testing answers the question the coverage report cannot: not "was
+# this line executed?" but "would anyone notice if it were wrong?". For a
+# billing engine that is the only question that matters — a rounding rule, a
+# comparison operator or a tolerance bound can all be executed by the tests and
+# still be silently incorrect.
+#
+# Run it with `just mutants` (see justfile). Schema: `cargo mutants --emit-schema=config`.
+
+# `serde` gates a large, invariant-critical surface (every validated type
+# re-runs its checks in `try_from` on deserialisation). Without this the whole
+# module would be invisible to both the mutator and the tests.
+all_features = true
+
+# Mutants routinely produce dead code, unused bindings and unreachable
+# branches. Those are warnings about the *mutant*, not about the crate, and the
+# crate's own `-D warnings` gates already run in CI. Capping lints keeps a
+# mutant from being scored "unviable" for a reason that has nothing to do with
+# whether the tests would have caught it.
+cap_lints = true
+
+# The baseline suite runs in about a second, so the auto-derived timeout
+# (5 × baseline) would land at the 20 s floor. Mutating a loop bound or a
+# `while` condition can produce a genuine non-terminating mutant; a slightly
+# higher floor keeps a cold cache or a loaded CI runner from reporting that as
+# a timeout when it is really just slow.
+minimum_test_timeout = 30
+
+# Mutating an argument to `with_capacity` swaps one preallocation size for
+# another. The result is always correct and only ever differs in how many times
+# a `Vec` reallocates, so no test can — or should — distinguish it.
+skip_calls_defaults = true
+
+# ── Known survivors ───────────────────────────────────────────────────────────
+#
+# There is deliberately no `exclude_re` here. An exclusion is a permanent blind
+# spot: the regex that hides `builder -> Default::default()` today also hides it
+# once `builder()` starts doing real work. Every mutant is generated, run and
+# reported.
+#
+# The survivors the project tolerates — and the reason each one is tolerated —
+# are recorded in `.cargo/mutants-baseline.txt`, which `just mutants-gate` diffs
+# the run against. A new survivor fails the gate; so does a recorded one that is
+# now caught.

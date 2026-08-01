@@ -208,3 +208,43 @@ impl From<std::convert::Infallible> for BillingError {
         match x {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Amount;
+    use std::error::Error as _;
+
+    #[test]
+    fn a_parse_failure_keeps_its_cause_in_the_error_chain() {
+        // `BillingError::Parse` wraps the underlying `ParseAmountError`, and
+        // callers using `anyhow`, `eyre` or a plain `while let Some(e) = e.source()`
+        // loop rely on that link to report *why* the string was rejected. A
+        // `source()` that returned `None` still prints a sensible top-level
+        // message, so nothing in an ordinary test would notice the chain was cut.
+        let inner = Amount::<2>::parse("1.005").unwrap_err();
+        let expected = inner.to_string();
+        let err = BillingError::from(inner);
+
+        let source = err.source().expect("Parse must expose its cause");
+        assert_eq!(source.to_string(), expected);
+
+        // Variants that wrap nothing report nothing, rather than pointing at
+        // themselves and producing a cycle.
+        assert!(
+            BillingError::InvalidInput {
+                reason: "no cause".into(),
+            }
+            .source()
+            .is_none()
+        );
+        assert!(
+            BillingError::MonetaryOverflow {
+                precision: 5,
+                input_value: None,
+            }
+            .source()
+            .is_none()
+        );
+    }
+}

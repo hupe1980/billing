@@ -301,6 +301,35 @@ fn graduated_exact_tier_boundary_uses_lower_price() {
 }
 
 #[test]
+fn graduated_tiers_are_numbered_from_one_on_the_invoice() {
+    // The generated descriptions are what the customer reads. They are also the
+    // only place the tier index appears, so an off-by-one here prints "Tier 0"
+    // on a real invoice while every amount in the document stays correct.
+    let sched = graduated_two_band();
+    let items = sched.split(dec!(1234.5)).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].description, "Tier 1 (up to 500 kWh)");
+    assert_eq!(items[1].description, "Tier 2 (over 500 kWh)");
+
+    // A caller-supplied description replaces the generated one outright.
+    let named = TariffSchedule::graduated()
+        .unit("kWh")
+        .band(
+            TariffBand::up_to(dec!(500), Amount::parse("0.32000").unwrap())
+                .with_description("Grundkontingent"),
+        )
+        .band(TariffBand::over(
+            dec!(500),
+            Amount::parse("0.28000").unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let items = named.split(dec!(1234.5)).unwrap();
+    assert_eq!(items[0].description, "Grundkontingent");
+    assert_eq!(items[1].description, "Tier 2 (over 500 kWh)");
+}
+
+#[test]
 fn graduated_zero_quantity_returns_empty() {
     let sched = graduated_two_band();
     let items = sched.split(dec!(0)).unwrap();
@@ -1501,6 +1530,35 @@ fn prorate_amount_active_exceeds_total_is_error() {
         RoundingStrategy::MidpointAwayFromZero,
     );
     assert!(result.is_err(), "active_days > total_days must be Err");
+}
+
+#[test]
+fn prorate_amount_over_the_whole_period_is_the_whole_amount() {
+    // `active_days == total_days` is the ordinary case, not the error case: a
+    // customer present for the entire month pays the full standing charge. It is
+    // also the boundary the exceeds-total check sits on, and a check that fired
+    // one day early would reject every unprorated line that happened to go
+    // through this function.
+    let amount = Amount::parse("100.00000").unwrap();
+    for days in [1u32, 28, 30, 31, 365] {
+        assert_eq!(
+            prorate_amount(amount, days, days, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+            amount,
+            "{days}/{days} must be the full amount"
+        );
+    }
+
+    // One day past it is still refused.
+    assert!(
+        prorate_amount(amount, 31, 30, RoundingStrategy::MidpointAwayFromZero).is_err(),
+        "one day beyond the period must be Err"
+    );
+
+    // And none of the period is none of the amount.
+    assert_eq!(
+        prorate_amount(amount, 0, 30, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+        Amount::ZERO
+    );
 }
 
 #[test]
@@ -5481,4 +5539,281 @@ fn rate_lookup_empty_builder_returns_err_not_panics() {
             "error reason should explain the requirement"
         );
     }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Exact behaviour the property tests cannot pin down
+//
+// The `proptest` suite asserts the algebraic laws — cash rounding is idempotent,
+// lands on a multiple and never moves more than one increment; allocation
+// conserves the total. Every one of those laws holds just as well for a *wrong*
+// answer that rounds the other way or hands the odd cent to the wrong recipient.
+// These tests fix the direction and the recipient.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[test]
+fn cash_rounding_truncates_toward_zero_on_both_sides_of_zero() {
+    // `Truncate` means "toward zero", which is a different direction above and
+    // below zero — `Floor` and `Truncate` agree on positives and disagree on
+    // negatives. A credit note is where that shows up: rounding -1.03 down to
+    // -1.05 hands the customer a extra two cents that the corresponding invoice
+    // never charged.
+    let five_cents = Amount::<2>::parse("0.05").unwrap();
+
+    let cases = [
+        // (value, Truncate, Floor, Ceiling)
+        ("1.03", "1.00", "1.00", "1.05"),
+        ("-1.03", "-1.00", "-1.05", "-1.00"),
+        ("-1.07", "-1.05", "-1.10", "-1.05"),
+        ("2.00", "2.00", "2.00", "2.00"),
+        ("-2.00", "-2.00", "-2.00", "-2.00"),
+    ];
+
+    for (value, truncate, floor, ceiling) in cases {
+        let a = Amount::<2>::parse(value).unwrap();
+        for (strategy, expected) in [
+            (RoundingStrategy::Truncate, truncate),
+            (RoundingStrategy::Floor, floor),
+            (RoundingStrategy::Ceiling, ceiling),
+        ] {
+            assert_eq!(
+                a.round_to_increment(five_cents, strategy).unwrap(),
+                Amount::<2>::parse(expected).unwrap(),
+                "{value} under {strategy:?}"
+            );
+        }
+    }
+
+    // Exactly on a multiple, every strategy is a no-op — this is what keeps
+    // `Truncate` from stepping a negative multiple up by one increment.
+    for value in ["1.05", "-1.05", "0.00"] {
+        let a = Amount::<2>::parse(value).unwrap();
+        for strategy in [
+            RoundingStrategy::Truncate,
+            RoundingStrategy::Floor,
+            RoundingStrategy::Ceiling,
+            RoundingStrategy::MidpointAwayFromZero,
+            RoundingStrategy::MidpointToEven,
+        ] {
+            assert_eq!(a.round_to_increment(five_cents, strategy).unwrap(), a);
+        }
+    }
+}
+
+#[test]
+fn cash_rounding_at_the_midpoint_breaks_ties_to_the_even_multiple() {
+    // `MidpointToEven` is the banker's rule: at an exact half-increment it picks
+    // whichever neighbour is an even *multiple of the increment*, not an even
+    // amount. Getting that backwards is invisible to every property the suite
+    // asserts — the result still lands on a multiple, within one increment — and
+    // biases a large batch of roundings in one direction.
+    let half_euro = Amount::<2>::parse("0.50").unwrap();
+
+    // 1.25 sits halfway between multiples 2 (1.00) and 3 (1.50). 2 is even.
+    let quarter = Amount::<2>::parse("1.25").unwrap();
+    assert_eq!(
+        quarter
+            .round_to_increment(half_euro, RoundingStrategy::MidpointToEven)
+            .unwrap(),
+        Amount::<2>::parse("1.00").unwrap()
+    );
+    // 1.75 sits halfway between multiples 3 (1.50) and 4 (2.00). 4 is even.
+    let three_quarter = Amount::<2>::parse("1.75").unwrap();
+    assert_eq!(
+        three_quarter
+            .round_to_increment(half_euro, RoundingStrategy::MidpointToEven)
+            .unwrap(),
+        Amount::<2>::parse("2.00").unwrap()
+    );
+
+    // The other midpoint rule always steps away from zero, so it disagrees with
+    // banker's rounding on exactly one of the two.
+    assert_eq!(
+        quarter
+            .round_to_increment(half_euro, RoundingStrategy::MidpointAwayFromZero)
+            .unwrap(),
+        Amount::<2>::parse("1.50").unwrap()
+    );
+    assert_eq!(
+        three_quarter
+            .round_to_increment(half_euro, RoundingStrategy::MidpointAwayFromZero)
+            .unwrap(),
+        Amount::<2>::parse("2.00").unwrap()
+    );
+
+    // Negative midpoints mirror: -1.25 goes to the even multiple -1.00, while
+    // away-from-zero takes it to -1.50.
+    let neg = Amount::<2>::parse("-1.25").unwrap();
+    assert_eq!(
+        neg.round_to_increment(half_euro, RoundingStrategy::MidpointToEven)
+            .unwrap(),
+        Amount::<2>::parse("-1.00").unwrap()
+    );
+    assert_eq!(
+        neg.round_to_increment(half_euro, RoundingStrategy::MidpointAwayFromZero)
+            .unwrap(),
+        Amount::<2>::parse("-1.50").unwrap()
+    );
+}
+
+#[test]
+fn allocate_gives_the_odd_unit_to_the_largest_true_remainder() {
+    // Hamilton's rule ranks recipients by the fraction the floor discarded, not
+    // by the size of their share. Ranking by the quotient instead still conserves
+    // the total — so the conservation property passes — but pays the odd cent to
+    // the biggest recipient every time, which over a year is a systematic
+    // transfer rather than a rounding artefact.
+    //
+    // 1.00 by 1:2:3 floors to 0.16 / 0.33 / 0.50 = 0.99, one cent short.
+    // Discarded fractions are 4/6, 2/6, 0/6 — the *smallest* share has the
+    // largest remainder and takes the cent.
+    let parts = Amount::<2>::parse("1.00")
+        .unwrap()
+        .allocate(&[1, 2, 3])
+        .unwrap();
+    assert_eq!(
+        parts,
+        vec![
+            Amount::<2>::parse("0.17").unwrap(),
+            Amount::<2>::parse("0.33").unwrap(),
+            Amount::<2>::parse("0.50").unwrap(),
+        ]
+    );
+    assert_eq!(
+        parts.iter().copied().sum::<Amount<2>>(),
+        Amount::<2>::parse("1.00").unwrap()
+    );
+
+    // Reversing the ratios reverses which recipient is short-changed by the
+    // floor, and the cent follows the remainder rather than the position.
+    let reversed = Amount::<2>::parse("1.00")
+        .unwrap()
+        .allocate(&[3, 2, 1])
+        .unwrap();
+    assert_eq!(
+        reversed,
+        vec![
+            Amount::<2>::parse("0.50").unwrap(),
+            Amount::<2>::parse("0.33").unwrap(),
+            Amount::<2>::parse("0.17").unwrap(),
+        ]
+    );
+
+    // Negative totals allocate by magnitude and keep the sign on every part.
+    let credit = Amount::<2>::parse("-1.00")
+        .unwrap()
+        .allocate(&[1, 2, 3])
+        .unwrap();
+    assert_eq!(
+        credit,
+        vec![
+            Amount::<2>::parse("-0.17").unwrap(),
+            Amount::<2>::parse("-0.33").unwrap(),
+            Amount::<2>::parse("-0.50").unwrap(),
+        ]
+    );
+
+    // An exact division leaves no remainder to award.
+    let exact = Amount::<2>::parse("0.60")
+        .unwrap()
+        .allocate(&[1, 1, 1])
+        .unwrap();
+    assert_eq!(exact, vec![Amount::<2>::parse("0.20").unwrap(); 3]);
+}
+
+#[test]
+fn allocate_gives_a_zero_ratio_nothing_at_all() {
+    // A recipient allocated nothing is an ordinary input, not an error: a tenant
+    // who moved in mid-period, a cost centre switched off for the month. The
+    // sibling case in `proportional_split` had the same hole.
+    //
+    // The risk is specific. Largest-remainder distribution hands spare units to
+    // whoever the floor short-changed most, and a zero ratio is short-changed by
+    // nothing — so it must never be served, even when there are units going
+    // begging. A cent paid to a recipient owed zero is a cent taken from one owed
+    // something.
+    let parts = Amount::<2>::parse("1.00")
+        .unwrap()
+        .allocate(&[1, 0, 2])
+        .unwrap();
+    // 1.00 by 1:0:2 floors to 0.33 / 0.00 / 0.66, one cent short. The discarded
+    // fractions are 1/3, 0 and 2/3, so the cent goes to the last — and the zero
+    // ratio, whose remainder is nothing, is passed over rather than rounded up.
+    assert_eq!(
+        parts,
+        vec![
+            Amount::<2>::parse("0.33").unwrap(),
+            Amount::<2>::ZERO,
+            Amount::<2>::parse("0.67").unwrap(),
+        ]
+    );
+    assert_eq!(
+        parts.iter().copied().sum::<Amount<2>>(),
+        Amount::<2>::parse("1.00").unwrap()
+    );
+
+    // Zeros at either end, and several of them, behave the same way.
+    let edges = Amount::<2>::parse("1.00")
+        .unwrap()
+        .allocate(&[0, 0, 1, 0])
+        .unwrap();
+    assert_eq!(
+        edges,
+        vec![
+            Amount::<2>::ZERO,
+            Amount::<2>::ZERO,
+            Amount::<2>::parse("1.00").unwrap(),
+            Amount::<2>::ZERO,
+        ]
+    );
+
+    // Only an all-zero set is refused — there is no share to compute at all.
+    assert!(
+        Amount::<2>::parse("1.00")
+            .unwrap()
+            .allocate(&[0, 0])
+            .is_err()
+    );
+    assert!(Amount::<2>::parse("1.00").unwrap().allocate(&[]).is_err());
+}
+
+#[test]
+fn exact_to_reports_a_narrowing_refusal_distinctly_from_a_precision_loss() {
+    // Narrowing that would drop a non-zero digit is refused with `InvalidInput`
+    // and a message telling the caller to rebuild at that scale — the actionable
+    // answer. Reaching the generic `Decimal` conversion instead would still fail,
+    // but as `PrecisionLoss`, which reads as "your input had too many digits"
+    // and sends the caller looking in the wrong place.
+    let inexact = Amount::<5>::parse("356.80221").unwrap();
+    match inexact.exact_to::<2>() {
+        Err(BillingError::InvalidInput { reason }) => {
+            assert!(reason.contains("does not fit 2 decimal places"), "{reason}");
+            assert!(reason.contains("rebuild"), "{reason}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    // Narrowing that fits is exact, and widening is always exact.
+    assert_eq!(
+        Amount::<5>::parse("356.80000")
+            .unwrap()
+            .exact_to::<2>()
+            .unwrap(),
+        Amount::<2>::parse("356.80").unwrap()
+    );
+    assert_eq!(
+        Amount::<2>::parse("356.80")
+            .unwrap()
+            .exact_to::<5>()
+            .unwrap(),
+        Amount::<5>::parse("356.80000").unwrap()
+    );
+    // Same scale is the identity and never consults `fits_scale`.
+    assert_eq!(
+        Amount::<5>::parse("356.80221")
+            .unwrap()
+            .exact_to::<5>()
+            .unwrap(),
+        Amount::<5>::parse("356.80221").unwrap()
+    );
 }

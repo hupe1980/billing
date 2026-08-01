@@ -2296,4 +2296,97 @@ mod tests {
     fn assert_valid_passes() {
         simple_doc("42.00000").assert_valid();
     }
+
+    /// An inconsistent document, reachable only from inside the crate.
+    ///
+    /// Every public constructor computes the totals it stores, and
+    /// deserialisation re-runs `validate` through `try_from`, so no caller can
+    /// hold a `BillingDocument` whose gross does not follow from its parts.
+    /// `from_raw` is the one path that skips the check — it exists for
+    /// allocation, which computes the parts itself — and it is therefore the only
+    /// way to test that the check is still there.
+    fn inconsistent_doc() -> BillingDocument {
+        BillingDocument::from_raw(DocumentParts {
+            meta: DocumentMeta::default(),
+            net_positions: vec![
+                LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            tax_positions: vec![],
+            discount_positions: vec![],
+            net_total: Amount::parse("100.00000").unwrap(),
+            tax_total: Amount::ZERO,
+            // 100 + 0 is not 219.
+            gross_total: Amount::parse("219.00000").unwrap(),
+            tax_breakdown: vec![],
+            prepaid: Amount::ZERO,
+            rounding: Amount::ZERO,
+        })
+        .expect("from_raw does not validate totals")
+    }
+
+    #[test]
+    fn validate_rejects_a_gross_that_does_not_follow_from_the_parts() {
+        let err = inconsistent_doc().validate().unwrap_err();
+        assert!(
+            matches!(err, BillingError::ValidationFailed { .. }),
+            "expected ValidationFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_builder_carries_the_header_it_was_given_into_the_document() {
+        // `meta` and `currency` are the two setters whose effect is invisible in
+        // the totals: a builder step that discarded them would still produce a
+        // document that balances and validates, with an empty BT-1 and a currency
+        // of XXX on it. Both are fatal on a real invoice and neither is arithmetic.
+        let doc = BillingDocument::builder()
+            .meta(DocumentMeta {
+                invoice_number: "R-2026-0042".into(),
+                period_label: "Juni 2026".into(),
+                ..Default::default()
+            })
+            .currency(Currency::EUR)
+            .positions(vec![
+                LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ])
+            .build()
+            .unwrap();
+
+        assert_eq!(doc.meta.invoice_number, "R-2026-0042");
+        assert_eq!(doc.meta.period_label, "Juni 2026");
+        assert_eq!(doc.meta.currency, Currency::EUR);
+        assert_ne!(doc.meta.currency, Currency::default());
+        assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
+
+        // `currency` is documented as a shorthand applied *after* `meta`, which
+        // replaces the whole header — so the reverse order loses it, and the
+        // documentation is the only thing that says so.
+        let overwritten = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .meta(DocumentMeta {
+                invoice_number: "R-2026-0043".into(),
+                ..Default::default()
+            })
+            .positions(vec![
+                LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(overwritten.meta.currency, Currency::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "BillingDocument arithmetic invariants violated")]
+    fn assert_valid_panics_on_an_inconsistent_document() {
+        // `assert_valid` is what every test in this crate and in every downstream
+        // suite leans on. An `assert_valid` that stopped asserting would leave all
+        // of them green, so the one behaviour worth pinning is that it panics.
+        inconsistent_doc().assert_valid();
+    }
 }

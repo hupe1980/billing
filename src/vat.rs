@@ -841,4 +841,109 @@ mod tests {
         .with_exemption_reason("nope");
         assert!(bad.validate().is_err());
     }
+
+    #[test]
+    fn a_negative_rate_is_refused_but_a_negative_zero_is_not() {
+        // `Decimal` has a signed zero: `-0.00` reports `is_sign_negative()` and
+        // is still zero. A reverse-charge line built by negating a 0 % rate lands
+        // on exactly that, so the sign check has to exempt it — while still
+        // refusing a rate that is genuinely below zero.
+        //
+        // `L` (Canary Islands) is the category that makes the two separable: it
+        // permits a zero rate, so the negative check is the only thing standing
+        // between it and a rate of -5 %.
+        assert!(LineVat::new(TaxCategory::CanaryIslands, Decimal::ZERO).is_ok());
+        assert!(LineVat::new(TaxCategory::CanaryIslands, -Decimal::ZERO).is_ok());
+        assert!(
+            LineVat::new(
+                TaxCategory::CanaryIslands,
+                Decimal::from_str_exact("-0.05").unwrap()
+            )
+            .is_err(),
+            "a negative rate must be refused"
+        );
+        assert!(
+            LineVat::new(
+                TaxCategory::CanaryIslands,
+                Decimal::from_str_exact("-0.000").unwrap()
+            )
+            .is_ok(),
+            "a signed zero is still zero"
+        );
+    }
+
+    #[test]
+    fn a_rate_renders_as_a_percentage_without_trailing_zeros() {
+        // BT-119 goes on the wire as a percentage, not a fraction: 19, not 0.19.
+        // The trailing zeros matter too — `19.00` and `19` are the same number
+        // but not the same string, and a validator comparing BT-119 against a
+        // code list sees the string.
+        let cases = [
+            ("0.19", "19"),
+            ("0.075", "7.5"),
+            ("0.07", "7"),
+            ("0", "0"),
+            ("0.190", "19"),
+            ("1", "100"),
+            ("0.0025", "0.25"),
+        ];
+        for (rate, expected) in cases {
+            let entry = TaxBreakdownEntry::new(
+                TaxCategory::Standard,
+                Decimal::from_str_exact(rate).unwrap(),
+                Amount::ZERO,
+                Amount::ZERO,
+            );
+            assert_eq!(
+                entry.rate_percent().to_string(),
+                expected,
+                "rate {rate} must render as {expected}"
+            );
+        }
+
+        // `LineVat` renders the same figure, with its category, for a line label.
+        let vat = LineVat::new(
+            TaxCategory::Standard,
+            Decimal::from_str_exact("0.19").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vat.to_string(), "S 19%");
+        assert_eq!(vat.rate_percent().to_string(), "19");
+        assert_eq!(
+            LineVat::new(TaxCategory::ReverseCharge, Decimal::ZERO)
+                .unwrap()
+                .to_string(),
+            "AE 0%"
+        );
+    }
+
+    #[test]
+    fn has_exemption_reason_reports_either_form_and_neither() {
+        // BR-E-10 and its siblings accept BT-120 *or* BT-121, so this predicate
+        // has to see both — and it has to be able to say no, which is what makes
+        // the "reason required" rules enforceable at all.
+        let bare = TaxBreakdownEntry::new(
+            TaxCategory::Standard,
+            Decimal::from_str_exact("0.19").unwrap(),
+            Amount::ZERO,
+            Amount::ZERO,
+        );
+        assert!(!bare.has_exemption_reason());
+
+        assert!(
+            bare.clone()
+                .with_exemption_reason("Art. 132")
+                .has_exemption_reason()
+        );
+        assert!(
+            bare.clone()
+                .with_exemption_reason_code("VATEX-EU-132")
+                .has_exemption_reason()
+        );
+        assert!(
+            bare.with_exemption_reason("Art. 132")
+                .with_exemption_reason_code("VATEX-EU-132")
+                .has_exemption_reason()
+        );
+    }
 }

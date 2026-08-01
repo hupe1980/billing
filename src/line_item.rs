@@ -1642,4 +1642,152 @@ mod tests {
         assert!(item.has_tag("commodity"));
         assert!(!item.has_tag("fixed"));
     }
+
+    #[test]
+    fn a_line_needs_a_fixed_amount_or_both_halves_of_a_price() {
+        // Half a price is not a price. A quantity without a unit price has no
+        // amount to state, and a unit price without a quantity has no BT-129 —
+        // either one alone would build a line whose BT-131 is unreachable, and
+        // accepting it defers the failure to whatever tries to total it.
+        assert!(
+            LineItem::debit("Nur Menge")
+                .quantity(Quantity::new(dec!(100), "kWh"))
+                .build()
+                .is_err()
+        );
+        assert!(
+            LineItem::debit("Nur Preis")
+                .unit_price(UnitPrice::new(dec!(0.30), "EUR/kWh"))
+                .build()
+                .is_err()
+        );
+        assert!(LineItem::debit("Gar nichts").build().is_err());
+
+        // Both halves, or a fixed amount, or both — all fine.
+        assert!(
+            LineItem::debit("Beides")
+                .quantity(Quantity::new(dec!(100), "kWh"))
+                .unit_price(UnitPrice::new(dec!(0.30), "EUR/kWh"))
+                .build()
+                .is_ok()
+        );
+        assert!(
+            LineItem::debit("Pauschale")
+                .fixed_amount(Amount::parse("10.00000").unwrap())
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_zero_quantity_line_is_valid() {
+        // A metered line with no consumption in the period is an ordinary
+        // invoice line, not an error: the meter reading is real, the amount is
+        // zero, and EN 16931 has no rule against it. Only a *negative* quantity
+        // is a caller mistake — refunds are `Sign::Credit`, not a negated
+        // quantity — so the boundary sits between zero and below it.
+        let zero = LineItem::debit("Arbeitspreis")
+            .quantity(Quantity::new(Decimal::ZERO, "kWh"))
+            .unit_price(UnitPrice::new(dec!(0.30), "EUR/kWh"))
+            .build()
+            .unwrap();
+        assert_eq!(zero.net_amount, Amount::<5>::ZERO);
+        zero.validate().unwrap();
+
+        let mut negative = zero.clone();
+        negative.quantity = Some(Quantity::new(dec!(-1), "kWh"));
+        assert!(negative.validate().is_err());
+    }
+
+    #[test]
+    fn without_basis_drops_the_pair_and_keeps_the_reason() {
+        // The point of `without_basis` is to stay lawful when the amount moves in
+        // a way the base cannot follow — a min/max clamp, a penny correction on
+        // one line of a split. Stating a basis that no longer reproduces the
+        // amount is a fatal R040 failure; stating none is always valid. Dropping
+        // the reason code along with it would trade one fatal rule (R040) for
+        // another (BR-CO-21, which wants BT-97 or BT-98).
+        let stated =
+            AllowanceCharge::percentage_of(Amount::<5>::parse("1000.00000").unwrap(), dec!(0.10))
+                .with_reason_code("95");
+        assert_eq!(stated.reason_code.as_deref(), Some("95"));
+        assert_eq!(
+            stated.base_amount,
+            Some(Amount::<5>::parse("1000.00000").unwrap())
+        );
+        assert_eq!(stated.percentage, Some(dec!(10))); // a percentage, not a fraction
+        stated.validate().unwrap();
+        stated
+            .check_amount(Amount::parse("100.00000").unwrap())
+            .unwrap();
+
+        let bare = stated.clone().without_basis();
+        assert_eq!(bare.reason_code.as_deref(), Some("95"));
+        assert_eq!(bare.base_amount, None);
+        assert_eq!(bare.percentage, None);
+        bare.validate().unwrap();
+        // With no stated pair there is nothing for R040 to contradict, so an
+        // amount the original basis would have rejected is now fine.
+        bare.check_amount(Amount::parse("73.41000").unwrap())
+            .unwrap();
+        assert!(
+            stated
+                .check_amount(Amount::parse("73.41000").unwrap())
+                .is_err()
+        );
+
+        // A code-only allowance is the other lawful shape, and `coded` builds it
+        // directly.
+        let coded = AllowanceCharge::coded("ABK");
+        assert_eq!(coded.reason_code.as_deref(), Some("ABK"));
+        assert_eq!(coded.base_amount, None);
+        assert_eq!(coded.percentage, None);
+    }
+
+    #[test]
+    fn r040_tolerance_is_inclusive_at_its_stated_bound() {
+        // PEPPOL-EN16931-R040 permits the stated pair and the amount to disagree
+        // by up to ±0.02, and the error message quotes that figure. A check that
+        // rejected at exactly 0.02 would contradict its own message and fail
+        // documents the rule allows — the difference is invisible unless the
+        // boundary itself is tested.
+        let ac = AllowanceCharge {
+            reason_code: None,
+            base_amount: Some(Amount::<5>::parse("1000.00000").unwrap()),
+            percentage: Some(dec!(10)),
+        };
+        // 10 % of 1000.00 is 100.00.
+        ac.check_amount(Amount::parse("100.00000").unwrap())
+            .unwrap();
+
+        // Exactly on the bound, both directions: allowed.
+        ac.check_amount(Amount::parse("100.02000").unwrap())
+            .unwrap();
+        ac.check_amount(Amount::parse("99.98000").unwrap()).unwrap();
+
+        // One unit of the smallest representable step beyond it: refused.
+        assert!(
+            ac.check_amount(Amount::parse("100.02001").unwrap())
+                .is_err()
+        );
+        assert!(ac.check_amount(Amount::parse("99.97999").unwrap()).is_err());
+
+        // The sign of the amount does not matter — an allowance states the same
+        // pair as the equivalent charge and is compared on magnitude.
+        ac.check_amount(Amount::parse("-100.02000").unwrap())
+            .unwrap();
+        assert!(
+            ac.check_amount(Amount::parse("-100.02001").unwrap())
+                .is_err()
+        );
+
+        // With no stated pair there is nothing to check against.
+        let bare = AllowanceCharge {
+            reason_code: Some("ABK".into()),
+            base_amount: None,
+            percentage: None,
+        };
+        bare.check_amount(Amount::parse("999.00000").unwrap())
+            .unwrap();
+    }
 }

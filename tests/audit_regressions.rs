@@ -208,6 +208,62 @@ fn proportional_allocation_rejects_negative_shares_that_sum_to_one() {
 fn equal_allocation_rejects_zero_recipients() {
     assert!(EqualAllocation::new(0).is_err());
     assert!(EqualAllocation::new(1).is_ok());
+
+    // `n()` reports what was asked for, not a constant that happens to match the
+    // common case.
+    for n in [1usize, 2, 3, 7, 64] {
+        assert_eq!(EqualAllocation::new(n).unwrap().n(), n);
+    }
+}
+
+#[test]
+fn proportional_allocation_reports_the_shares_it_was_built_from() {
+    let shares = vec![dec!(0.4), dec!(0.35), dec!(0.25)];
+    let alloc = ProportionalAllocation::new(shares.clone()).unwrap();
+    assert_eq!(alloc.shares(), shares.as_slice());
+    assert_eq!(alloc.shares().len(), 3);
+    assert_eq!(alloc.shares().iter().sum::<Decimal>(), Decimal::ONE);
+}
+
+#[test]
+fn allocated_documents_are_numbered_per_recipient() {
+    // Every recipient gets a document, and every document needs its own BT-1.
+    // Handing all three the parent's number produces invoices that are
+    // indistinguishable in a ledger — and, under §14 UStG, not lawfully numbered.
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "R-2026-0007".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Grundpreis", Amount::parse("900.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let docs = ProportionalAllocation::new(vec![dec!(0.4), dec!(0.35), dec!(0.25)])
+        .unwrap()
+        .allocate(&doc)
+        .unwrap();
+
+    let numbers: Vec<&str> = docs
+        .iter()
+        .map(|d| d.meta.invoice_number.as_str())
+        .collect();
+    assert_eq!(numbers, ["R-2026-0007/1", "R-2026-0007/2", "R-2026-0007/3"]);
+    // Distinct, and none of them silently reuses the parent's number.
+    assert!(!numbers.contains(&"R-2026-0007"));
+
+    // The rest of the header is inherited rather than reset.
+    for d in &docs {
+        assert_eq!(d.meta.currency, doc.meta.currency);
+        assert_eq!(d.meta.kind, doc.meta.kind);
+    }
 }
 
 #[test]
@@ -1230,6 +1286,98 @@ fn proportional_split_still_accepts_shares_the_hamilton_step_can_absorb() {
 }
 
 #[test]
+fn proportional_split_absorbs_a_deficit_larger_than_one_unit_per_fraction() {
+    // Found by mutation testing: the guard rejecting `n_units > parts.len()` was
+    // commented "unreachable", and it was not. Two sources feed the deficit — the
+    // step-1 floor discards up to one unit per fraction, and the share-sum
+    // tolerance admits a drift worth up to another unit per fraction — so it can
+    // reach almost 2n units.
+    //
+    // The previous release therefore refused a split it had already accepted the
+    // shares for. `10_000_000` (the case above) worked; `25_000_000` with the same
+    // shares and scale returned "deficit of 4 units exceeds the 3 fractions
+    // available to absorb it".
+    let parts = proportional_split(dec!(25000000), &[dec!(0.333333333); 3], 2).unwrap();
+    let sum: Decimal = parts.iter().sum();
+    assert_eq!(sum, dec!(25000000.00));
+    // Four units over three fractions: one each, then the largest remainder — which
+    // ties three ways and so goes to the earliest index — takes the fourth.
+    assert_eq!(
+        parts,
+        vec![dec!(8333333.34), dec!(8333333.33), dec!(8333333.33)]
+    );
+
+    // The whole band that used to fail. Every one of these must conserve the total
+    // exactly rather than error; `29_999_999` sits just under the point where the
+    // tolerance check itself takes over and rejects the shares outright.
+    for total in [
+        dec!(20000001),
+        dec!(25000000),
+        dec!(29000000),
+        dec!(29999998),
+        dec!(29999999),
+        dec!(29999999.99),
+    ] {
+        let parts = proportional_split(total, &[dec!(0.333333333); 3], 2)
+            .unwrap_or_else(|e| panic!("total={total} rejected: {e}"));
+        let sum: Decimal = parts.iter().sum();
+        assert_eq!(sum, total.round_dp(2), "total={total}");
+        // No recipient may drift more than the units the deficit actually forced.
+        for part in &parts {
+            let ideal = total * dec!(0.333333333);
+            assert!(
+                (part - ideal).abs() <= dec!(0.02),
+                "total={total} part={part}"
+            );
+        }
+    }
+
+    // Shares that drift further than the Hamilton step could ever absorb are still
+    // rejected — widening the distribution must not widen what is accepted.
+    assert!(proportional_split(dec!(30000000), &[dec!(0.333333333); 3], 2).is_err());
+    assert!(proportional_split(dec!(100), &[dec!(0.5), dec!(0.4)], 2).is_err());
+}
+
+#[test]
+fn proportional_split_judges_shares_on_their_own_terms_not_on_the_total() {
+    // The share-sum check has two arms: an absolute drift bound and a
+    // value-scaled one. Only the absolute arm fires here — shares summing to 0.9
+    // are wrong regardless of what they are splitting, and the value-scaled arm
+    // goes quiet as the total shrinks, because 10% of nearly nothing is worth
+    // less than a cent.
+    //
+    // Splitting a zero or near-zero total is a real case (a fully discounted
+    // document, a period with no consumption), so it is exactly where a
+    // malformed share set would otherwise slip through unnoticed.
+    assert!(proportional_split(Decimal::ZERO, &[dec!(0.5), dec!(0.4)], 2).is_err());
+    assert!(proportional_split(dec!(0.01), &[dec!(0.5), dec!(0.4)], 2).is_err());
+    assert!(proportional_split(dec!(0.01), &[dec!(0.6), dec!(0.6)], 2).is_err());
+
+    // A zero total with correct shares still splits, into zeros.
+    let parts = proportional_split(Decimal::ZERO, &[dec!(0.5), dec!(0.5)], 2).unwrap();
+    assert_eq!(parts, vec![Decimal::ZERO, Decimal::ZERO]);
+}
+
+#[test]
+fn proportional_split_accepts_a_zero_share() {
+    // A recipient allocated nothing is a legitimate input — a tenant who moved in
+    // mid-period, a cost centre switched off for the month. Only a *negative*
+    // fraction is an error, and treating zero as one would turn a routine case
+    // into a hard failure at the call site.
+    let parts = proportional_split(dec!(100), &[dec!(0.5), Decimal::ZERO, dec!(0.5)], 2).unwrap();
+    assert_eq!(parts, vec![dec!(50.00), Decimal::ZERO, dec!(50.00)]);
+    assert_eq!(parts.iter().sum::<Decimal>(), dec!(100.00));
+
+    // All but one at zero degenerates to "give it all to the remaining one".
+    let parts = proportional_split(dec!(100), &[Decimal::ZERO, Decimal::ONE], 2).unwrap();
+    assert_eq!(parts, vec![Decimal::ZERO, dec!(100.00)]);
+
+    // Negative is still rejected, so the boundary sits between them and not
+    // somewhere else.
+    assert!(proportional_split(dec!(100), &[dec!(1.5), dec!(-0.5)], 2).is_err());
+}
+
+#[test]
 fn empty_unit_labels_are_rejected() {
     // An empty unit renders as "EUR/" in a price label and a bare space in the
     // description — visible nonsense on an invoice.
@@ -1424,6 +1572,15 @@ fn not_billable_reason_survives_instead_of_becoming_an_empty_document() {
         out.billable().unwrap().net_total(),
         Amount::parse("42.00000").unwrap()
     );
+    // The billable side of every accessor, so each one is pinned in both
+    // directions rather than only where it answers "no". A predicate that always
+    // answers "nothing to bill" suppresses invoices in perfect silence.
+    assert!(out.is_billable());
+    assert_eq!(out.reason(), None);
+    assert_eq!(
+        out.into_billable().unwrap().net_total(),
+        Amount::parse("42.00000").unwrap()
+    );
 }
 
 /// A `ScalarTariff` needs neither `type Usage = ()` nor an ignored `usage` argument,
@@ -1443,16 +1600,29 @@ fn scalar_tariff_composes_as_a_tariff() {
         fn tax_layers(&self) -> Vec<Box<dyn billing::TaxLayer>> {
             vec![FixedRateTax::new("VAT", dec!(0.19)).unwrap().boxed()]
         }
+        fn discount_layers(&self) -> Vec<Box<dyn billing::DiscountLayer>> {
+            vec![
+                billing::tax::FixedDiscount::new("Rabatt", Amount::parse("10.00000").unwrap())
+                    .unwrap()
+                    .boxed(),
+            ]
+        }
     }
 
     // Via the scalar convenience…
     let doc = Payout(100).settle(DocumentMeta::default()).unwrap();
-    assert_eq!(doc.net_total(), Amount::parse("100.00000").unwrap());
-    assert_eq!(doc.tax_total(), Amount::parse("19.00000").unwrap());
+    // 100 billed, less a 10.00 discount, taxed at 19 % of the reduced base.
+    assert_eq!(doc.net_total(), Amount::parse("90.00000").unwrap());
+    assert_eq!(doc.discount_total(), Amount::parse("-10.00000").unwrap());
+    assert_eq!(doc.tax_total(), Amount::parse("17.10000").unwrap());
 
-    // …and via the generic `Tariff` surface, including the tax layers.
+    // …and via the generic `Tariff` surface. The blanket impl forwards *both*
+    // layer kinds; forwarding only the taxes would silently drop the discount and
+    // over-bill by its amount plus the tax on it.
     let doc2 = Tariff::bill(&Payout(100), DocumentMeta::default(), &()).unwrap();
     assert_eq!(doc2.gross_total(), doc.gross_total());
+    assert_eq!(doc2.discount_total(), doc.discount_total());
+    assert_eq!(doc2.discount_positions().len(), 1);
 
     // …and through the document builder.
     let doc3 = BillingDocument::builder()
@@ -1462,6 +1632,7 @@ fn scalar_tariff_composes_as_a_tariff() {
         .build()
         .unwrap();
     assert_eq!(doc3.gross_total(), doc.gross_total());
+    assert_eq!(doc3.discount_total(), doc.discount_total());
 }
 
 /// `FixedRateTax::exempt` enforces the EN 16931 category/reason pairing that the
@@ -1616,4 +1787,260 @@ fn round_to_scale_matches_increment_rounding_for_every_strategy() {
             assert!(a.fits_scale(5));
         }
     }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_vat_breakdown_must_be_a_component_of_the_tax_actually_charged() {
+    // Validation check 8. Exact equality would be wrong — a commission or a
+    // per-unit excise adds to `tax_total` without contributing a breakdown entry
+    // — so the rule is a containment one: the breakdown may not exceed the tax
+    // charged, and may not oppose its sign.
+    //
+    // Both halves matter and they fail differently. A breakdown *larger* than the
+    // tax charged is output VAT declared on an invoice that never charged it. A
+    // breakdown of the *opposite* sign is an invoice claiming input VAT. Checking
+    // only one of the two lets the other through, and both deserialise cleanly
+    // from a hand-built payload if nothing looks.
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "COMP-1".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
+        vec![],
+    )
+    .unwrap();
+    let json = serde_json::to_string(&doc).unwrap();
+    assert!(serde_json::from_str::<BillingDocument>(&json).is_ok());
+
+    // Only the breakdown entry is moved; `tax_total` stays at 19.00.
+    let tamper = |tax_amount: &str| {
+        let bad = json.replace(
+            r#""taxable_base":"100.00000","tax_amount":"19.00000""#,
+            &format!(r#""taxable_base":"100.00000","tax_amount":"{tax_amount}""#),
+        );
+        assert_ne!(
+            bad, json,
+            "replacement did not match — payload shape changed"
+        );
+        serde_json::from_str::<BillingDocument>(&bad)
+    };
+
+    // Exceeds the tax charged.
+    assert!(tamper("19.00001").is_err());
+    assert!(tamper("38.00000").is_err());
+    // Opposes its sign: an invoice cannot declare negative output VAT.
+    assert!(tamper("-19.00000").is_err());
+    assert!(tamper("-0.00001").is_err());
+
+    // The other side of the rule: a breakdown strictly *below* `tax_total` is
+    // lawful, and is the whole reason this is a containment check rather than an
+    // equality one. A platform commission is taxed but is not itself VAT, so it
+    // raises the tax total without appearing in BG-23.
+    let with_charge = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "COMP-1B".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![
+            Box::new(PercentageCharge::new("Platform fee", dec!(0.05)).unwrap()),
+            Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap()),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let breakdown_tax: Amount<5> = with_charge
+        .tax_breakdown()
+        .iter()
+        .map(|e| e.tax_amount)
+        .sum();
+    assert!(breakdown_tax < with_charge.tax_total());
+    assert!(breakdown_tax > Amount::ZERO);
+    with_charge.assert_valid();
+    let json = serde_json::to_string(&with_charge).unwrap();
+    assert!(serde_json::from_str::<BillingDocument>(&json).is_ok());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn the_breakdown_containment_rule_mirrors_for_a_credit_note() {
+    // A credit note's tax_total is negative, so "does not exceed" and "does not
+    // oppose the sign" both flip. Handling only the invoice orientation leaves
+    // credit notes unchecked — and a credit note is the document where a wrong
+    // sign is worth twice the money, because it reverses one.
+    let invoice = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "COMP-2".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
+        vec![],
+    )
+    .unwrap();
+    let credit = invoice
+        .reverse(DocumentMeta {
+            invoice_number: "COMP-2-STORNO".into(),
+            kind: DocumentKind::CreditNote,
+            currency: Currency::EUR,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(credit.tax_total().is_negative());
+
+    let json = serde_json::to_string(&credit).unwrap();
+    assert!(serde_json::from_str::<BillingDocument>(&json).is_ok());
+
+    let tamper = |tax_amount: &str| {
+        let bad = json.replace(
+            r#""tax_amount":"-19.00000""#,
+            &format!(r#""tax_amount":"{tax_amount}""#),
+        );
+        assert_ne!(
+            bad, json,
+            "replacement did not match — payload shape changed"
+        );
+        serde_json::from_str::<BillingDocument>(&bad)
+    };
+
+    // More negative than the tax reversed.
+    assert!(tamper("-19.00001").is_err());
+    assert!(tamper("-38.00000").is_err());
+    // Positive breakdown on a negative tax total — the sign opposition.
+    assert!(tamper("19.00000").is_err());
+    assert!(tamper("0.00001").is_err());
+
+    // And the untampered credit note, whose breakdown sits exactly at the bound,
+    // still validates — the rule is inclusive at both ends.
+    credit.assert_valid();
+    assert_eq!(
+        credit
+            .tax_breakdown()
+            .iter()
+            .map(|e| e.tax_amount)
+            .sum::<Amount<5>>(),
+        credit.tax_total()
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn verify_vat_attribution_actually_rejects_a_mis_attributed_position() {
+    // BR-CO-04 / BR-S-08: every position carries a VAT category and rate, and the
+    // positions carrying each pair must sum to that group's taxable base. The
+    // whole point of `verify_vat_attribution` is to say no — but every other test
+    // in this suite calls it on a document it expects to be sound and unwraps.
+    // A version of it that returned `Ok(())` unconditionally would have passed
+    // all of them.
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "ATTR-1".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
+        vec![],
+    )
+    .unwrap();
+    doc.verify_vat_attribution().unwrap();
+
+    let json = serde_json::to_string(&doc).unwrap();
+
+    // Re-label the line as 7 % — a group the breakdown does not contain.
+    let orphaned = json.replacen(
+        r#""vat":{"category":"Standard","rate":"0.19"}"#,
+        r#""vat":{"category":"Standard","rate":"0.07"}"#,
+        1,
+    );
+    assert_ne!(
+        orphaned, json,
+        "replacement did not match — payload shape changed"
+    );
+    let doc = serde_json::from_str::<BillingDocument>(&orphaned).unwrap();
+    assert!(
+        doc.verify_vat_attribution().is_err(),
+        "a position naming a group outside BG-23 must be rejected"
+    );
+
+    // Attribution is read from the *taxable* positions. Counting the VAT position
+    // itself instead would double the base of its own group and make a sound
+    // document look broken — and make this broken one look sound.
+    let base: Amount<5> = doc
+        .all_positions()
+        .filter(|p| !p.has_tag(billing::tags::VAT))
+        .filter_map(|p| p.vat.map(|_| p.net_amount))
+        .sum();
+    assert_eq!(base, Amount::parse("100.00000").unwrap());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn no_public_path_produces_a_document_that_fails_its_own_validation() {
+    // The counterpart to the in-crate `assert_valid_panics_on_an_inconsistent_document`
+    // test: from outside the crate an invalid `BillingDocument` cannot be reached
+    // at all. Every constructor computes the totals it stores, `with_extra_position`
+    // refuses where it would strand the VAT breakdown, and a tampered payload is
+    // rejected on the way in rather than validated after the fact.
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "PANIC-1".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19)).unwrap())],
+        vec![],
+    )
+    .unwrap();
+    doc.assert_valid();
+
+    // A tampered gross does not survive deserialisation.
+    let json = serde_json::to_string(&doc).unwrap();
+    let broken = json.replace(
+        r#""gross_total":"119.00000""#,
+        r#""gross_total":"219.00000""#,
+    );
+    assert_ne!(
+        broken, json,
+        "replacement did not match — payload shape changed"
+    );
+    assert!(serde_json::from_str::<BillingDocument>(&broken).is_err());
+
+    // Appending to a document carrying a VAT breakdown is refused outright, rather
+    // than silently producing one whose breakdown no longer covers its base.
+    assert!(
+        doc.with_extra_position(
+            LineItem::fixed("Nachtrag", Amount::parse("50.00000").unwrap())
+                .build()
+                .unwrap(),
+        )
+        .is_err()
+    );
 }

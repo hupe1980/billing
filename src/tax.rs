@@ -1445,4 +1445,243 @@ mod tests {
         let levy = PerUnitLevy::new("Levy", Amount::parse("0.01000").unwrap(), "kWh").unwrap();
         assert_eq!(levy.currency(), Currency::XXX);
     }
+
+    #[test]
+    fn layer_accessors_report_what_was_configured() {
+        // Every one of these reads a private field back out, which is the only
+        // way a caller can inspect a layer it did not build — a tariff catalogue
+        // rendering its own configuration, a test asserting what was wired up.
+        // Reading them against non-default values is what distinguishes "returns
+        // the field" from "returns the type's default", and the two are
+        // indistinguishable when the field happens to hold the default.
+        let tax = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_tag("commodity");
+        assert_eq!(tax.name(), "MwSt");
+        assert_eq!(tax.rate(), dec!(0.19));
+        assert_ne!(tax.rate(), Decimal::default());
+        assert_eq!(tax.require_tag(), Some("commodity"));
+        assert_eq!(tax.category(), TaxCategory::Standard);
+
+        // An untagged layer taxes everything, which is `None` and not `Some("")`.
+        let untagged = FixedRateTax::new("MwSt", dec!(0.19)).unwrap();
+        assert_eq!(untagged.require_tag(), None);
+
+        let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+            .unwrap()
+            .with_currency(Currency::EUR);
+        assert_eq!(levy.name(), "Stromsteuer");
+        assert_eq!(levy.rate(), Amount::parse("0.02050").unwrap());
+        assert_ne!(levy.rate(), Amount::<5>::default());
+        assert_eq!(levy.unit(), "kWh");
+        assert_eq!(levy.currency(), Currency::EUR);
+        assert_ne!(levy.currency(), Currency::default());
+
+        let charge = PercentageCharge::new("Servicepauschale", dec!(0.025)).unwrap();
+        assert_eq!(charge.name(), "Servicepauschale");
+        assert_eq!(charge.rate(), dec!(0.025));
+        assert_ne!(charge.rate(), Decimal::default());
+
+        let discount = PercentageDiscount::new("Treuerabatt", dec!(0.10)).unwrap();
+        assert_eq!(discount.name(), "Treuerabatt");
+        assert_eq!(discount.rate(), dec!(0.10));
+    }
+
+    #[test]
+    fn a_levy_carries_the_vat_treatment_it_was_given_to_its_own_position() {
+        // A per-unit excise sits *inside* the VAT base and is normally itself
+        // subject to VAT, so BR-37 wants BT-102 / BT-103 on the position the levy
+        // produces. `with_vat` is how a caller states that, and dropping it
+        // yields a charge position with no category — invalid under BR-37 while
+        // every amount on the document stays right.
+        let vat = crate::vat::LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap();
+        let levy = PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+            .unwrap()
+            .with_currency(Currency::EUR)
+            .with_vat(vat);
+
+        let declared = TaxLayer::vat(&levy).expect("the levy declares its own BT-102");
+        assert_eq!(declared.category, TaxCategory::Standard);
+        assert_eq!(declared.rate, dec!(0.19));
+
+        // Without `with_vat` there is nothing to declare, and assembly derives the
+        // attribution from whichever VAT layer covers the position instead.
+        let plain =
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh").unwrap();
+        assert!(TaxLayer::vat(&plain).is_none());
+    }
+
+    #[test]
+    fn a_percentage_charge_declares_its_bg_21_reason_code_and_vat() {
+        // BT-105 and BT-102 / BT-103 are what make a document level charge a
+        // lawful BG-21 rather than an unexplained addition to the total. Both are
+        // opt-in, and both have to survive the trip from the builder to the
+        // `TaxLayer` methods assembly reads.
+        let vat = crate::vat::LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap();
+        let charge = PercentageCharge::new("Servicepauschale", dec!(0.025))
+            .unwrap()
+            .with_reason_code("ABK")
+            .with_vat(vat);
+
+        let declared = TaxLayer::allowance_charge(&charge).expect("BT-105 was set");
+        assert_eq!(declared.reason_code.as_deref(), Some("ABK"));
+        // A percentage-derived charge states BT-100 / BT-101 from `compute`, which
+        // is the only place the base is known — so the layer-level fallback
+        // carries the code alone. R041 / R042 want the pair together or not at all.
+        assert_eq!(declared.base_amount, None);
+        assert_eq!(declared.percentage, None);
+
+        let declared_vat = TaxLayer::vat(&charge).expect("BT-102 was set");
+        assert_eq!(declared_vat.category, TaxCategory::Standard);
+        assert_eq!(declared_vat.rate, dec!(0.19));
+
+        // Neither is invented when the caller did not ask for it. An empty
+        // `AllowanceCharge` would state a BG-21 with no reason at all — worse
+        // than none, because BR-CO-21 requires a reason or a code.
+        let bare = PercentageCharge::new("Servicepauschale", dec!(0.025)).unwrap();
+        assert!(TaxLayer::allowance_charge(&bare).is_none());
+        assert!(TaxLayer::vat(&bare).is_none());
+    }
+
+    #[test]
+    fn a_percentage_discount_declares_its_bg_20_reason_code_and_vat() {
+        // BG-20 is BG-21's mirror: an allowance reduces the taxable base, so
+        // BR-32 wants BT-95 / BT-96 on it and BR-CO-21 wants BT-97 or BT-98.
+        // The `DiscountLayer` side of the pair needs the same coverage.
+        let vat = crate::vat::LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap();
+        let discount = PercentageDiscount::new("Treuerabatt", dec!(0.10))
+            .unwrap()
+            .with_reason_code("95")
+            .with_vat(vat);
+
+        assert_eq!(DiscountLayer::name(&discount), "Treuerabatt");
+        let declared = DiscountLayer::allowance_charge(&discount).expect("BT-98 was set");
+        assert_eq!(declared.reason_code.as_deref(), Some("95"));
+        let declared_vat = DiscountLayer::vat(&discount).expect("BT-95 was set");
+        assert_eq!(declared_vat.category, TaxCategory::Standard);
+        assert_eq!(declared_vat.rate, dec!(0.19));
+
+        let bare = PercentageDiscount::new("Treuerabatt", dec!(0.10)).unwrap();
+        assert_eq!(DiscountLayer::name(&bare), "Treuerabatt");
+        assert!(DiscountLayer::allowance_charge(&bare).is_none());
+        assert!(DiscountLayer::vat(&bare).is_none());
+
+        // A fixed discount is the same group stated as an amount rather than a
+        // rate, and reports the same things.
+        let fixed = FixedDiscount::new("Gutschrift", Amount::parse("25.00000").unwrap())
+            .unwrap()
+            .with_reason_code("100");
+        assert_eq!(fixed.name(), "Gutschrift");
+        assert_eq!(DiscountLayer::name(&fixed), "Gutschrift");
+        assert_eq!(fixed.amount(), Amount::parse("25.00000").unwrap());
+        assert_ne!(fixed.amount(), Amount::<5>::default());
+        assert_eq!(
+            DiscountLayer::allowance_charge(&fixed)
+                .expect("BT-98 was set")
+                .reason_code
+                .as_deref(),
+            Some("100")
+        );
+        assert!(DiscountLayer::vat(&fixed).is_none());
+        assert_eq!(
+            DiscountLayer::vat(&fixed.clone().with_vat(vat))
+                .expect("BT-95 was set")
+                .rate,
+            dec!(0.19)
+        );
+    }
+
+    #[test]
+    fn a_layer_with_a_required_tag_taxes_only_what_carries_it() {
+        // `require_tag` is not decoration: it is the filter that decides the
+        // taxable base. A layer that reported no tag would tax the whole
+        // document, and one that reported the wrong tag would tax nothing —
+        // both produce a document that still validates, with the wrong tax on it.
+        let positions = vec![
+            LineItem::fixed("Arbeitspreis", Amount::parse("100.00000").unwrap())
+                .tag("commodity")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Netzentgelt", Amount::parse("50.00000").unwrap())
+                .tag("grid")
+                .build()
+                .unwrap(),
+        ];
+
+        let tagged = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_tag("commodity");
+        assert_eq!(
+            tagged.compute(&positions).unwrap().net_amount,
+            Amount::parse("19.00000").unwrap(),
+            "19 % of the commodity line alone"
+        );
+
+        let untagged = FixedRateTax::new("MwSt", dec!(0.19)).unwrap();
+        assert_eq!(
+            untagged.compute(&positions).unwrap().net_amount,
+            Amount::parse("28.50000").unwrap(),
+            "19 % of both lines"
+        );
+
+        let unmatched = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_tag("nothing-has-this");
+        assert_eq!(
+            unmatched.compute(&positions).unwrap().net_amount,
+            Amount::<5>::ZERO
+        );
+    }
+
+    #[test]
+    fn a_category_that_forbids_an_exemption_reason_forbids_the_code_too() {
+        // BR-S-10 and its siblings name BT-120 *and* BT-121. They are alternatives
+        // when a reason is required, so a caller who holds only the VATEX code
+        // sets only the code — and a check that looked at the text alone would
+        // wave exactly that caller through.
+        let standard = FixedRateTax::new("MwSt", dec!(0.19)).unwrap();
+        assert_eq!(standard.exemption_reason(), None);
+        assert_eq!(standard.exemption_reason_code(), None);
+        assert!(standard.compute(&[]).is_ok());
+
+        // Text only.
+        let with_text = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_exemption_reason("Art. 132");
+        assert_eq!(with_text.exemption_reason(), Some("Art. 132"));
+        assert_eq!(with_text.exemption_reason_code(), None);
+        assert!(with_text.compute(&[]).is_err());
+
+        // Code only — the case the text-only check missed.
+        let with_code = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_exemption_reason_code("VATEX-EU-132");
+        assert_eq!(with_code.exemption_reason(), None);
+        assert_eq!(with_code.exemption_reason_code(), Some("VATEX-EU-132"));
+        assert!(with_code.compute(&[]).is_err());
+
+        // Both.
+        let with_both = FixedRateTax::new("MwSt", dec!(0.19))
+            .unwrap()
+            .with_exemption_reason("Art. 132")
+            .with_exemption_reason_code("VATEX-EU-132");
+        assert_eq!(with_both.exemption_reason(), Some("Art. 132"));
+        assert_eq!(with_both.exemption_reason_code(), Some("VATEX-EU-132"));
+        assert!(with_both.compute(&[]).is_err());
+
+        // A category that *permits* a reason accepts each of the three shapes.
+        let exempt = |t: FixedRateTax| t.with_category(TaxCategory::Exempt);
+        assert!(
+            exempt(FixedRateTax::new("Bildung", dec!(0)).unwrap())
+                .with_exemption_reason_code("VATEX-EU-132")
+                .compute(&[])
+                .is_ok()
+        );
+        assert!(
+            exempt(FixedRateTax::new("Bildung", dec!(0)).unwrap())
+                .with_exemption_reason("Art. 132")
+                .compute(&[])
+                .is_ok()
+        );
+    }
 }

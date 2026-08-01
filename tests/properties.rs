@@ -126,12 +126,36 @@ proptest! {
     #[test]
     fn allocate_conserves_the_total(
         a in arb_amount(),
-        ratios in prop::collection::vec(1u64..1000, 1..16),
+        // Zero is included deliberately. A recipient allocated nothing — a tenant
+        // who moved in mid-period, a cost centre switched off for the month — is a
+        // routine input, and it is the one the old `1..1000` generator could never
+        // produce. Only an all-zero set is a genuine error.
+        ratios in prop::collection::vec(0u64..1000, 1..16),
     ) {
-        let parts = a.allocate(&ratios).unwrap();
-        prop_assert_eq!(parts.len(), ratios.len());
-        let sum = Amount::checked_sum(parts.iter().copied()).unwrap();
-        prop_assert_eq!(sum, a, "allocate must neither create nor destroy money");
+        match a.allocate(&ratios) {
+            Ok(parts) => {
+                prop_assert_eq!(parts.len(), ratios.len());
+                let sum = Amount::checked_sum(parts.iter().copied()).unwrap();
+                prop_assert_eq!(sum, a, "allocate must neither create nor destroy money");
+                // A zero ratio is a zero share — never a rounding crumb. The
+                // largest-remainder step hands out spare units by remainder, and a
+                // zero ratio has none, so it must never be served.
+                for (ratio, part) in ratios.iter().zip(&parts) {
+                    if *ratio == 0 {
+                        prop_assert_eq!(
+                            *part,
+                            Amount::<5>::ZERO,
+                            "a zero ratio must receive nothing"
+                        );
+                    }
+                }
+            }
+            Err(_) => prop_assert!(
+                ratios.iter().all(|r| *r == 0),
+                "the only ratios that may be refused are all-zero ones, got {:?}",
+                ratios
+            ),
+        }
     }
 
     #[test]
@@ -162,6 +186,78 @@ proptest! {
         let parts = proportional_split(total, &fractions, 3).unwrap();
         let got: Decimal = parts.iter().sum();
         prop_assert_eq!(got, total, "Hamilton split must sum to the rounded total");
+    }
+
+    #[test]
+    fn proportional_split_conserves_the_total_when_the_shares_do_not_sum_to_one(
+        total in 0u64..1_000_000_000u64,
+        n in 1usize..12,
+        scale in 0u32..6,
+    ) {
+        // The test above builds fractions that sum to *exactly* one, and that
+        // construction is precisely what hid the 0.11.0 bug: with no drift the
+        // deficit can never exceed one unit per fraction, so the branch that
+        // mishandled a larger one was unreachable from this generator.
+        //
+        // Real callers do not get exact fractions. `1/n` truncated to nine
+        // decimals is what a config file or a spreadsheet hands you, and it sums
+        // to slightly under one — which is the case the share-sum tolerance
+        // deliberately admits, and therefore the case the split has to honour.
+        let share = (Decimal::ONE / Decimal::from(n as u64))
+            .round_dp_with_strategy(9, rust_decimal::RoundingStrategy::ToZero);
+        let fractions = vec![share; n];
+        let total = Decimal::from(total);
+
+        // Whatever the tolerance decides, the guarantee is the same: this
+        // function either refuses the shares or splits them exactly. Returning a
+        // set of parts that sums to anything other than the total is the one
+        // outcome it must never produce — and an `Err` for shares it accepted is
+        // what the bug actually looked like.
+        if let Ok(parts) = proportional_split(total, &fractions, scale) {
+            prop_assert_eq!(parts.len(), n);
+            let got: Decimal = parts.iter().sum();
+            prop_assert_eq!(
+                got,
+                total.round_dp_with_strategy(
+                    scale,
+                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                ),
+                "accepted shares must split exactly"
+            );
+            // The correction is spread, not concentrated: the deficit is under two
+            // units per fraction, so no part may run further than that from its
+            // ideal share.
+            let unit = Decimal::new(1, scale);
+            for part in &parts {
+                let ideal = total * share;
+                prop_assert!(
+                    (part - ideal).abs() <= unit * Decimal::from(2u64),
+                    "part {} strays more than two units from its ideal {}",
+                    part,
+                    ideal
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proportional_split_never_rejects_evenly_truncated_thirds(
+        total in 0u64..29_999_999u64,
+        scale in 0u32..3,
+    ) {
+        // The concrete shape from the 0.11.0 bug report, held as a law rather than
+        // a single example: three `0.333333333` shares are inside the documented
+        // tolerance, so they must split rather than fail — at every total the
+        // tolerance accepts, not merely at the one that was tested.
+        let fractions = [Decimal::new(333_333_333, 9); 3];
+        let total = Decimal::from(total);
+        let parts = proportional_split(total, &fractions, scale)
+            .map_err(|e| TestCaseError::fail(format!("rejected total {total}: {e}")))?;
+        let got: Decimal = parts.iter().sum();
+        prop_assert_eq!(
+            got,
+            total.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        );
     }
 
     // ── Rounding laws ────────────────────────────────────────────────────────

@@ -26,8 +26,164 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.10.0"`) if you need to schedule migrations yourself;
-`"0.10"` will pick up `0.10.x` patch fixes only.
+Pin exactly (`billing = "=0.11.0"`) if you need to schedule migrations yourself;
+`"0.11"` will pick up `0.11.x` patch fixes only.
+
+## [0.11.0]
+
+No API changes. This release comes from pointing a different kind of tool at the
+crate: **mutation testing**, via [`cargo-mutants`](https://mutants.rs/).
+
+The suite up to 0.10.0 was checked three ways — example-based tests, property
+tests asserting the algebraic laws, and every README example compiled as a
+doctest. All three answer "does the code do what I expect?". None answers "would
+anything fail if it did something else?", and for a billing engine that is the
+question that decides whether a rounding rule is verified or merely exercised.
+
+Mutation testing answers it by rewriting the code — flipping `<` to `<=`, deleting
+a guard, replacing a computed amount with its default — and reporting every
+rewrite the suite still accepts.
+
+The first sweep generated 958 rewrites, of which 737 compiled. **124 of those
+survived**: code that could be changed, in ways that alter what an invoice says,
+without a single test failing. One was a bug. The rest were gaps.
+
+After this release, 13 survive — eleven provably equivalent rewrites and two in
+branches no input reaches. That is 724 of 737, a **98.2 %** score.
+
+### Fixed — `proportional_split` refused splits it had already accepted ⚠️ silent
+
+`proportional_split` rejected inputs whose shares it had validated, with an
+internal-sounding error:
+
+```text
+proportional_split: deficit of 4 units exceeds the 3 fractions available to
+absorb it (fractions sum to 0.999999999)
+```
+
+`proportional_split(dec!(25000000), &[dec!(0.333333333); 3], 2)` was one such
+call. The same shares at the same scale split fine at `10_000_000` — a case
+0.9.0 added a regression test for — and failed at `25_000_000`.
+
+The Hamilton step assumed the deficit could never exceed one unit per fraction,
+and said so in a comment calling the branch unreachable. It has two sources, not
+one: flooring each ideal share discards up to one unit per fraction, and the
+share-sum tolerance separately admits a drift worth up to another unit per
+fraction. Together they put the deficit just under **2n** units, so the guard was
+reachable for any total large enough to make a 1e-9 drift worth about a cent.
+
+The distribution now takes `n_units / n` units per fraction and awards the
+remaining `n_units % n` in Hamilton order — the same rule, generalised. `Σ(parts)
+== total` now holds for every input the share check accepts, which is what the
+function's documentation always promised.
+
+**This is a behaviour change with an unchanged signature.** Calls that returned
+`Err(InvalidInput)` now return `Ok`. Nothing that previously succeeded changed its
+result. Code matching on that error to fall back to a manual split can drop the
+fallback; code treating the error as fatal will simply stop seeing it.
+
+The mutation run found this by flipping `n_units > parts.len()` to `>=` and
+watching nothing fail — the branch was untested because it was believed
+unreachable.
+
+### Added — mutation testing as a first-class gate
+
+- **[`.cargo/mutants.toml`](.cargo/mutants.toml)** — configuration, with the
+  reasoning for each setting recorded beside it. `all_features` so the serde
+  surface is mutated too, `cap_lints` so a mutant is never scored unviable for a
+  warning that describes the mutant rather than the crate.
+- **[`.cargo/mutants-baseline.txt`](.cargo/mutants-baseline.txt)** — every
+  tolerated survivor, each with the reason it is tolerated. Nothing is suppressed
+  with `exclude_re`: an exclusion is a permanent blind spot, since the regex that
+  hides `builder -> Default::default()` today also hides it once `builder()`
+  starts doing real work. Every mutant is still generated, run and reported.
+- **`just mutants-gate`** — the pass/fail form. Runs the sweep and diffs its
+  survivors against that baseline, failing both when a mutant survives that is not
+  recorded *and* when a recorded one no longer survives, because a stale entry is
+  a blind spot too. Line and column numbers are stripped before comparison, so
+  ordinary edits do not churn the file.
+- **`just mutants`, `mutants-diff`, `mutants-file`, `mutants-iterate`,
+  `mutants-list`, `mutants-baseline-update`** — the reporting form and the
+  narrower loops used while closing a gap.
+- **A diff-scoped CI job.** Pull requests mutate only the lines they changed, so
+  new code has to arrive with tests that would notice if it were wrong. The full
+  sweep takes tens of minutes and stays on the developer's machine — CI gates the
+  delta, `just mutants-gate` gates the release.
+
+### Documentation — where this crate stops
+
+The README argued that XML serialisation and the EN 16931 rule set belong in
+separate crates, and then left the reader without a pointer to one. Both now
+exist and are named: [`en16931`](https://crates.io/crates/en16931) for the
+semantic model and its business rules, and
+[`en16931-formats`](https://crates.io/crates/en16931-formats) for UBL 2.1,
+UN/CEFACT CII, the XRechnung CIUS and ZUGFeRD / Factur-X.
+
+Neither is a dependency of this crate, and `billing` has no knowledge of either.
+The split is the one the README already argued for: `billing` answers *what are
+the amounts*, `en16931` answers *is this a lawful invoice*, `en16931-formats`
+answers *how does it go on the wire*. What `billing` contributes is the part that
+is hard to retrofit — a validator can report that BT-112 ≠ BT-109 + BT-110, but
+not which rounding decision three layers earlier made them disagree.
+
+### Added — tests for behaviour that nothing was checking
+
+Each of these closes a surviving mutant, which is to say: each covers code that
+could have been changed without a single test failing.
+
+| Area | What was unverified |
+|---|---|
+| `proportional_split` | a zero share (a recipient billed nothing); that malformed shares are rejected on their own terms rather than only when the total is large enough to make the drift expensive |
+| `Amount::allocate` | *which* recipient receives the odd unit — conservation held for any answer, so ranking by quotient instead of by remainder was invisible |
+| `Amount::round_to_increment` | `Truncate` on a negative amount (a credit note rounds toward zero, not down); `MidpointToEven` at an exact midpoint, in both directions |
+| `Amount::exact_to` | that a narrowing refusal is `InvalidInput` with the "rebuild at that scale" advice, not a generic `PrecisionLoss` |
+| `BillingDocument::validate` check 8 | that a VAT breakdown may not exceed, or oppose the sign of, the tax actually charged — the check had **no test at all**, in either the invoice or the credit-note orientation |
+| `BillingDocument::verify_vat_attribution` | that it ever returns `Err`; every existing caller unwrapped it on a document expected to be sound |
+| `BillingDocument::assert_valid` | that it panics — the method every downstream suite leans on had only a passing case |
+| `merge_breakdown` | BT-121 conflicting, matching and one-sided across merged entries (BT-120 was covered; its code twin was not) |
+| Assembly of BG-21 | that a layer may declare its charge detail at the layer level, and that VAT positions never receive it |
+| `AdvancePayment` | BT-26 and BT-X-292 — set, read back, and surviving a serde round trip through `try_from`, which rebuilds field by field and would have dropped them silently |
+| `residual_breakdown` | over-deduction of a zero-rated group, where the tax is pinned at zero and the base is the only half that can go negative; and that a group is dropped only when *both* halves reach zero |
+| `AllowanceCharge::check_amount` | that the PEPPOL-EN16931-R040 ±0.02 tolerance is inclusive at exactly 0.02, as its own error message states |
+| `LineAllowanceCharge::negated` | that BT-137 is negated alongside BT-136 — R040 compares magnitudes, so a positive base beside a negated amount validated cleanly |
+| `LineItemBuilder::build` | that half a price is refused: a quantity without a unit price, or a unit price without a quantity |
+| `LineItem::validate` | that a zero quantity is valid — a metered line with no consumption is an ordinary invoice line |
+| `Currency` | `TryFrom<&str>` and `FromStr` (a failure returning the default would have produced XXX-labelled documents that still validate); `minor_unit_increment` where the currency's minor units exactly fill the scale |
+| `Prepayment::is_none` | that `Itemised(vec![])` and `Total(0)` are not `None`; and the billable side of `Billing::is_billable` / `reason` / `into_billable`, which had only ever been asserted where they answer "nothing to bill" |
+| `Period::is_ordered` | that a ten-character string with the wrong separators is declined, that a nine-character one with the right pattern is too, and that one good endpoint does not carry the other — a lexicographic compare orders `YYYY-MM-DD` and nothing else |
+| `prorate_amount` | that `active_days == total_days` is the whole amount rather than the error case |
+| `TariffSchedule::split` | that graduated tiers are numbered from one on the generated description — the only place the tier index reaches the customer |
+| `FixedRateTax` | that `require_tag` actually narrows the taxable base, and that a category forbidding an exemption reason forbids the *code* as well as the text (BR-S-10 names both) |
+| `TimeOfUsePricing` / `DynamicPricing` | the plural `bands` / `intervals` setters and `currency`, which no test went through — leaving `XXX/kWh` on an invoice, which reads as a price and is not one |
+| Layer accessors | `PerUnitLevy`, `PercentageCharge`, `PercentageDiscount` and `FixedDiscount` reporting their configured rate, unit, currency, BT-105 / BT-98 reason code and BT-102 / BT-95 VAT rather than a default |
+| `LineVat` | that a negative rate is refused while a *signed zero* is not; that BT-119 renders as a percentage with trailing zeros stripped; that `has_exemption_reason` can say no |
+| `DocumentKind` | that `Display` renders the UNTDID code and honours width, fill and alignment |
+| `Amount` `Debug` and serde | that `Debug` carries `P` and the trailing zeros; that a JSON number is rejected with a message naming the decimal-string alternative |
+| `BillingError::source` | that a parse failure keeps its cause in the error chain |
+| Allocation | that allocated documents are numbered per recipient rather than all inheriting the parent's BT-1 |
+| `TaxLayer` / `DiscountLayer` defaults | that a third-party layer overriding neither `vat` nor `allowance_charge` gets neither invented for it — an `AllowanceCharge` conjured from `Default` states a BG-20/BG-21 with no reason at all, which BR-CO-21 forbids, on a document whose every amount is right |
+| `CashRounding` | that `increment` and `strategy` report what the rule was built with — a zero increment would make every amount look already-rounded |
+| `Tariff` blanket impl | that `discount_layers` is forwarded alongside `tax_layers`; forwarding only the taxes drops the discount and over-bills by its amount plus the tax on it |
+| `Amount::allocate` | a **zero ratio** — a recipient allocated nothing. The generator for the conservation property drew ratios from `1..1000`, so it could not produce one; largest-remainder distribution must pass such a recipient over rather than round it up, because a cent paid to someone owed zero is a cent taken from someone owed something |
+
+### Changed — two property tests that could not have failed
+
+Mutation testing grades the tests. Two of the property tests turned out to be
+narrower than they read, in ways no mutant could reveal — a mutant changes the
+code, and these were limited by their *generators*:
+
+- `proportional_split_conserves_the_total` built fractions summing to **exactly**
+  one, forcing the drift term to zero. That is the region in which the bug fixed
+  above is unreachable, so the property could never have found it. Two new
+  properties cover the drifting region: one asserts the general contract (refuse
+  the shares, or split them exactly — never return parts that sum to something
+  else), the other pins the reported shape as a law across every total the
+  tolerance accepts. Reverting the fix makes the second fail and shrink to
+  `total = 19585372, scale = 2` — a different counterexample from the one that
+  prompted the fix, which is the point of a property.
+- `allocate_conserves_the_total` drew ratios from `1..1000`, so a zero ratio never
+  appeared. It now draws from `0..1000`, asserts a zero ratio receives exactly
+  zero, and asserts that the *only* ratios `allocate` may refuse are all-zero ones.
 
 ## [0.10.0]
 

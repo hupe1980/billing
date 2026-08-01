@@ -241,4 +241,27 @@ mod tests {
         assert_eq!(floor.round(a).unwrap(), Amount::parse("12.30000").unwrap());
         assert_eq!(ceil.round(a).unwrap(), Amount::parse("12.35000").unwrap());
     }
+
+    #[test]
+    fn a_cash_rounding_rule_reports_the_increment_and_strategy_it_was_built_with() {
+        // BT-114 is derived from these two, and a document carrying a rounding
+        // rule re-checks its own remainder against them on `validate`. Reading
+        // back a zero increment would make every amount look already-rounded.
+        let inc = Amount::<5>::parse("0.05000").unwrap();
+        let rule = CashRounding::new(inc, RoundingStrategy::MidpointAwayFromZero).unwrap();
+        assert_eq!(rule.increment(), inc);
+        assert_ne!(rule.increment(), Amount::<5>::default());
+        assert_eq!(rule.strategy(), RoundingStrategy::MidpointAwayFromZero);
+
+        // A different increment reads back differently — Swedish krona rounds to
+        // the whole unit, Swiss francs to five centimes.
+        let krona = CashRounding::new(
+            Amount::<5>::parse("1.00000").unwrap(),
+            RoundingStrategy::MidpointToEven,
+        )
+        .unwrap();
+        assert_eq!(krona.increment(), Amount::<5>::parse("1.00000").unwrap());
+        assert_eq!(krona.strategy(), RoundingStrategy::MidpointToEven);
+        assert_ne!(krona.increment(), rule.increment());
+    }
 }

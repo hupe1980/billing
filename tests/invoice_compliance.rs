@@ -556,6 +556,115 @@ fn conflicting_exemption_reasons_cannot_be_silently_merged() {
     );
 }
 
+/// BT-121 merges under the same rule as BT-120, and either field may arrive from
+/// whichever of the merged entries happens to carry it.
+#[test]
+fn exemption_reason_codes_merge_conflict_and_carry_over_like_the_texts() {
+    fn two_exempt_layers(
+        number: &str,
+        first: FixedRateTax,
+        second: FixedRateTax,
+    ) -> Result<BillingDocument, BillingError> {
+        BillingDocument::from_positions(
+            meta(number),
+            vec![
+                LineItem::fixed("A", Amount::parse("100.00000").unwrap())
+                    .tag("a")
+                    .build()
+                    .unwrap(),
+                LineItem::fixed("B", Amount::parse("50.00000").unwrap())
+                    .tag("b")
+                    .build()
+                    .unwrap(),
+            ],
+            vec![Box::new(first), Box::new(second)],
+            vec![],
+        )
+    }
+
+    let exempt = |name: &str, tag: &str| {
+        FixedRateTax::new(name, dec!(0))
+            .unwrap()
+            .with_category(TaxCategory::Exempt)
+            .with_tag(tag)
+    };
+
+    // Two different VATEX codes in one breakdown line cannot both be stated, and
+    // keeping whichever arrived first would silently drop a legally required
+    // justification for half the base.
+    let err = two_exempt_layers(
+        "VATEX-1",
+        exempt("Bildung", "a").with_exemption_reason_code("VATEX-EU-132"),
+        exempt("Finanz", "b").with_exemption_reason_code("VATEX-EU-135"),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("conflicting exemption reason codes"),
+        "{err}"
+    );
+
+    // The same code twice is one code, and merges.
+    let doc = two_exempt_layers(
+        "VATEX-2",
+        exempt("X", "a").with_exemption_reason_code("VATEX-EU-132"),
+        exempt("Y", "b").with_exemption_reason_code("VATEX-EU-132"),
+    )
+    .unwrap();
+    assert_eq!(doc.tax_breakdown().len(), 1);
+    assert_eq!(
+        doc.tax_breakdown()[0].exemption_reason_code.as_deref(),
+        Some("VATEX-EU-132")
+    );
+    assert_eq!(
+        doc.tax_breakdown()[0].taxable_base,
+        Amount::parse("150.00000").unwrap()
+    );
+
+    // BR-E-10 accepts the code *or* the text, so the two layers may satisfy it
+    // differently. The merged line has to end up with both — dropping whichever
+    // the first entry lacked is how a lawful pair becomes an unlawful single.
+    let doc = two_exempt_layers(
+        "VATEX-3",
+        exempt("X", "a").with_exemption_reason_code("VATEX-EU-132"),
+        exempt("Y", "b")
+            .with_exemption_reason("Art. 132 education")
+            .with_exemption_reason_code("VATEX-EU-132"),
+    )
+    .unwrap();
+    assert_eq!(doc.tax_breakdown().len(), 1);
+    assert_eq!(
+        doc.tax_breakdown()[0].exemption_reason.as_deref(),
+        Some("Art. 132 education"),
+        "BT-120 must carry over from the entry that had it"
+    );
+    assert_eq!(
+        doc.tax_breakdown()[0].exemption_reason_code.as_deref(),
+        Some("VATEX-EU-132")
+    );
+
+    // And the mirror image: the text arrives first, the code second.
+    let doc = two_exempt_layers(
+        "VATEX-4",
+        exempt("X", "a").with_exemption_reason("Art. 132 education"),
+        exempt("Y", "b")
+            .with_exemption_reason("Art. 132 education")
+            .with_exemption_reason_code("VATEX-EU-132"),
+    )
+    .unwrap();
+    assert_eq!(doc.tax_breakdown().len(), 1);
+    assert_eq!(
+        doc.tax_breakdown()[0].exemption_reason_code.as_deref(),
+        Some("VATEX-EU-132"),
+        "BT-121 must carry over from the entry that had it"
+    );
+    assert_eq!(
+        doc.tax_breakdown()[0].exemption_reason.as_deref(),
+        Some("Art. 132 education")
+    );
+    doc.assert_valid();
+}
+
 #[test]
 fn reversing_a_negative_debit_does_not_mint_an_invalid_credit_line() {
     // A Debit with a NEGATIVE net (negative spot price, or VAT on a negative base)
@@ -1487,6 +1596,157 @@ fn vat_tag_is_engine_assigned_so_custom_layers_classify_correctly() {
         doc.charge_total().unwrap(),
         Amount::parse("5.00000").unwrap()
     );
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+
+    // `CustomVat` overrides neither `covers` nor `allowance_charge`, so this is
+    // also the test of what those defaults do. `covers` defaults to `true` —
+    // "this layer taxes everything it is given" — and that is what puts BT-151 /
+    // BT-152 on each taxable position. A default of `false` would attribute
+    // nothing, leaving BR-CO-04 unsatisfied on every line.
+    let line = &doc.net_positions()[0];
+    let attribution = line.vat.as_ref().expect("BT-151 / BT-152 on the line");
+    assert_eq!(attribution.category, TaxCategory::Standard);
+    assert_eq!(attribution.rate, dec!(0.19));
+
+    // `CustomCharge` overrides neither, and its `allowance_charge` default of
+    // `None` is load-bearing: an empty `AllowanceCharge` conjured in its place
+    // would state a BG-21 with no reason at all, which BR-CO-21 forbids.
+    let charge = doc.charge_positions().next().unwrap();
+    assert!(charge.allowance_charge.is_none());
+    // The charge is inside the VAT base, so it carries the covering layer's pair.
+    assert_eq!(
+        charge.vat.as_ref().map(|v| v.rate),
+        Some(dec!(0.19)),
+        "BT-102 / BT-103 derived from the layer that covers it"
+    );
+}
+
+/// A layer may declare its BG-21 detail at the layer level rather than filling it
+/// in `compute`, and assembly attaches it — but only to charges, never to VAT.
+#[test]
+fn assembly_backfills_charge_detail_onto_charges_and_not_onto_vat() {
+    use billing::{AllowanceCharge, LineVat};
+
+    // Unlike `PercentageCharge`, this layer computes a flat amount and has nothing
+    // it needs to know about the base — so it states BT-102 / BT-105 once, on the
+    // layer, and leaves the position it returns bare. That fallback is what the
+    // `TaxLayer::allowance_charge` and `TaxLayer::vat` docs promise.
+    struct DeclaredCharge;
+    impl TaxLayer for DeclaredCharge {
+        fn name(&self) -> &str {
+            "Handling"
+        }
+        fn compute(&self, _: &[LineItem]) -> Result<LineItem, BillingError> {
+            // Carries neither `allowance_charge` nor `vat` of its own.
+            LineItem::debit("Handling")
+                .fixed_amount(Amount::parse("5.00000").unwrap())
+                .build()
+        }
+        fn allowance_charge(&self) -> Option<AllowanceCharge> {
+            Some(AllowanceCharge {
+                reason_code: Some("ABK".into()),
+                base_amount: None,
+                percentage: None,
+            })
+        }
+        fn vat(&self) -> Option<LineVat> {
+            // BR-37: a charge needs its own category and rate. It must agree with
+            // the VAT layer that covers it, or assembly reports a LayerError.
+            Some(LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap())
+        }
+    }
+
+    let doc = BillingDocument::builder()
+        .meta(meta("BG21-FALLBACK"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(Box::new(DeclaredCharge))
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // The charge picked up what the layer declared.
+    let charge = doc.charge_positions().next().expect("one charge");
+    assert_eq!(charge.net_amount, Amount::parse("5.00000").unwrap());
+    let detail = charge.allowance_charge.as_ref().expect("BG-21 detail");
+    assert_eq!(detail.reason_code.as_deref(), Some("ABK")); // BT-105
+    let vat = charge.vat.as_ref().expect("BT-102 / BT-103");
+    assert_eq!(vat.category, TaxCategory::Standard);
+    assert_eq!(vat.rate, dec!(0.19));
+
+    // The VAT position is BG-23 and carries neither: a charge sits *inside* the
+    // taxable base, VAT is the tax *on* that base. Attaching BT-102 to it would
+    // report the VAT as a second charge and double the document's BT-108.
+    let vat_position = doc.vat_positions().next().expect("one VAT position");
+    assert!(vat_position.allowance_charge.is_none());
+    assert!(vat_position.vat.is_none());
+
+    // VAT is on 100 + 5, and the charge total counts the charge once.
+    assert_eq!(doc.vat_total().unwrap(), Amount::parse("19.95000").unwrap());
+    assert_eq!(
+        doc.charge_total().unwrap(),
+        Amount::parse("5.00000").unwrap()
+    );
+    doc.verify_vat_attribution().unwrap();
+    doc.assert_valid();
+}
+
+/// A `DiscountLayer` that overrides neither `vat` nor `allowance_charge` gets
+/// neither invented for it — the defaults are `None`, and `None` is load-bearing.
+#[test]
+fn a_discount_layer_using_the_defaults_gets_no_bg_20_detail_invented() {
+    use billing::DiscountLayer;
+
+    // The mirror of `CustomCharge` on the allowance side. Both defaults matter for
+    // the same reason: an `AllowanceCharge` conjured out of `Default` states a
+    // BG-20 with no reason code and no reason text, which BR-CO-21 forbids —
+    // and it would do so on a document whose every amount is right, so nothing
+    // arithmetic would notice.
+    struct BareDiscount;
+    impl DiscountLayer for BareDiscount {
+        fn name(&self) -> &str {
+            "Kulanz"
+        }
+        fn compute(&self, _: &[LineItem]) -> Result<LineItem, BillingError> {
+            LineItem::credit("Kulanz")
+                .fixed_amount(Amount::parse("10.00000").unwrap())
+                .build()
+        }
+    }
+
+    let doc = BillingDocument::builder()
+        .meta(meta("BG20-DEFAULT"))
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(Box::new(BareDiscount))
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    let allowance = &doc.discount_positions()[0];
+    assert_eq!(allowance.net_amount, Amount::parse("-10.00000").unwrap());
+    assert!(
+        allowance.allowance_charge.is_none(),
+        "no BG-20 detail may be invented for a layer that declared none"
+    );
+    // BT-95 / BT-96 still arrive, but from the VAT layer that covers the
+    // allowance rather than from the discount layer's own (absent) declaration.
+    assert_eq!(
+        allowance.vat.as_ref().map(|v| v.rate),
+        Some(dec!(0.19)),
+        "BR-32 attribution derived from the covering layer"
+    );
+
+    // 100 − 10 = 90 taxable, 19 % of 90 = 17.10.
+    assert_eq!(doc.net_total(), Amount::parse("90.00000").unwrap());
+    assert_eq!(doc.tax_total(), Amount::parse("17.10000").unwrap());
     doc.verify_vat_attribution().unwrap();
     doc.assert_valid();
 }
@@ -2917,8 +3177,29 @@ fn line_allowances_follow_scaling_and_reversal() {
         reversed.line_allowances[0].amount,
         Amount::parse("-100.00000").unwrap()
     );
+    // BT-137 follows BT-136. Leaving the base positive beside a negated amount
+    // states "−100.00, being 10 % of 1000.00" — arithmetic that only holds
+    // because R040 compares magnitudes, which is exactly why nothing else here
+    // would catch it.
+    assert_eq!(
+        reversed.line_allowances[0].base_amount,
+        Some(Amount::parse("-1000.00000").unwrap())
+    );
+    assert_eq!(reversed.line_allowances[0].percentage, Some(dec!(10))); // a rate: unsigned
     reversed.validate().unwrap(); // R040 compares magnitudes, so it survives
     credit.assert_valid();
+
+    // Reversing twice is the identity, base included.
+    let restored = credit.reverse(meta("INV-LA-2")).unwrap();
+    let restored = &restored.net_positions()[0];
+    assert_eq!(
+        restored.line_allowances[0].base_amount,
+        Some(Amount::parse("1000.00000").unwrap())
+    );
+    assert_eq!(
+        restored.line_allowances[0].amount,
+        Amount::parse("100.00000").unwrap()
+    );
 }
 
 /// A line allowance moves BT-131 only. The document totals chain needs no special
