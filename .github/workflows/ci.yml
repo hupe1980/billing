@@ -101,10 +101,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          # `just` so CI runs the *same* recipe as a developer does. The recipe
+          # asserts that every advisory ignored in .cargo/audit.toml is ignored for a
+          # crate that is genuinely not in the build graph — two implementations of
+          # that check would drift, and the one in CI would drift silently.
+          tool: cargo-audit,just
       - name: Run audit
-        run: cargo audit
+        run: just audit
 
   # ── License / dependency policy ─────────────────────────────────────────────
   deny:

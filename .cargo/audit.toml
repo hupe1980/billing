@@ -1,0 +1,30 @@
+# cargo-audit configuration — https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# `cargo audit` reads `Cargo.lock`, and a lockfile is **feature-agnostic**: it records
+# every optional dependency any crate in the graph *could* activate, whether or not
+# anything activates it. So an advisory can fire against a crate this project never
+# compiles.
+#
+# Each ignore below therefore comes with the reason it is safe *and* with a check that
+# keeps it honest — `just audit` asserts the crate is absent from the resolved build
+# graph before it runs the audit. If a future change enables the feature, the assertion
+# fails and the ignore stops being justified, rather than silently covering a real
+# exposure.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0235 — rkyv 0.7: out-of-bounds reads validating archives that
+    # contain Rc/Arc. Fixed in rkyv 0.8.17.
+    #
+    # `rust_decimal` declares `rkyv = { version = "0.7.46", optional = true }` behind
+    # its `rkyv` feature. This crate depends on `rust_decimal` with
+    # `default-features = false, features = ["std"]` and never enables `rkyv`, so the
+    # code is not built, not linked, and not reachable:
+    #
+    #     $ cargo tree -i rkyv --all-features
+    #     warning: nothing to print.
+    #
+    # There is also nothing to upgrade to: 0.7.46 is the newest 0.7, and moving to
+    # 0.8 is `rust_decimal`'s call, not ours.
+    "RUSTSEC-2026-0235",
+]

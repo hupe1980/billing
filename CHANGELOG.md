@@ -395,6 +395,32 @@ last place in the crate that assumed a currency; `RateSchedule`, `TimeOfUsePrici
 `DocumentMeta` is documented as extensible by struct-update syntax, so its new field
 breaks only exhaustive struct literals.
 
+### Fixed — the security audit failed on a crate that is never built
+
+`cargo audit` failed CI on **RUSTSEC-2026-0235** (rkyv 0.7: out-of-bounds reads
+validating archives containing `Rc`/`Arc`).
+
+rkyv is not a dependency of this crate in any meaningful sense. `rust_decimal`
+declares it `optional = true` behind an `rkyv` feature that nothing here enables, and
+`cargo tree -i rkyv --all-features` prints *nothing*: it is not built, not linked and
+not reachable. The advisory fires because `Cargo.lock` is **feature-agnostic** — it
+records every optional dependency any crate in the graph could activate. There is also
+nothing to upgrade to; 0.7.46 is the newest 0.7, and moving to 0.8 is `rust_decimal`'s
+call.
+
+So it is ignored in a new `.cargo/audit.toml` — **paired with the invariant that
+justifies it.** `just audit` now asserts each ignored crate is absent from the resolved
+build graph *before* running the audit. Enable `rust_decimal/rkyv` in a future release
+and the assertion fails, rather than the ignore silently covering a real exposure. CI
+runs `just audit` rather than `cargo audit`, so the check cannot exist only locally.
+
+`deny.toml` deliberately does **not** mirror the ignore. cargo-deny resolves features,
+so the optional dependency was never in its graph and it never flagged this — an entry
+there would match nothing and quietly stop meaning anything. That difference between
+the two tools is now written down where the empty `ignore = []` sits.
+
+Lockfile refreshed while there: 13 patch-level updates, all within the 1.85 MSRV.
+
 ### Changed — mutation testing is no longer a CI gate
 
 It was wired into CI on pull requests. It is not any more, and the nightly sweep that

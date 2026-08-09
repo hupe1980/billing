@@ -330,6 +330,22 @@ mutants-list *ARGS:
 
 # Audit dependencies for known vulnerabilities (requires `cargo install cargo-audit`).
 audit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # `.cargo/audit.toml` ignores advisories against crates that are in Cargo.lock but
+    # never built — a lockfile records optional dependencies whether or not anything
+    # activates them. That reasoning is only valid while the crate really is absent
+    # from the resolved graph, so assert it rather than trust the comment.
+    #
+    # `cargo tree -i` resolves features, so it prints nothing for a crate no feature
+    # selection reaches. If one ever does, this fails and the ignore must be revisited.
+    for crate in rkyv; do
+        if cargo tree -i "$crate" --all-features --quiet 2>/dev/null | grep -q .; then
+            echo "$crate is now in the build graph — its entry in .cargo/audit.toml" >&2
+            echo "is no longer justified. Upgrade it or remove the ignore." >&2
+            exit 1
+        fi
+    done
     cargo audit
 
 # Check for accidental semver-breaking API changes
