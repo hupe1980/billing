@@ -32,6 +32,36 @@ minimum_test_timeout = 30
 # a `Vec` reallocates, so no test can — or should — distinguish it.
 skip_calls_defaults = true
 
+# ── Speed ─────────────────────────────────────────────────────────────────────
+#
+# A full sweep compiles and tests the crate about a thousand times, so anything
+# paid per mutant is paid a thousand times. Three settings carry almost all of it,
+# and none of them changes which mutants are caught.
+
+# No debuginfo, no incremental state — see `[profile.mutants]` in Cargo.toml.
+profile = "mutants"
+
+# Doctests are excluded from mutation runs, and only from mutation runs.
+#
+# They are the most expensive third of `cargo test` here (163 of them, plus the
+# whole README compiled as one), and they are the *least* informative to a mutant:
+# a doctest exists to show a reader how a function is called, so it exercises the
+# happy path that the unit and integration suites already cover several times over.
+# Where that turned out to be false, the answer was a missing unit test rather than
+# a slower sweep: the first run with doctests excluded surfaced several functions
+# whose *only* coverage was an example. Each got a real test. That is the outcome to
+# repeat if a new survivor appears here — a function tested only by a doctest is a
+# gap whether or not the sweep is what reveals it.
+#
+# `just test` and CI still run every doctest on the unmutated tree, which is where
+# a broken example actually matters.
+additional_cargo_test_args = ["--lib", "--tests"]
+
+# Parallelism is not set here: it belongs to the machine, not to the project. A
+# 4-core GitHub runner and a 14-core laptop want different numbers, and the wrong
+# one either idles cores or thrashes memory. `just mutants*` derives it from the
+# core count; CI sets CARGO_MUTANTS_JOBS per runner.
+
 # ── Known survivors ───────────────────────────────────────────────────────────
 #
 # There is deliberately no `exclude_re` here. An exclusion is a permanent blind

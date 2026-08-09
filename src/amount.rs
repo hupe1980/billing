@@ -214,6 +214,36 @@ impl AmountScale {
     }
 }
 
+/// The **exact**, unrounded tax contained in a tax-inclusive amount:
+/// `gross × rate ÷ (1 + rate)`.
+///
+/// Shared by [`Amount::extract_tax`], which rounds it at the type's precision, and
+/// by [`crate::TaxBreakdownEntry::from_gross`], which rounds it at an interchange
+/// scale. Deriving it in one place is what keeps the two from disagreeing about
+/// what "the VAT fraction" means — and each of them rounds the *exact* value once
+/// rather than reducing the other's already-rounded answer.
+pub(crate) fn exact_tax_in_gross(gross: Decimal, rate: Decimal) -> Result<Decimal, BillingError> {
+    if rate.is_sign_negative() && !rate.is_zero() {
+        return Err(BillingError::InvalidInput {
+            reason: format!("a tax-inclusive amount cannot carry a negative rate, got {rate}"),
+        });
+    }
+    if rate.is_zero() {
+        return Ok(Decimal::ZERO);
+    }
+    let overflow = || BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    };
+    // `1 + rate` is strictly above 1 here, so the division is always defined.
+    // `checked_*` throughout: `Decimal`'s own operators panic on overflow.
+    let divisor = Decimal::ONE.checked_add(rate).ok_or_else(overflow)?;
+    gross
+        .checked_mul(rate)
+        .and_then(|p| p.checked_div(divisor))
+        .ok_or_else(overflow)
+}
+
 // ── Amount<P> ─────────────────────────────────────────────────────────────────
 
 /// Fixed-point monetary amount with `P` decimal places.
@@ -248,7 +278,7 @@ impl AmountScale {
 ///
 /// `P > 18` is a **compile-time** error: `10¹⁹` exceeds `i64::MAX`.
 ///
-/// `EuroAmount` (`P = 5`) therefore tops out around **92 trillion** currency
+/// `Amount<5>` therefore tops out around **92 trillion** currency
 /// units. That is far above any single invoice and above any realistic portfolio
 /// aggregate, which is why the backing type is `i64` rather than `i128`: doubling
 /// the width of every amount in every document buys headroom nobody needs. If you
@@ -294,13 +324,13 @@ impl AmountScale {
 /// [`Amount::from_decimal_rounded`] is the opt-in that rounds instead, and it
 /// requires you to name the [`RoundingStrategy`].
 ///
-/// # Common type aliases
+/// # No currency-named aliases
 ///
-/// ```rust
-/// use billing::{EuroAmount, InvoiceAmt};
-/// let _: EuroAmount  = billing::Amount::parse("0.03456").unwrap(); // 5 dp
-/// let _: InvoiceAmt  = billing::Amount::parse("49.99").unwrap();   // 2 dp
-/// ```
+/// There is deliberately no `EuroAmount` or `InvoiceAmt`. Both existed until 0.12.0
+/// and both were unused: `Amount<5>` says what `EuroAmount` said without claiming a
+/// currency the crate is careful never to assume, and `Amount<2>` says what
+/// `InvoiceAmt` said without implying that two decimals is "the invoice precision" —
+/// documents are assembled at `Amount<5>` and reduced with [`AmountScale`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[must_use = "Amount is an immutable value; every operation returns a new one"]
 pub struct Amount<const P: u8>(i64);
@@ -682,6 +712,86 @@ impl<const P: u8> Amount<P> {
                 reason: format!("division by zero or overflow: {self} / {divisor}"),
             })?;
         Self::from_decimal_rounded(q, RoundingStrategy::MidpointAwayFromZero)
+    }
+
+    /// The tax **contained in** a tax-inclusive amount — `self × rate ÷ (1 + rate)`.
+    ///
+    /// # Why this is not `self × rate`
+    ///
+    /// A gross price already includes the tax, so the rate applies to the *net*
+    /// part, which is what is unknown. Multiplying the gross by the rate over-states
+    /// the tax by exactly `rate²` of the net: on `119.00` at 19 % it gives `22.61`
+    /// instead of `19.00`. The correct extraction is the "VAT fraction" every tax
+    /// authority publishes for retail — `19/119`, `7/107`, `1/6` for a 20 % rate.
+    ///
+    /// # When you need it
+    ///
+    /// Consumer prices are quoted tax-inclusive nearly everywhere — German B2C
+    /// under §1 PAngV, and the same in most of the EU, the UK and Australia. EN 16931
+    /// nonetheless requires the **net** figures: BT-131 per line, BT-116 per VAT
+    /// category, BT-109 for the document, with BT-117 derived from them under
+    /// BR-CO-17. So a gross-quoted catalogue has to be converted once, at the
+    /// boundary, before any of the totals chain is computed — and the crate rounds
+    /// leaves rather than aggregates for exactly this reason (see [`AmountScale`]).
+    ///
+    /// The pair `(net_of_tax, extract_tax)` reconstructs `self` exactly under any
+    /// strategy, because the net is defined as the remainder rather than rounded
+    /// independently.
+    ///
+    /// # Rounds at `P`
+    ///
+    /// This is the primitive, so it rounds once at the type's own precision. To
+    /// split a gross price straight onto an **interchange** precision — EN 16931's
+    /// two decimals — use [`crate::TaxBreakdownEntry::from_gross`], which takes an
+    /// [`AmountScale`] and rounds once *there*. Calling this and then reducing the
+    /// result rounds twice, and two roundings are not one: see
+    /// [`AmountScale::apply_decimal`].
+    ///
+    /// ```rust
+    /// use billing::{Amount, RoundingStrategy};
+    /// use rust_decimal::dec;
+    ///
+    /// let gross = Amount::<5>::parse("119.00000")?;
+    /// let tax   = gross.extract_tax(dec!(0.19), RoundingStrategy::MidpointAwayFromZero)?;
+    /// let net   = gross.net_of_tax(dec!(0.19), RoundingStrategy::MidpointAwayFromZero)?;
+    ///
+    /// assert_eq!(tax, Amount::parse("19.00000")?);   // not 22.61
+    /// assert_eq!(net, Amount::parse("100.00000")?);
+    /// assert_eq!(net.checked_add(tax)?, gross);      // exact, by construction
+    ///
+    /// // A zero rate contains no tax, and the whole amount is net.
+    /// assert_eq!(gross.extract_tax(dec!(0), RoundingStrategy::Truncate)?, Amount::ZERO);
+    /// # Ok::<(), billing::BillingError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// - [`BillingError::InvalidInput`] if `rate` is negative — a tax-inclusive
+    ///   amount at a negative rate is not a thing, and the formula's sign flips.
+    /// - [`BillingError::MonetaryOverflow`] if the intermediate product or the
+    ///   rounded result leaves the representable range.
+    pub fn extract_tax(
+        self,
+        rate: Decimal,
+        strategy: RoundingStrategy,
+    ) -> Result<Self, BillingError> {
+        Self::from_decimal_rounded(exact_tax_in_gross(self.into_decimal(), rate)?, strategy)
+    }
+
+    /// The net part of a tax-inclusive amount — `self − self.extract_tax(rate, …)`.
+    ///
+    /// Defined as the **remainder**, not as an independent rounding of
+    /// `self ÷ (1 + rate)`, so `net + tax == self` holds exactly. See
+    /// [`extract_tax`](Self::extract_tax).
+    ///
+    /// # Errors
+    /// As [`Amount::extract_tax`], plus [`BillingError::MonetaryOverflow`] if the
+    /// subtraction leaves range.
+    pub fn net_of_tax(
+        self,
+        rate: Decimal,
+        strategy: RoundingStrategy,
+    ) -> Result<Self, BillingError> {
+        self.checked_sub(self.extract_tax(rate, strategy)?)
     }
 
     /// Split into `n` parts that sum **exactly** back to `self`.
@@ -1493,11 +1603,6 @@ impl<const P: u8> Default for Amount<P> {
     }
 }
 
-/// 5 decimal places — high-precision monetary amounts.
-pub type EuroAmount = Amount<5>;
-/// Standard invoice precision: 2 decimal places (e.g. `49.99`).
-pub type InvoiceAmt = Amount<2>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1571,6 +1676,34 @@ mod tests {
     fn checked_overflow() {
         let max = Amount::<5>(i64::MAX);
         assert!(max.checked_add(Amount::<5>::from_raw_units(1)).is_err());
+    }
+
+    #[test]
+    fn checked_div_returns_the_quotient_and_refuses_a_zero_divisor() {
+        // Until 0.12.0 the only thing asserting this was a doctest: `properties.rs`
+        // called it and discarded the result, so replacing the whole body with
+        // `Ok(Default::default())` passed the suite. Deriving a unit price from a
+        // total is exactly where a silent zero would be least visible.
+        let total = Amount::<5>::parse("100.00000").unwrap();
+        assert_eq!(
+            total.checked_div(Decimal::from(4u32)).unwrap(),
+            Amount::parse("25.00000").unwrap()
+        );
+        // Not a no-op: a default-returning body would answer ZERO here.
+        assert!(!total.checked_div(Decimal::from(4u32)).unwrap().is_zero());
+
+        // Commercial rounding at P, on a quotient that does not terminate.
+        assert_eq!(
+            Amount::<5>::parse("10.00000")
+                .unwrap()
+                .checked_div(Decimal::from(3u32))
+                .unwrap(),
+            Amount::parse("3.33333").unwrap()
+        );
+
+        // `Decimal`'s own `/` panics on both; this returns.
+        assert!(total.checked_div(Decimal::ZERO).is_err());
+        assert!(total.checked_div(Decimal::new(1, 28)).is_err());
     }
 
     #[test]

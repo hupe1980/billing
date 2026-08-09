@@ -647,6 +647,74 @@ impl TaxBreakdownEntry {
         }
     }
 
+    /// Build an entry from a **tax-inclusive** total, splitting it into BT-116 and
+    /// BT-117.
+    ///
+    /// The consumer-pricing case: a catalogue quoted gross (§1 PAngV in Germany, and
+    /// the equivalent almost everywhere else) still has to be invoiced net, because
+    /// EN 16931's whole totals chain is net and BR-CO-17 derives BT-117 from BT-116.
+    /// This does that split once, at the boundary:
+    ///
+    /// ```text
+    /// BT-117 = round(gross × rate ÷ (1 + rate))     ← the "VAT fraction", 19/119
+    /// BT-116 = gross − BT-117                       ← the remainder, so the two re-sum
+    /// ```
+    ///
+    /// Deriving the base as the remainder rather than rounding it separately is what
+    /// keeps `BT-116 + BT-117` equal to the gross the customer was quoted — the
+    /// figure the price tag promised, and the one a rounding of both halves would
+    /// miss by a cent.
+    ///
+    /// # The scale is the interchange scale, and it rounds once
+    ///
+    /// `scale` is where the tax lands, and the exact product is rounded **once**, at
+    /// that precision — never at the engine's five decimals and then again on the way
+    /// out. On a gross of `9.99` at 19 % the exact tax is `1.59504`: rounding once to
+    /// two decimals gives `1.60`, while reducing the five-decimal answer afterwards
+    /// gives the same here and a different figure elsewhere. EN 16931 makes the
+    /// single rounding the required behaviour — BR-CO-17 defines BT-117 as the
+    /// rounded product, and a validator recomputes it exactly that way.
+    ///
+    /// Both results are therefore already at `scale`, so a document assembled with
+    /// [`amount_scale`](crate::BillingDocumentBuilder::amount_scale) at the same
+    /// precision leaves them untouched. Pass `AmountScale::new(5, …)` to stay at the
+    /// engine's own precision.
+    ///
+    /// ```rust
+    /// use billing::{Amount, AmountScale, TaxBreakdownEntry, TaxCategory};
+    /// use rust_decimal::dec;
+    ///
+    /// // A shelf price of 9,99 € including 19 % VAT.
+    /// let entry = TaxBreakdownEntry::from_gross(
+    ///     TaxCategory::Standard, dec!(0.19),
+    ///     Amount::parse("9.99000")?, AmountScale::EN16931,
+    /// )?;
+    ///
+    /// assert_eq!(entry.taxable_base, Amount::parse("8.39000")?); // BT-116
+    /// assert_eq!(entry.tax_amount,   Amount::parse("1.60000")?); // BT-117
+    /// assert!(entry.validate().is_ok());                         // BR-CO-17 holds
+    /// // Nothing is lost: the two still add up to the price on the tag.
+    /// assert_eq!(entry.taxable_base.checked_add(entry.tax_amount)?, Amount::parse("9.99000")?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// [`crate::BillingError::InvalidInput`] if `rate` is negative, or
+    /// [`crate::BillingError::MonetaryOverflow`] on overflow. The category rules are
+    /// **not** checked here, exactly as in [`TaxBreakdownEntry::new`] — attach an
+    /// exemption reason first, then call [`validate`](Self::validate).
+    pub fn from_gross(
+        category: TaxCategory,
+        rate: Decimal,
+        gross: Amount<5>,
+        scale: crate::amount::AmountScale,
+    ) -> Result<Self, crate::error::BillingError> {
+        let exact = crate::amount::exact_tax_in_gross(gross.into_decimal(), rate)?;
+        let tax_amount = scale.apply_decimal(exact)?;
+        let taxable_base = gross.checked_sub(tax_amount)?;
+        Ok(Self::new(category, rate, taxable_base, tax_amount))
+    }
+
     /// Attach the BT-120 exemption reason text.
     #[must_use]
     pub fn with_exemption_reason(mut self, reason: impl Into<String>) -> Self {

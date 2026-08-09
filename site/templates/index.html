@@ -1,0 +1,28 @@
+{#- Landing page.
+
+    The template is deliberately a thin shell: the content lives in
+    `content/_index.md` so that fenced code blocks get syntax-highlighted at render
+    time, which they cannot be if they are written as literal HTML in a template.
+    Structural wrappers are raw HTML blocks inside that markdown — CommonMark passes
+    them through and resumes parsing markdown after a blank line. -#}
+{% extends "base.html" %}
+
+{% block content %}
+{%- set docs = get_section(path="docs/_index.md") -%}
+
+<div class="landing">
+{{ section.content | safe }}
+
+<section class="wrap">
+  <h2 id="documentation">Documentation</h2>
+  <ul class="doc-index">
+    {%- for p in docs.pages %}
+    <li>
+      <a href="{{ p.permalink }}">{{ p.title }}</a>
+      <span>{{ p.description }}</span>
+    </li>
+    {%- endfor %}
+  </ul>
+</section>
+</div>
+{% endblock content %}

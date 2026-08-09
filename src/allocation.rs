@@ -247,6 +247,11 @@ impl AllocationRule for ProportionalAllocation {
         // amounts due would sum to the gross rather than to the original amount due.
         let mut prepaid_remaining = doc.prepaid();
         let mut rounding_remaining = doc.rounding();
+        // BT-111 is a VAT total and splits exactly as BT-110 does. Dropping it
+        // would leave every recipient's document naming a VAT accounting currency
+        // with nothing in it — or, worse, silently omitting a figure BR-53 makes
+        // mandatory once BT-6 is present.
+        let mut accounting_remaining = doc.vat_accounting_currency().map(|a| a.vat_total());
         // The VAT breakdown must be split alongside the totals: an allocated
         // document without its per-rate breakdown is not a lawful invoice. Each
         // entry is tracked separately so the last recipient absorbs the remainder
@@ -278,6 +283,22 @@ impl AllocationRule for ProportionalAllocation {
                 prepaid_remaining = prepaid_remaining.checked_sub(p)?;
                 rounding_remaining = rounding_remaining.checked_sub(r)?;
                 (p, r)
+            };
+
+            let vat_accounting_currency = match doc.vat_accounting_currency() {
+                None => None,
+                Some(acct) => {
+                    let part = if is_last {
+                        accounting_remaining.unwrap_or(Amount::ZERO)
+                    } else {
+                        let p = acct.vat_total().checked_mul_qty(*share)?;
+                        if let Some(rem) = accounting_remaining.as_mut() {
+                            *rem = rem.checked_sub(p)?;
+                        }
+                        p
+                    };
+                    Some(acct.with_vat_total(part))
+                }
             };
 
             // Split each VAT breakdown group the same way as the totals.
@@ -345,6 +366,7 @@ impl AllocationRule for ProportionalAllocation {
                 tax_breakdown: breakdown,
                 prepaid,
                 rounding,
+                vat_accounting_currency,
             })?);
             // The rustdoc promises "(4) each recipient's assert_valid() passes".
             // `from_raw` performs no total validation, so without this the promise

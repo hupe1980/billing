@@ -1,12 +1,43 @@
-//! [`Tariff`] trait — the primary extension point for domain-specific billing logic.
+//! [`PricingModel`] — the primary extension point for domain-specific billing logic.
 //!
-//! Three traits and one enum:
+//! One trait and one enum:
 //!
 //! | Item | Use it when |
 //! |------|-------------|
-//! | [`Tariff`] | pricing is driven by usage data (metered consumption, seats, calls) |
-//! | [`ScalarTariff`] | the positions are already computed and there is no usage input |
+//! | [`PricingModel`] | you are adapting a domain to the engine — usage in, priced positions and layers out |
 //! | [`Billing`] | the outcome is "positions", "a document", **or** "nothing to bill, because …" |
+//!
+//! # Why "PricingModel" and not "Tariff"
+//!
+//! Until 0.12.0 this trait was `Tariff`, and the rate table was `TariffSchedule`.
+//! *Tariff* is perfectly good English for a published schedule of rates — the sense
+//! is as old as the customs-duty one, both from the 1590s, and UK primary legislation
+//! is titled the *Domestic Gas and Electricity (Tariff Cap) Act 2018*.
+//!
+//! It was still the wrong name **here**. This crate advertises zero domain
+//! assumptions, and every other public name keeps that promise:
+//! [`crate::LineItem`], [`crate::Quantity`], [`crate::UnitPrice`],
+//! [`crate::TaxLayer`], [`crate::UsageAggregator`], [`crate::AllocationRule`].
+//! *Tariff* is the vocabulary of utilities and telecoms specifically — a SaaS or
+//! marketplace developer says *plan*, *pricing model* or *rate card*, and in American
+//! English the word's dominant sense is an import duty, which this crate has nothing
+//! to do with. Naming the primary extension point after one domain cluster is exactly
+//! the assumption the crate says it does not make.
+//!
+//! `PricingModel` is the phrase every one of those domains already uses for "how we
+//! work out what to charge", and [`crate::RateSchedule`] / [`crate::RateBand`] join
+//! [`crate::RateLookup`] in a neutral family of rate tables.
+//!
+//! # `PricingModel` is not [`crate::RateSchedule`]
+//!
+//! They sit at different levels, and the similar names invite the wrong guess.
+//!
+//! A [`crate::RateSchedule`] is a **rate table** — the banded prices themselves —
+//! alongside [`crate::RateLookup`], [`crate::TimeOfUsePricing`] and
+//! [`crate::DynamicPricing`]. A `PricingModel` is the **adapter** that decides which of
+//! those to consult, in what order, with what quantities, and which tax and discount
+//! layers apply. A schedule is a thing a model *uses*; it does not implement this
+//! trait, and would have nothing to say about tax layers if it did.
 use std::convert::Infallible;
 use std::fmt;
 
@@ -33,10 +64,10 @@ use crate::tax::{DiscountLayer, TaxLayer};
 /// `Err` it pollutes the error path with an ordinary business state, so callers
 /// cannot tell a missing price from a genuine arithmetic failure.
 ///
-/// `R` is the tariff's own reason type ([`Tariff::NotBillable`]), so domains keep
+/// `R` is the model's own reason type ([`PricingModel::NotBillable`]), so domains keep
 /// their own enum and match it exhaustively.
 ///
-/// # Tariffs that always bill
+/// # Models that always bill
 ///
 /// Set `type NotBillable = `[`Infallible`] and the [`NotBillable`](Billing::NotBillable)
 /// variant becomes uninhabited — the compiler knows the outcome is always
@@ -109,7 +140,7 @@ impl<T, R> Billing<T, R> {
 
     /// Transform the reason, leaving a billable value untouched.
     ///
-    /// Use when composing a domain tariff into a wider one whose reason type is
+    /// Use when composing a domain model into a wider one whose reason type is
     /// broader.
     #[must_use]
     pub fn map_reason<S, F: FnOnce(R) -> S>(self, f: F) -> Billing<T, S> {
@@ -136,7 +167,7 @@ impl<T> Billing<T, Infallible> {
     ///
     /// Available only for `R = `[`Infallible`], where the
     /// [`NotBillable`](Billing::NotBillable) variant cannot be constructed. This is
-    /// a total function — not a panicking `unwrap` — so a tariff that always bills
+    /// a total function — not a panicking `unwrap` — so a model that always bills
     /// pays nothing for the third outcome existing.
     #[must_use]
     pub fn into_inner(self) -> T {
@@ -171,50 +202,81 @@ impl<T, R: fmt::Display> fmt::Display for Billing<T, R> {
     }
 }
 
-/// The positions-or-reason outcome returned by [`Tariff::line_items`].
+/// The positions-or-reason outcome returned by [`PricingModel::positions`].
 pub type Positions<R> = Billing<Vec<LineItem>, R>;
 
-/// The document-or-reason outcome returned by [`Tariff::try_bill`].
+/// The document-or-reason outcome returned by [`PricingModel::try_bill`].
 pub type Billed<R> = Billing<BillingDocument, R>;
 
-// ── Tariff ────────────────────────────────────────────────────────────────────
+// ── PricingModel ────────────────────────────────────────────────────────────────────
 
 /// Implement this trait to adapt any domain to the billing engine.
 ///
 /// # Design
 ///
-/// - `line_items` is a **pure function**: no I/O, no clock access, no mutation.
+/// - `positions` is a **pure function**: no I/O, no clock access, no mutation.
 /// - Tax and discount layers declared here are applied by the document builder
 ///   in order. Tax ordering is significant (e.g. Stromsteuer before MwSt).
-/// - The separation between pricing (`line_items`) and taxes (`tax_layers`)
+/// - The separation between pricing (`positions`) and taxes (`tax_layers`)
 ///   mirrors real-world invoicing: net amount and tax calculation are
 ///   independently auditable.
 ///
-/// # Choosing between `Tariff` and [`ScalarTariff`]
+/// # Settlements with no usage input
 ///
-/// If pricing consumes usage data, implement `Tariff`. If the positions are
-/// already computed and there is no usage input, implement [`ScalarTariff`]
-/// instead — a blanket impl supplies `Tariff` for you, so you neither write
-/// `type Usage = ()` nor take an argument you ignore.
+/// Plenty of settlements are not usage-driven: a subsidy payout, a redispatch
+/// compensation, a KWKG or EEG settlement whose figures were determined upstream.
+/// Set `type Usage = ()` and call [`settle`](PricingModel::settle), which is
+/// [`bill`](PricingModel::bill) without the `&()` at the call site.
+///
+/// ```rust
+/// use billing::{PricingModel, Positions, LineItem, Amount, DocumentMeta, Currency};
+/// use std::convert::Infallible;
+///
+/// struct EegSettlement { payout_eur: i64 }
+///
+/// impl PricingModel for EegSettlement {
+///     type Usage = ();
+///     type Error = Infallible;
+///     type NotBillable = Infallible;
+///
+///     fn positions(&self, _: &()) -> Result<Positions<Infallible>, Self::Error> {
+///         Ok(vec![
+///             LineItem::credit_fixed("EEG Vergütung", Amount::<5>::from_int(self.payout_eur))
+///                 .build().unwrap(),
+///         ].into())
+///     }
+/// }
+///
+/// let meta = DocumentMeta { currency: Currency::EUR, ..Default::default() };
+/// let doc = EegSettlement { payout_eur: 400 }.settle(meta).unwrap();
+/// assert_eq!(doc.net_total(), Amount::<5>::parse("-400.00000").unwrap());
+/// ```
+///
+/// An earlier release had a second trait for this case, with its own method names
+/// and a blanket impl. It removed one `type Usage = ();` line and one ignored
+/// parameter, and cost a second vocabulary (`positions` vs `line_items`,
+/// `settle` vs `bill`) plus a coherence hazard: implementing both traits for one
+/// type was a compile error the documentation had to warn about. One trait is the
+/// better trade.
 ///
 /// # Example — SaaS platform
 ///
 /// ```rust
-/// use billing::{Tariff, Billing, Positions, LineItem, Amount, TaxLayer};
+/// use billing::{PricingModel, Billing, Positions, LineItem, Amount, TaxLayer};
 /// use billing::tax::FixedRateTax;
 /// use rust_decimal::dec;
 /// use std::convert::Infallible;
 ///
-/// struct PlatformTariff { monthly_fee_eur: u32 }
+/// struct PlatformPlan { monthly_fee_eur: u32 }
 /// struct Seats { count: u32 }
 ///
-/// impl Tariff for PlatformTariff {
+/// impl PricingModel for PlatformPlan {
 ///     type Usage = Seats;
 ///     type Error = Infallible;
-///     // This tariff always produces an invoice.
+///     // This model always produces an invoice.
 ///     type NotBillable = Infallible;
 ///
-///     fn line_items(&self, usage: &Seats) -> Result<Positions<Infallible>, Self::Error> {
+///     fn positions(&self, usage: &Seats) -> Result<Positions<Infallible>, Self::Error> {
 ///         Ok(vec![
 ///             LineItem::fixed("Monthly platform fee",
 ///                 Amount::<5>::from_int(i64::from(self.monthly_fee_eur) * i64::from(usage.count))
@@ -231,7 +293,7 @@ pub type Billed<R> = Billing<BillingDocument, R>;
 /// # Example — a settlement that is not always billable
 ///
 /// ```rust
-/// use billing::{Tariff, Billing, Positions, LineItem, Amount};
+/// use billing::{PricingModel, Billing, Positions, LineItem, Amount};
 /// use std::convert::Infallible;
 /// use std::fmt;
 ///
@@ -250,12 +312,12 @@ pub type Billed<R> = Billing<BillingDocument, R>;
 /// struct Settlement;
 /// struct Readings { kwh: Option<u32> }
 ///
-/// impl Tariff for Settlement {
+/// impl PricingModel for Settlement {
 ///     type Usage = Readings;
 ///     type Error = Infallible;
 ///     type NotBillable = NotYet;
 ///
-///     fn line_items(&self, usage: &Readings) -> Result<Positions<NotYet>, Self::Error> {
+///     fn positions(&self, usage: &Readings) -> Result<Positions<NotYet>, Self::Error> {
 ///         let Some(kwh) = usage.kwh else {
 ///             // The reason survives — it is not flattened into an empty Vec.
 ///             return Ok(Billing::NotBillable(NotYet::NoMeterReading));
@@ -266,10 +328,10 @@ pub type Billed<R> = Billing<BillingDocument, R>;
 ///     }
 /// }
 ///
-/// let outcome = Settlement.line_items(&Readings { kwh: None }).unwrap();
+/// let outcome = Settlement.positions(&Readings { kwh: None }).unwrap();
 /// assert_eq!(outcome.reason(), Some(&NotYet::NoMeterReading));
 /// ```
-pub trait Tariff {
+pub trait PricingModel {
     /// Domain-specific usage input.
     type Usage;
     /// Domain-specific error type — for things that actually went **wrong**.
@@ -277,7 +339,7 @@ pub trait Tariff {
     /// Domain-specific reason there is nothing to bill — for things that are
     /// merely **not billable**, which is a business state and not a failure.
     ///
-    /// Use [`Infallible`] for a tariff that always produces positions; the
+    /// Use [`Infallible`] for a model that always produces positions; the
     /// [`Billing::NotBillable`] variant is then uninhabited and
     /// [`Billing::into_inner`] unwraps the outcome for free.
     type NotBillable: fmt::Debug + fmt::Display;
@@ -287,7 +349,7 @@ pub trait Tariff {
     /// Return `Ok(items.into())` to bill, or
     /// `Ok(Billing::NotBillable(reason))` to record that there is nothing to bill
     /// and why. Reserve `Err` for genuine failures.
-    fn line_items(&self, usage: &Self::Usage) -> Result<Positions<Self::NotBillable>, Self::Error>;
+    fn positions(&self, usage: &Self::Usage) -> Result<Positions<Self::NotBillable>, Self::Error>;
 
     /// Tax / surcharge / percentage-charge layers applied after positions.
     ///
@@ -304,16 +366,16 @@ pub trait Tariff {
 
     /// Compute a [`BillingDocument`] from usage data.
     ///
-    /// Available only when `NotBillable = `[`Infallible`] — a tariff that can
+    /// Available only when `NotBillable = `[`Infallible`] — a model that can
     /// decline to bill has nowhere to put the reason in this signature, and must use
-    /// [`Tariff::try_bill`] instead. The bound is what makes that a compile-time
+    /// [`PricingModel::try_bill`] instead. The bound is what makes that a compile-time
     /// distinction rather than a silently-dropped reason.
     ///
     /// # Errors
-    /// Propagates `line_items` failures and any document-assembly error.
+    /// Propagates `positions` failures and any document-assembly error.
     fn bill(&self, meta: DocumentMeta, usage: &Self::Usage) -> Result<BillingDocument, BillingError>
     where
-        Self: Sized + Tariff<NotBillable = Infallible>,
+        Self: Sized + PricingModel<NotBillable = Infallible>,
         Self::Error: Into<BillingError>,
     {
         Ok(self.try_bill(meta, usage)?.into_inner())
@@ -325,12 +387,12 @@ pub trait Tariff {
     /// ```rust,ignore
     /// BillingDocument::builder()
     ///     .meta(meta)
-    ///     .try_tariff(self, usage)?
+    ///     .try_pricing(self, usage)?
     ///     .map(|b| b.build())
     /// ```
     ///
     /// # Errors
-    /// Propagates `line_items` failures and any document-assembly error.
+    /// Propagates `positions` failures and any document-assembly error.
     fn try_bill(
         &self,
         meta: DocumentMeta,
@@ -342,129 +404,37 @@ pub trait Tariff {
     {
         match BillingDocumentBuilder::default()
             .meta(meta)
-            .try_tariff(self, usage)?
+            .try_pricing(self, usage)?
         {
             Billing::Billable(b) => Ok(Billing::Billable(b.build()?)),
             Billing::NotBillable(r) => Ok(Billing::NotBillable(r)),
         }
     }
-}
 
-// ── ScalarTariff ──────────────────────────────────────────────────────────────
-
-/// A tariff whose positions are **already computed** — no usage input.
-///
-/// # Why this exists
-///
-/// [`Tariff`] is shaped around usage-driven pricing, and plenty of settlements are
-/// not: a subsidy payout, a redispatch compensation, a KWKG or EEG settlement whose
-/// figures were determined upstream. Forced through `Tariff` those impls carried
-/// `type Usage = ()` and a `fn line_items(&self, _usage: &())` parameter that every
-/// implementation ignored — boilerplate that documented nothing and that callers
-/// had to satisfy with `&()` at every call site.
-///
-/// Implement `ScalarTariff` instead. A blanket impl supplies
-/// [`Tariff`]`<Usage = ()>`, so a scalar tariff still composes with
-/// [`BillingDocumentBuilder`] and everything else that takes a `Tariff` — it just
-/// never mentions `()`.
-///
-/// Implement **either** `ScalarTariff` or `Tariff` for a given type, never both;
-/// the blanket impl makes that a coherence error.
-///
-/// ```rust
-/// use billing::{ScalarTariff, Positions, LineItem, Amount, DocumentMeta, Currency};
-/// use std::convert::Infallible;
-///
-/// struct EegSettlement { payout_eur: i64 }
-///
-/// impl ScalarTariff for EegSettlement {
-///     type Error = Infallible;
-///     type NotBillable = Infallible;
-///
-///     // No `usage` parameter, and no `type Usage = ()`.
-///     fn positions(&self) -> Result<Positions<Infallible>, Self::Error> {
-///         Ok(vec![
-///             LineItem::credit_fixed("EEG Vergütung", Amount::<5>::from_int(self.payout_eur))
-///                 .build().unwrap(),
-///         ].into())
-///     }
-/// }
-///
-/// let meta = DocumentMeta { currency: Currency::EUR, ..Default::default() };
-/// let doc = EegSettlement { payout_eur: 400 }.settle(meta).unwrap();
-/// assert_eq!(doc.net_total(), Amount::<5>::parse("-400.00000").unwrap());
-/// ```
-pub trait ScalarTariff {
-    /// Domain-specific error type — for things that actually went wrong.
-    type Error: std::error::Error + Send + Sync + 'static;
-    /// Domain-specific reason there is nothing to bill. [`Infallible`] if the
-    /// settlement always bills.
-    type NotBillable: fmt::Debug + fmt::Display;
-
-    /// The already-computed positions, or the reason there are none.
+    /// [`bill`](PricingModel::bill) for a model that takes no usage — the settlement case.
     ///
-    /// Named `positions` rather than `line_items` so that it does not collide with
-    /// [`Tariff::line_items`], which the blanket impl also brings into scope for
-    /// every implementor.
-    fn positions(&self) -> Result<Positions<Self::NotBillable>, Self::Error>;
-
-    /// Tax / surcharge layers, in application order. See [`Tariff::tax_layers`].
-    fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
-        vec![]
-    }
-
-    /// Discount layers applied before tax. See [`Tariff::discount_layers`].
-    fn discount_layers(&self) -> Vec<Box<dyn DiscountLayer>> {
-        vec![]
-    }
-
-    /// Compute a [`BillingDocument`] — the scalar counterpart of [`Tariff::bill`].
-    ///
-    /// Available only when `NotBillable = `[`Infallible`]; otherwise use
-    /// [`ScalarTariff::try_settle`].
+    /// Bounded on `Usage = ()`, so it exists exactly where `&()` would otherwise
+    /// have to be written at every call site and nowhere else.
     ///
     /// # Errors
     /// Propagates `positions` failures and any document-assembly error.
     fn settle(&self, meta: DocumentMeta) -> Result<BillingDocument, BillingError>
     where
-        Self: Sized + ScalarTariff<NotBillable = Infallible>,
+        Self: Sized + PricingModel<Usage = (), NotBillable = Infallible>,
         Self::Error: Into<BillingError>,
     {
-        Ok(self.try_settle(meta)?.into_inner())
+        self.bill(meta, &())
     }
 
-    /// Compute a [`BillingDocument`], or the reason there is nothing to bill.
+    /// [`try_bill`](PricingModel::try_bill) for a model that takes no usage.
     ///
     /// # Errors
     /// Propagates `positions` failures and any document-assembly error.
     fn try_settle(&self, meta: DocumentMeta) -> Result<Billed<Self::NotBillable>, BillingError>
     where
-        Self: Sized,
+        Self: Sized + PricingModel<Usage = ()>,
         Self::Error: Into<BillingError>,
     {
-        Tariff::try_bill(self, meta, &())
-    }
-}
-
-/// Every [`ScalarTariff`] is a [`Tariff`] whose usage is `()`.
-///
-/// This is what lets a scalar settlement compose with [`BillingDocumentBuilder`]
-/// and with generic code over `Tariff` without the implementor ever writing
-/// `type Usage = ()`.
-impl<T: ScalarTariff> Tariff for T {
-    type Usage = ();
-    type Error = <T as ScalarTariff>::Error;
-    type NotBillable = <T as ScalarTariff>::NotBillable;
-
-    fn line_items(&self, _usage: &()) -> Result<Positions<Self::NotBillable>, Self::Error> {
-        self.positions()
-    }
-
-    fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
-        ScalarTariff::tax_layers(self)
-    }
-
-    fn discount_layers(&self) -> Vec<Box<dyn DiscountLayer>> {
-        ScalarTariff::discount_layers(self)
+        self.try_bill(meta, &())
     }
 }

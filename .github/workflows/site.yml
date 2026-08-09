@@ -1,0 +1,87 @@
+name: Site
+
+# Builds the Zola landing page and documentation site in `site/` and publishes it to
+# GitHub Pages.
+#
+# The build runs on every pull request that touches the site, so a broken template or
+# a dead internal link fails review rather than production. Only a push to `main`
+# deploys.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/site.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deployments race; queue instead, and do not cancel one that is
+# already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: "0.22.1"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Zola
+        run: |
+          curl -sSL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+
+      # `zola check` validates every internal link and every `get_url` target. A
+      # renamed page that some other page still links to fails here rather than
+      # becoming a 404 in production.
+      - name: Check links and templates
+        working-directory: site
+        run: zola check
+
+      # Every fenced Rust block on the site is compiled and run, for the same
+      # reason the README is a doctest: a code sample that no longer compiles is
+      # worse than no sample at all.
+      - name: Verify the site's Rust examples
+        run: python3 site/verify-examples.py
+
+      - name: Build
+        working-directory: site
+        run: zola build
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

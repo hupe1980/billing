@@ -5,8 +5,8 @@ use crate::currency::Currency;
 use crate::error::BillingError;
 use crate::line_item::{LineAllowanceCharge, LineItem};
 use crate::period::Period;
-use crate::settlement::CashRounding;
-use crate::tariff::Billing;
+use crate::pricing::Billing;
+use crate::settlement::{CashRounding, VatAccountingCurrency};
 use crate::tax::{DiscountLayer, TaxLayer};
 use crate::vat::TaxBreakdownEntry;
 
@@ -51,6 +51,16 @@ pub struct DocumentMeta {
     pub issue_date: Option<String>,
     /// Payment due date as ISO 8601 date string, e.g. `"2026-07-31"`.
     pub due_date: Option<String>,
+    /// EN 16931 **BT-20** — the payment terms, including any structured
+    /// early-payment discount (Skonto).
+    ///
+    /// Header data rather than a total, because the discount is **conditional**: it
+    /// is earned by paying early, which has not happened when the invoice is issued.
+    /// Nothing here moves `net_total`, `gross_total`, `amount_due` or the VAT
+    /// breakdown — see [`crate::terms`] for why deducting it up front would
+    /// understate the taxable base, and what has to happen instead when it is taken.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub payment_terms: Option<crate::terms::PaymentTerms>,
     /// Sender / issuer identifier (MP-ID, GLN, BDEW code, or free-form).
     pub issuer_id: Option<String>,
     /// Recipient identifier (MP-ID, GLN, BDEW code, or free-form).
@@ -80,8 +90,8 @@ pub struct DocumentMeta {
 /// # Construction
 ///
 /// - [`BillingDocument::from_positions`] — supply positions and layer vecs directly.
-/// - [`BillingDocument::builder`] — fluent builder; use `.tariff(t, u)?` to load
-///   positions from a [`crate::Tariff`] implementation.
+/// - [`BillingDocument::builder`] — fluent builder; use `.pricing(m, u)?` to load
+///   positions from a [`crate::PricingModel`] implementation.
 /// # Validation on deserialisation
 ///
 /// `BillingDocument` re-runs [`BillingDocument::validate`] when deserialised, so a
@@ -111,6 +121,8 @@ pub struct BillingDocument {
     /// The rule that produced `rounding`, retained so that a later change to
     /// `prepaid` recomputes it instead of leaving a stale, non-tenderable figure.
     cash_rounding: Option<CashRounding>,
+    /// EN 16931 BT-6 / BT-111 — the VAT total restated in the accounting currency.
+    vat_accounting_currency: Option<VatAccountingCurrency>,
 }
 
 #[cfg(feature = "serde")]
@@ -134,6 +146,8 @@ struct BillingDocumentRepr {
     rounding: Amount<5>,
     #[serde(default)]
     cash_rounding: Option<CashRounding>,
+    #[serde(default)]
+    vat_accounting_currency: Option<VatAccountingCurrency>,
 }
 
 #[cfg(feature = "serde")]
@@ -154,6 +168,7 @@ impl TryFrom<BillingDocumentRepr> for BillingDocument {
             rounding: r.rounding,
             cash_rounding: r.cash_rounding,
             prepayment: r.prepayment,
+            vat_accounting_currency: r.vat_accounting_currency,
         };
         doc.validate()?;
         Ok(doc)
@@ -486,6 +501,15 @@ impl BillingDocument {
             ("prepaid (BT-113)".to_owned(), self.prepaid),
             ("rounding (BT-114)".to_owned(), self.rounding),
         ]);
+        // BR-DEC-15 caps BT-111 at two decimals in its own right. It is not derived
+        // from any other amount in the document — it is a conversion at a rate the
+        // engine never sees — so nothing else here covers it.
+        if let Some(acct) = self.vat_accounting_currency {
+            checks.push((
+                format!("vat_accounting_currency (BT-111, {})", acct.currency()),
+                acct.vat_total(),
+            ));
+        }
         // BT-106, BT-108, BT-109 and BT-110 are derived rather than stored, and
         // each is capped in its own right (BR-DEC-09, BR-DEC-10, BR-DEC-12,
         // BR-DEC-13). They are sums of already-checked leaves, so they cannot
@@ -1045,6 +1069,7 @@ impl BillingDocument {
             prepaid: Amount::ZERO,
             rounding: Amount::ZERO,
             cash_rounding: None,
+            vat_accounting_currency: None,
         })
     }
 
@@ -1229,6 +1254,99 @@ impl BillingDocument {
         self.cash_rounding
     }
 
+    /// Restate the VAT total in the currency VAT is accounted for in — EN 16931
+    /// **BT-6** and **BT-111**.
+    ///
+    /// Needed whenever the invoice currency is not the currency the tax is reported
+    /// in: art. 230 of the VAT Directive permits any invoice currency but requires
+    /// the VAT amount in the national currency of the member state where the tax is
+    /// due. A EUR invoice from a Polish, Czech, Swedish, Danish, Hungarian or
+    /// Romanian supplier is the ordinary case.
+    ///
+    /// Nothing else moves. BT-110, BT-112 and BT-115 stay in the invoice currency —
+    /// `PEPPOL-EN16931-R051` requires every other amount to carry BT-5, and BT-111
+    /// is the single documented exception.
+    ///
+    /// ```rust
+    /// use billing::prelude::*;
+    /// use billing::{FixedRateTax, VatAccountingCurrency};
+    /// use rust_decimal::dec;
+    ///
+    /// // Invoiced in EUR, VAT reported in PLN at 4.30.
+    /// let doc = BillingDocument::builder()
+    ///     .currency(Currency::EUR)
+    ///     .amount_scale(AmountScale::EN16931)
+    ///     .positions(vec![LineItem::fixed("Leistung", Amount::parse("1000.00000")?).build()?])
+    ///     .extra_tax(FixedRateTax::new("VAT", dec!(0.19))?.boxed())
+    ///     .build()?
+    ///     .with_vat_accounting_currency(VatAccountingCurrency::converted(
+    ///         Currency::new("PLN")?, Amount::parse("190.00000")?, dec!(4.30),
+    ///         AmountScale::EN16931,
+    ///     )?)?;
+    ///
+    /// assert_eq!(doc.vat_total()?, Amount::parse("190.00000")?);            // BT-110, EUR
+    /// let acct = doc.vat_accounting_currency().unwrap();
+    /// assert_eq!(acct.currency(), Currency::new("PLN")?);                   // BT-6
+    /// assert_eq!(acct.vat_total(), Amount::parse("817.00000")?);            // BT-111
+    /// assert!(doc.fits_amount_scale(2));                                    // BR-DEC-15
+    /// doc.assert_valid();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if BT-6 equals the invoice currency
+    /// (`PEPPOL-EN16931-R005`, fatal — restating the VAT in the currency it is
+    /// already in says nothing and is rejected outright), or if BT-111 opposes the
+    /// sign of BT-110 (`PEPPOL-EN16931-R055`, fatal).
+    pub fn with_vat_accounting_currency(
+        mut self,
+        accounting: VatAccountingCurrency,
+    ) -> Result<Self, BillingError> {
+        self.vat_accounting_currency = Some(accounting);
+        // Both Peppol rules need the document, so they are checked here and again
+        // in `validate` — deserialisation reconstructs the field directly.
+        self.check_vat_accounting_currency()?;
+        Ok(self)
+    }
+
+    /// The VAT accounting currency and its VAT total (BT-6 / BT-111), if set.
+    #[must_use]
+    pub fn vat_accounting_currency(&self) -> Option<VatAccountingCurrency> {
+        self.vat_accounting_currency
+    }
+
+    /// `PEPPOL-EN16931-R005` and `PEPPOL-EN16931-R055`, both fatal.
+    fn check_vat_accounting_currency(&self) -> Result<(), BillingError> {
+        let Some(acct) = self.vat_accounting_currency else {
+            return Ok(());
+        };
+        if acct.currency() == self.meta.currency {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "VAT accounting currency (BT-6) {} is the invoice currency (BT-5); \
+                     PEPPOL-EN16931-R005 requires them to differ",
+                    acct.currency()
+                ),
+            });
+        }
+        // "Same operational sign": zero is compatible with either direction, so the
+        // test is on strict opposition rather than on equality of `signum`.
+        let bt110 = self.vat_total()?;
+        let bt111 = acct.vat_total();
+        let opposed = (bt110.is_positive() && bt111.is_negative())
+            || (bt110.is_negative() && bt111.is_positive());
+        if opposed {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "VAT total (BT-110) {bt110} and VAT total in accounting currency \
+                     (BT-111) {bt111} have opposite signs; PEPPOL-EN16931-R055 requires \
+                     the same operational sign"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Produce the reversing document for this one — a credit note (Storno).
     ///
     /// Every monetary value is negated: each position's `net_amount`, all totals,
@@ -1363,6 +1481,13 @@ impl BillingDocument {
             prepaid: Amount::ZERO,
             rounding: Amount::ZERO,
             cash_rounding: None,
+            // BT-111 is a VAT total, so it negates with BT-110. Carrying it over
+            // unchanged would leave a credit note whose two VAT figures point in
+            // opposite directions — `PEPPOL-EN16931-R055`, fatal.
+            vat_accounting_currency: self
+                .vat_accounting_currency
+                .map(VatAccountingCurrency::negated)
+                .transpose()?,
         })
     }
 
@@ -1395,6 +1520,7 @@ impl BillingDocument {
             prepaid: parts.prepaid,
             rounding: parts.rounding,
             cash_rounding: None,
+            vat_accounting_currency: parts.vat_accounting_currency,
         })
     }
 
@@ -1402,7 +1528,7 @@ impl BillingDocument {
 
     /// Assert full arithmetic correctness of the document. Returns `Result`.
     ///
-    /// Thirteen invariants are checked (all exact — no tolerance):
+    /// Fourteen invariants are checked (all exact — no tolerance):
     /// 1. `Σ(net_positions + discount_positions) == net_total`
     /// 2. `Σ(tax_positions) == tax_total`
     /// 3. `net_total + tax_total == gross_total`
@@ -1422,6 +1548,9 @@ impl BillingDocument {
     /// 12. a document that charges VAT has a VAT breakdown, and a declared
     ///     breakdown has a VAT position behind it (BR-CO-18)
     /// 13. a "not subject to VAT" (`O`) breakdown group is the only group (BR-O-11)
+    /// 14. the VAT accounting currency pair, where set: BT-6 differs from BT-5
+    ///     (`PEPPOL-EN16931-R005`) and BT-111 shares BT-110's operational sign
+    ///     (`PEPPOL-EN16931-R055`)
     ///
     /// EN 16931's **BR-S-08** — the VAT breakdown agrees with the per-position
     /// attribution — is deliberately *not* among them, because
@@ -1676,6 +1805,19 @@ impl BillingDocument {
             }
         }
 
+        // Check 14 — the VAT accounting currency pair, if present:
+        // `PEPPOL-EN16931-R005` (BT-6 ≠ BT-5) and `PEPPOL-EN16931-R055` (BT-110 and
+        // BT-111 share an operational sign). Checked here rather than only at the
+        // setter because `reverse`, `merge_period_documents`, `AllocationRule` and
+        // serde all reach the field without going through it — and a reversal that
+        // forgot to negate BT-111 is exactly the shape R055 exists to catch.
+        self.check_vat_accounting_currency()
+            .map_err(|e| BillingError::ValidationFailed {
+                check: "vat_accounting_currency".into(),
+                actual: e.to_string(),
+                expected: "BT-6 to differ from BT-5, and BT-111 to share BT-110's sign".into(),
+            })?;
+
         Ok(())
     }
 
@@ -1817,6 +1959,54 @@ impl BillingDocument {
         Ok(())
     }
 
+    /// The positions carrying **no** VAT attribution — EN 16931 BT-151 (line),
+    /// BT-95 (allowance) or BT-102 (charge).
+    ///
+    /// Each of those is mandatory: **BR-CO-04** on an invoice line, **BR-32** on a
+    /// document level allowance, **BR-37** on a document level charge, all fatal. A
+    /// position this yields therefore cannot be emitted as EN 16931 at all, and the
+    /// consumer must either obtain the category from the caller or refuse — it may
+    /// not guess, because the wrong category changes what tax is owed.
+    ///
+    /// [`verify_vat_attribution`](Self::verify_vat_attribution) deliberately
+    /// **ignores** these: it checks that the attributions which exist agree with the
+    /// breakdown, and a document with none passes it vacuously. That is the right
+    /// split — this crate bills things that are not invoices, and a document with no
+    /// VAT layer is a legitimate state — but it means "verify passed" is not on its
+    /// own a licence to emit. This is the other half of the question.
+    ///
+    /// VAT positions are excluded: they *are* the BG-23 and carry no BT-151.
+    ///
+    /// ```rust
+    /// use billing::prelude::*;
+    /// use rust_decimal::dec;
+    ///
+    /// // A levy the VAT layer does not cover: it is a BG-21 charge with no BT-102.
+    /// let doc = BillingDocument::builder()
+    ///     .currency(Currency::EUR)
+    ///     .positions(vec![LineItem::for_usage(
+    ///         "Arbeit",
+    ///         Quantity::new(dec!(1000), "kWh"),
+    ///         UnitPrice::new(dec!(0.30), "EUR/kWh"),
+    ///     ).tag("energy").build()?])
+    ///     .extra_tax(PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050")?, "kWh")?.boxed())
+    ///     .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.with_tag("energy").boxed())
+    ///     .build()?;
+    ///
+    /// // The attribution that exists is consistent …
+    /// doc.verify_vat_attribution()?;
+    /// // … but the levy has none, and BR-37 makes one mandatory.
+    /// let missing: Vec<_> = doc.unattributed_positions().map(|p| &p.description).collect();
+    /// assert_eq!(missing.len(), 1);
+    /// assert!(missing[0].starts_with("Stromsteuer"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn unattributed_positions(&self) -> impl Iterator<Item = &LineItem> + '_ {
+        self.all_positions()
+            .filter(|p| !p.has_tag(crate::tags::VAT))
+            .filter(|p| p.vat.is_none())
+    }
+
     /// Assert full arithmetic correctness — panics on failure.
     ///
     /// Convenience wrapper around [`BillingDocument::validate`] suitable for use
@@ -1824,7 +2014,7 @@ impl BillingDocument {
     /// methods panic rather than returning `Result`.
     ///
     /// # Panics
-    /// Panics if any of the thirteen invariants is violated.
+    /// Panics if any of the fourteen invariants is violated.
     pub fn assert_valid(&self) {
         self.validate()
             .expect("BillingDocument arithmetic invariants violated");
@@ -1880,6 +2070,7 @@ pub(crate) struct DocumentParts {
     pub tax_breakdown: Vec<TaxBreakdownEntry>,
     pub prepaid: Amount<5>,
     pub rounding: Amount<5>,
+    pub vat_accounting_currency: Option<VatAccountingCurrency>,
 }
 
 /// Merge breakdown entries that share a `(category, normalised rate)` group.
@@ -1948,12 +2139,12 @@ pub(crate) fn merge_breakdown(
 
 /// Fluent builder for [`BillingDocument`].
 ///
-/// # Example — from a `Tariff` implementation
+/// # Example — from a `PricingModel` implementation
 ///
 /// ```rust,ignore
 /// let doc = BillingDocument::builder()
 ///     .meta(meta)
-///     .tariff(&my_tariff, &usage)?
+///     .pricing(&my_model, &usage)?
 ///     .build()?;
 /// ```
 ///
@@ -1992,51 +2183,51 @@ impl BillingDocumentBuilder {
         self
     }
 
-    /// Load positions and layers from a [`crate::Tariff`] that always bills.
+    /// Load positions and layers from a [`crate::PricingModel`] that always bills.
     ///
     /// Replaces any previously set positions and layers.
     ///
-    /// Bounded on `T::NotBillable = Infallible`. For a tariff that can decline to
-    /// bill, use [`try_tariff`](Self::try_tariff) — there is no way to represent a
+    /// Bounded on `T::NotBillable = Infallible`. For a model that can decline to
+    /// bill, use [`try_pricing`](Self::try_pricing) — there is no way to represent a
     /// "nothing to bill, because X" outcome as a builder, so the bound forces the
     /// caller to handle it rather than have the reason silently dropped.
     ///
     /// # Errors
-    /// Returns `Err` if `tariff.line_items(usage)` fails, converted to `BillingError`
+    /// Returns `Err` if `model.positions(usage)` fails, converted to `BillingError`
     /// via `T::Error: Into<BillingError>`.
-    pub fn tariff<T>(self, tariff: &T, usage: &T::Usage) -> Result<Self, BillingError>
+    pub fn pricing<T>(self, model: &T, usage: &T::Usage) -> Result<Self, BillingError>
     where
-        T: crate::tariff::Tariff<NotBillable = std::convert::Infallible>,
+        T: crate::pricing::PricingModel<NotBillable = std::convert::Infallible>,
         T::Error: Into<BillingError>,
     {
-        Ok(self.try_tariff(tariff, usage)?.into_inner())
+        Ok(self.try_pricing(model, usage)?.into_inner())
     }
 
-    /// Load positions and layers from a [`crate::Tariff`], propagating a
+    /// Load positions and layers from a [`crate::PricingModel`], propagating a
     /// "nothing to bill" outcome.
     ///
     /// Replaces any previously set positions and layers. Returns
-    /// [`Billing::NotBillable`] — carrying the tariff's own reason — when the tariff
+    /// [`Billing::NotBillable`] — carrying the model's own reason — when the model
     /// declines to bill; the builder is then not returned, because there is no
     /// document to assemble.
     ///
     /// ```rust
-    /// # use billing::{BillingDocument, Billing, DocumentMeta, Tariff, Positions, LineItem, Amount};
+    /// # use billing::{BillingDocument, Billing, DocumentMeta, PricingModel, Positions, LineItem, Amount};
     /// # use std::convert::Infallible;
     /// # #[derive(Debug)] struct NoData;
     /// # impl std::fmt::Display for NoData {
     /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("no data") }
     /// # }
     /// # struct T2;
-    /// # impl Tariff for T2 {
+    /// # impl PricingModel for T2 {
     /// #     type Usage = (); type Error = Infallible; type NotBillable = NoData;
-    /// #     fn line_items(&self, _: &()) -> Result<Positions<NoData>, Infallible> {
+    /// #     fn positions(&self, _: &()) -> Result<Positions<NoData>, Infallible> {
     /// #         Ok(Billing::NotBillable(NoData))
     /// #     }
     /// # }
     /// let outcome = BillingDocument::builder()
     ///     .meta(DocumentMeta::default())
-    ///     .try_tariff(&T2, &())?;
+    ///     .try_pricing(&T2, &())?;
     ///
     /// let doc = match outcome {
     ///     Billing::Billable(builder) => Some(builder.build()?),
@@ -2048,23 +2239,23 @@ impl BillingDocumentBuilder {
     /// ```
     ///
     /// # Errors
-    /// Returns `Err` if `tariff.line_items(usage)` fails, converted to `BillingError`
+    /// Returns `Err` if `model.positions(usage)` fails, converted to `BillingError`
     /// via `T::Error: Into<BillingError>`.
-    pub fn try_tariff<T: crate::tariff::Tariff>(
+    pub fn try_pricing<T: crate::pricing::PricingModel>(
         mut self,
-        tariff: &T,
+        model: &T,
         usage: &T::Usage,
     ) -> Result<Billing<Self, T::NotBillable>, BillingError>
     where
         T::Error: Into<BillingError>,
     {
-        let positions = match tariff.line_items(usage).map_err(Into::into)? {
+        let positions = match model.positions(usage).map_err(Into::into)? {
             Billing::Billable(items) => items,
             Billing::NotBillable(reason) => return Ok(Billing::NotBillable(reason)),
         };
         self.positions = positions;
-        self.tax_layers = tariff.tax_layers();
-        self.discount_layers = tariff.discount_layers();
+        self.tax_layers = model.tax_layers();
+        self.discount_layers = model.discount_layers();
         Ok(Billing::Billable(self))
     }
 
@@ -2322,6 +2513,7 @@ mod tests {
             tax_breakdown: vec![],
             prepaid: Amount::ZERO,
             rounding: Amount::ZERO,
+            vat_accounting_currency: None,
         })
         .expect("from_raw does not validate totals")
     }

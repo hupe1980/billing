@@ -50,7 +50,31 @@ test-one FILTER:
 # ── Examples ──────────────────────────────────────────────────────────────────
 
 # Run all examples.
-examples: example-saas example-water example-cloud
+examples: example-saas example-water example-cloud example-retail
+
+# ── Site ─────────────────────────────────────────────────────────────────────
+
+# Serve the landing page and docs locally with live reload.
+site-serve:
+    cd site && zola serve
+
+# Build the site into site/public.
+site-build:
+    cd site && zola build
+
+# Validate every internal link and template. Runs in CI on any site change.
+site-check:
+    cd site && zola check
+
+# Compile and run every Rust example on the site.
+#
+# The README gets this for free — it is included into the crate with
+# `include_str!`, so rustdoc compiles it. The site cannot: rustdoc needs a hidden
+# `# Ok::<(), _>(())` trailer wherever a snippet uses `?`, and Zola would print
+# that line on the page. So the snippets stay clean and are checked here instead.
+# Generates a git-ignored `tests/site_examples.rs`.
+site-verify:
+    python3 site/verify-examples.py
 
 # Run the SaaS billing example.
 example-saas:
@@ -63,6 +87,10 @@ example-water:
 # Run the cloud compute example.
 example-cloud:
     cargo run --example cloud_compute
+
+# Run the cross-border retail example.
+example-retail:
+    cargo run --example cross_border_retail
 
 # ── Documentation ─────────────────────────────────────────────────────────────
 
@@ -116,8 +144,55 @@ mutants-gate:
     # a filter that matches no mutant — and leave the previous run's missed.txt in
     # place, which the check below would then read as this run's result.
     rm -rf target/mutants-full
-    cargo mutants --output target/mutants-full
+    cargo mutants -j "${CARGO_MUTANTS_JOBS:-$(just _cores)}" --output target/mutants-full
     just _mutants-check target/mutants-full exact $?
+
+# Run one shard of the full sweep — the unit the CI matrix is built from.
+#
+# `cargo mutants --shard i/N` partitions the mutant list round-robin, so every
+# shard sees a representative mix rather than one file each. Results are only
+# meaningful when the shards are recombined: a shard cannot tell a *stale* baseline
+# entry from one that simply landed in another shard, so `mutants-shard` reports and
+# `mutants-union-check` decides.
+mutants-shard INDEX TOTAL OUT="target/mutants-shard":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rm -rf {{ OUT }}
+    cargo mutants --shard {{ INDEX }}/{{ TOTAL }} -j "${CARGO_MUTANTS_JOBS:-$(just _cores)}" \
+        --output {{ OUT }}
+    status=$?
+    if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
+    # A shard with no survivors writes no missed.txt; the union step needs a file.
+    mkdir -p {{ OUT }}/mutants.out
+    touch {{ OUT }}/mutants.out/missed.txt
+    echo "shard {{ INDEX }}/{{ TOTAL }}: $(wc -l < {{ OUT }}/mutants.out/missed.txt | tr -d ' ') survivor(s)"
+
+# Check the combined survivors of a sharded sweep against the baseline.
+#
+# DIR holds one file per shard (each a copy of that shard's missed.txt). This is
+# the same `exact` comparison a single-process sweep gets — it just reassembles the
+# survivor list first.
+mutants-union-check DIR:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    out=target/mutants-union
+    rm -rf "$out"; mkdir -p "$out/mutants.out"
+    cat {{ DIR }}/*/missed.txt {{ DIR }}/*.txt 2>/dev/null | grep -v '^$' \
+        > "$out/mutants.out/missed.txt" || true
+    if [ ! -s "$out/mutants.out/missed.txt" ] && [ -s .cargo/mutants-baseline.txt ]; then
+        # An empty union with a non-empty baseline means every recorded survivor is
+        # now caught — stale entries, which the gate must report rather than pass.
+        printf '' > "$out/mutants.out/missed.txt"
+    fi
+    just _mutants-check "$out" exact 0
+
+# Cores to hand cargo-mutants. Each job runs a cargo that parallelises internally,
+# so half the cores keeps every core busy without oversubscribing memory.
+[private]
+_cores:
+    #!/usr/bin/env bash
+    n=$( (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4) )
+    echo $(( n / 2 > 0 ? n / 2 : 1 ))
 
 # Mutate only the lines a diff touches, and FAIL on any survivor not in the baseline.
 mutants-diff-gate DIFF:
@@ -129,7 +204,8 @@ mutants-diff-gate DIFF:
     # See `mutants-gate`: a stale missed.txt from a previous run would otherwise be
     # read as this one's, and a docs-only diff writes nothing at all.
     rm -rf target/mutants-diff
-    cargo mutants --no-shuffle -vV --in-diff {{ DIFF }} --output target/mutants-diff
+    cargo mutants --no-shuffle -vV --in-diff {{ DIFF }} \
+        -j "${CARGO_MUTANTS_JOBS:-$(just _cores)}" --output target/mutants-diff
     just _mutants-check target/mutants-diff subset $?
 
 # Mutate only the lines your branch changed — the pre-push check CI also runs.
@@ -268,10 +344,11 @@ semver:
 # Deliberately excludes the mutation sweep. CI mutates only a pull request's own
 # diff (minutes); the full sweep is `just mutants-gate` and takes tens of them, so
 # it belongs before a release rather than in this loop.
-ci: fmt-check lint doc-build test-all test-no-features test-msrv bench-check examples
+ci: fmt-check lint doc-build test-all test-no-features test-msrv bench-check examples site-check site-verify
     @echo ""
     @echo "✓ All CI gates passed locally"
-    @echo "  Before a release, also run: just mutants-gate"
+    @echo "  Full mutation sweep: nightly in CI (.github/workflows/mutants.yml),"
+    @echo "  or locally with: just mutants-gate"
 
 # Verify benchmarks still compile (they are not run in CI — too slow and noisy).
 bench-check:

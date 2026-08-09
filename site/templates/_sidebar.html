@@ -1,0 +1,23 @@
+{#- Documentation navigation.
+
+    Rendered as a `<nav>` with a real list rather than a JS widget, so it is
+    crawlable, keyboard-navigable, and works before any script runs. On narrow
+    screens the `<details>` collapses it without changing the markup. -#}
+{%- set docs = get_section(path="docs/_index.md") -%}
+{%- set here = page.permalink | default(value="") -%}
+<details class="sidebar" open>
+  <summary>Documentation</summary>
+  {% include "_search.html" %}
+  <nav aria-label="Documentation">
+    <ul>
+      <li{% if here == docs.permalink %} class="current"{% endif %}>
+        <a href="{{ docs.permalink }}">Overview</a>
+      </li>
+      {%- for p in docs.pages %}
+      <li{% if here == p.permalink %} class="current"{% endif %}>
+        <a href="{{ p.permalink }}"{% if here == p.permalink %} aria-current="page"{% endif %}>{{ p.title }}</a>
+      </li>
+      {%- endfor %}
+    </ul>
+  </nav>
+</details>

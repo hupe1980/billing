@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 use crate::amount::Amount;
+use crate::currency::Currency;
 use crate::error::BillingError;
 use crate::period::Period;
 use crate::quantity::{Quantity, UnitPrice};
@@ -902,7 +903,7 @@ impl LineItem {
     ///    quantity unit renders as a bare space on the invoice and — because
     ///    [`crate::PerUnitLevy`] selects its base by matching `unit_label` — silently
     ///    excludes the position from every per-unit levy. An empty price unit
-    ///    renders as `"EUR/"`. [`crate::TariffSchedule`] and
+    ///    renders as `"EUR/"`. [`crate::RateSchedule`] and
     ///    [`crate::TimeOfUsePricing`] have always rejected empty units in their
     ///    builders; positions built by hand now get the same guarantee.
     /// 5. `vat`, where present, is category/rate-consistent — see
@@ -1039,11 +1040,21 @@ impl LineItem {
     /// display text only and are deliberately terse: the description carries the
     /// meaning.
     ///
+    /// # Why the currency is an argument
+    ///
+    /// The price label is generated (`"EUR"`, `"CHF"`, …), and a generated label
+    /// cannot invent the currency. Earlier releases hardcoded `"EUR"` here, which
+    /// printed a euro price on every Swiss, sterling and dollar invoice — exactly
+    /// the silent mislabelling [`Currency`] was introduced to end, and the one
+    /// place in the crate that still did it. Pass [`Currency::XXX`] if the label
+    /// genuinely does not matter; it renders as `XXX`, which reads as the bug it is.
+    ///
     /// ```rust
-    /// use billing::{LineItem, Amount, UNIT_CODE_ONE};
+    /// use billing::{LineItem, Amount, Currency, UNIT_CODE_ONE};
     /// use rust_decimal::dec;
     ///
-    /// let item = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap())
+    /// let item = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap(),
+    ///                               Currency::EUR)
     ///     .build()
     ///     .unwrap();
     ///
@@ -1052,26 +1063,40 @@ impl LineItem {
     /// assert_eq!(item.quantity.as_ref().unwrap().code.as_deref(),
     ///            Some(UNIT_CODE_ONE));                                       // BT-130
     /// assert_eq!(item.unit_price.as_ref().unwrap().value, dec!(8.50));       // BT-146
+    /// assert_eq!(item.unit_price.as_ref().unwrap().unit, "EUR");
     /// ```
     #[must_use]
-    pub fn flat_fee(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
-        Self::flat(description, amount, Sign::Debit)
+    pub fn flat_fee(
+        description: impl Into<String>,
+        amount: Amount<5>,
+        currency: Currency,
+    ) -> LineItemBuilder {
+        Self::flat(description, amount, currency, Sign::Debit)
     }
 
     /// The credit counterpart of [`LineItem::flat_fee`] — a flat refund stated as a
     /// complete EN 16931 invoice line.
     #[must_use]
-    pub fn credit_flat_fee(description: impl Into<String>, amount: Amount<5>) -> LineItemBuilder {
-        Self::flat(description, amount, Sign::Credit)
+    pub fn credit_flat_fee(
+        description: impl Into<String>,
+        amount: Amount<5>,
+        currency: Currency,
+    ) -> LineItemBuilder {
+        Self::flat(description, amount, currency, Sign::Credit)
     }
 
-    fn flat(description: impl Into<String>, amount: Amount<5>, sign: Sign) -> LineItemBuilder {
+    fn flat(
+        description: impl Into<String>,
+        amount: Amount<5>,
+        currency: Currency,
+        sign: Sign,
+    ) -> LineItemBuilder {
         // `normalize()` strips the five trailing zeros an `Amount<5>` carries, so
         // BT-146 renders as the price a human quoted (`8.50`, not `8.50000`).
         let price = amount.into_decimal().normalize();
         LineItemBuilder::new(description.into(), sign)
             .quantity(Quantity::new(Decimal::ONE, "×").with_code(crate::UNIT_CODE_ONE))
-            .unit_price(UnitPrice::new(price, "EUR"))
+            .unit_price(UnitPrice::new(price, currency.code()))
     }
 
     /// Create a fixed-amount credit position (negative net amount).

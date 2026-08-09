@@ -1,0 +1,5 @@
+# Everything here is public documentation and is meant to be indexed.
+User-agent: *
+Allow: /
+
+Sitemap: https://hupe1980.github.io/billing/sitemap.xml

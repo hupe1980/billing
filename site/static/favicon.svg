@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="billing">
+  <rect width="64" height="64" rx="14" fill="#1a56c4"/>
+  <text x="32" y="45" font-family="ui-monospace, Menlo, monospace" font-size="40"
+        font-weight="700" fill="#ffffff" text-anchor="middle">§</text>
+</svg>

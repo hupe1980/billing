@@ -10,24 +10,18 @@ use rust_decimal::dec;
 
 fn main() {
     // Three-tier graduated water tariff — unit is m³, not kWh
-    let schedule = TariffSchedule::graduated()
+    let schedule = RateSchedule::graduated()
         .unit("m³")
         // Without this, generated unit-price labels read "XXX/m³" — the ISO 4217
         // "no currency" code. The engine never assumes a currency.
         .currency(Currency::EUR)
-        .band(TariffBand::up_to(
-            dec!(5),
-            Amount::parse("0.80000").unwrap(),
-        ))
-        .band(TariffBand::between(
+        .band(RateBand::up_to(dec!(5), Amount::parse("0.80000").unwrap()))
+        .band(RateBand::between(
             dec!(5),
             dec!(20),
             Amount::parse("1.40000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(20),
-            Amount::parse("2.60000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(20), Amount::parse("2.60000").unwrap()))
         .build()
         .unwrap();
 

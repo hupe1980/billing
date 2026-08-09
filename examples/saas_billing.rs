@@ -1,8 +1,8 @@
 //! SaaS subscription + metered usage billing example.
 //!
 //! Demonstrates:
-//! - `Tariff` trait for domain-specific billing logic
-//! - `BillingDocument::builder().tariff(t, u)?` for ergonomic document creation
+//! - `PricingModel` trait for domain-specific billing logic
+//! - `BillingDocument::builder().pricing(m, u)?` for ergonomic document creation
 //! - Graduated pricing for API calls with a free tier (zero-price band)
 //! - `PercentageCharge` for platform commission with a minimum floor
 //! - `FixedRateTax` for VAT
@@ -18,7 +18,7 @@ struct SaasUsage {
     api_calls: u64,
 }
 
-struct SaasTariff {
+struct SaasPlan {
     base_fee_eur: u32,
     seat_price_eur: u32,
     free_api_calls: u64,
@@ -26,17 +26,22 @@ struct SaasTariff {
     overage_per_call: Amount<6>,
 }
 
-impl Tariff for SaasTariff {
+impl PricingModel for SaasPlan {
     type Usage = SaasUsage;
     type Error = BillingError;
     /// This tariff always produces an invoice, so the "nothing to bill" outcome is
     /// uninhabited and `.bill()` returns a document directly.
     type NotBillable = Infallible;
 
-    fn line_items(&self, usage: &SaasUsage) -> Result<Positions<Infallible>, BillingError> {
-        let base = LineItem::fixed(
+    fn positions(&self, usage: &SaasUsage) -> Result<Positions<Infallible>, BillingError> {
+        // `flat_fee`, not `fixed`: a standing charge is still an invoice line, and
+        // BR-22 / BR-23 / BR-26 want BT-129, BT-130 and BT-146 on every one of them.
+        // `flat_fee` states them as "1 × C62 at the full amount"; `fixed` would leave
+        // a consumer to synthesise all three.
+        let base = LineItem::flat_fee(
             "Platform base fee",
             Amount::<5>::from_int(self.base_fee_eur.into()),
+            Currency::EUR,
         )
         .tag("base")
         .build()?;
@@ -55,15 +60,15 @@ impl Tariff for SaasTariff {
 
         // Graduated: free tier (zero price) + overage tier.
         // Both bands are kept so the document shows what was included vs. charged.
-        let api_schedule = TariffSchedule::graduated()
+        let api_schedule = RateSchedule::graduated()
             .unit("calls")
             .currency(Currency::EUR)
-            .band(TariffBand::free_up_to(free).with_description(format!(
+            .band(RateBand::free_up_to(free).with_description(format!(
                 "API calls (free tier, first {} incl.)",
                 self.free_api_calls
             )))
             .band(
-                TariffBand::over(
+                RateBand::over(
                     free,
                     // Exact: Amount<6> → Amount<5> only succeeds when the price
                     // needs no more than 5 decimals. It does not here, so a silent
@@ -114,7 +119,7 @@ fn eur(a: Amount<5>) -> Amount<2> {
 }
 
 fn main() {
-    let tariff = SaasTariff {
+    let plan = SaasPlan {
         base_fee_eur: 49,
         seat_price_eur: 19,
         free_api_calls: 100_000,
@@ -140,7 +145,7 @@ fn main() {
     let doc = BillingDocument::builder()
         .meta(meta)
         .amount_scale(AmountScale::EN16931)
-        .tariff(&tariff, &usage)
+        .pricing(&plan, &usage)
         .unwrap()
         .build()
         .unwrap();

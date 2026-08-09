@@ -3,7 +3,7 @@
 //! The engine performs **no** conversion, no rate lookup, and no formatting
 //! beyond the three-letter code itself.  `Currency` exists for two reasons:
 //!
-//! 1. **Label generation** — [`crate::TariffSchedule`] and friends build unit-price
+//! 1. **Label generation** — [`crate::RateSchedule`] and friends build unit-price
 //!    labels such as `"EUR/kWh"`.  Before `Currency` existed these were hardcoded
 //!    to `EUR`, which silently mislabelled every non-euro invoice.
 //! 2. **Mixing protection** — [`crate::merge_period_documents`] refuses to combine

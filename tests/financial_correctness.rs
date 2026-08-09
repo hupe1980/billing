@@ -260,20 +260,17 @@ fn line_item_tags_are_case_sensitive() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// TariffSchedule — numerical correctness and guards
+// RateSchedule — numerical correctness and guards
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-fn graduated_two_band() -> TariffSchedule {
-    TariffSchedule::graduated()
+fn graduated_two_band() -> RateSchedule {
+    RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(500),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(500),
-            Amount::parse("0.28000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(500), Amount::parse("0.28000").unwrap()))
         .build()
         .unwrap()
 }
@@ -312,16 +309,13 @@ fn graduated_tiers_are_numbered_from_one_on_the_invoice() {
     assert_eq!(items[1].description, "Tier 2 (over 500 kWh)");
 
     // A caller-supplied description replaces the generated one outright.
-    let named = TariffSchedule::graduated()
+    let named = RateSchedule::graduated()
         .unit("kWh")
         .band(
-            TariffBand::up_to(dec!(500), Amount::parse("0.32000").unwrap())
+            RateBand::up_to(dec!(500), Amount::parse("0.32000").unwrap())
                 .with_description("Grundkontingent"),
         )
-        .band(TariffBand::over(
-            dec!(500),
-            Amount::parse("0.28000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(500), Amount::parse("0.28000").unwrap()))
         .build()
         .unwrap();
     let items = named.split(dec!(1234.5)).unwrap();
@@ -352,9 +346,9 @@ fn graduated_unit_label_propagated() {
 #[test]
 fn graduated_single_band_no_upper() {
     // A single unlimited band — all quantity at one price.
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("m³")
-        .band(TariffBand::over(dec!(0), Amount::parse("1.40000").unwrap()))
+        .band(RateBand::over(dec!(0), Amount::parse("1.40000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(25)).unwrap();
@@ -365,10 +359,10 @@ fn graduated_single_band_no_upper() {
 #[test]
 fn graduated_free_tier_generates_zero_item() {
     // Free tier produces a LineItem with net_amount = 0, preserving audit trail.
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("calls")
-        .band(TariffBand::free_up_to(dec!(1000)))
-        .band(TariffBand::over(
+        .band(RateBand::free_up_to(dec!(1000)))
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.00100").unwrap(),
         ))
@@ -382,13 +376,13 @@ fn graduated_free_tier_generates_zero_item() {
 
 #[test]
 fn volume_all_units_at_top_tier() {
-    let sched = TariffSchedule::volume()
+    let sched = RateSchedule::volume()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(1000),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.28000").unwrap(),
         ))
@@ -402,13 +396,13 @@ fn volume_all_units_at_top_tier() {
 
 #[test]
 fn volume_exact_boundary_uses_lower_tier() {
-    let sched = TariffSchedule::volume()
+    let sched = RateSchedule::volume()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(1000),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.28000").unwrap(),
         ))
@@ -423,9 +417,9 @@ fn volume_exact_boundary_uses_lower_tier() {
 #[test]
 fn block_partial_block_rounds_up() {
     // 450 / 100 = 4.5 → 5 full blocks
-    let sched = TariffSchedule::block()
+    let sched = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
+        .band(RateBand::block(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
@@ -438,9 +432,9 @@ fn block_partial_block_rounds_up() {
 
 #[test]
 fn block_exact_multiple_no_rounding() {
-    let sched = TariffSchedule::block()
+    let sched = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
+        .band(RateBand::block(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
@@ -452,12 +446,9 @@ fn block_exact_multiple_no_rounding() {
 
 #[test]
 fn block_one_unit_always_one_block() {
-    let sched = TariffSchedule::block()
+    let sched = RateSchedule::block()
         .unit("pkt")
-        .band(TariffBand::block(
-            dec!(10),
-            Amount::parse("2.00000").unwrap(),
-        ))
+        .band(RateBand::block(dec!(10), Amount::parse("2.00000").unwrap()))
         .build()
         .unwrap();
     // 1 unit → 1 block (round up from 0.1)
@@ -467,16 +458,10 @@ fn block_one_unit_always_one_block() {
 
 #[test]
 fn capacity_peak_selects_correct_tier() {
-    let sched = TariffSchedule::capacity()
+    let sched = RateSchedule::capacity()
         .unit("kW")
-        .band(TariffBand::up_to(
-            dec!(50),
-            Amount::parse("5.00000").unwrap(),
-        ))
-        .band(TariffBand::over(
-            dec!(50),
-            Amount::parse("10.00000").unwrap(),
-        ))
+        .band(RateBand::up_to(dec!(50), Amount::parse("5.00000").unwrap()))
+        .band(RateBand::over(dec!(50), Amount::parse("10.00000").unwrap()))
         .build()
         .unwrap();
     // Peak above boundary → second tier
@@ -489,16 +474,10 @@ fn capacity_peak_selects_correct_tier() {
 
 #[test]
 fn capacity_zero_peak_uses_first_tier() {
-    let sched = TariffSchedule::capacity()
+    let sched = RateSchedule::capacity()
         .unit("kW")
-        .band(TariffBand::up_to(
-            dec!(50),
-            Amount::parse("5.00000").unwrap(),
-        ))
-        .band(TariffBand::over(
-            dec!(50),
-            Amount::parse("10.00000").unwrap(),
-        ))
+        .band(RateBand::up_to(dec!(50), Amount::parse("5.00000").unwrap()))
+        .band(RateBand::over(dec!(50), Amount::parse("10.00000").unwrap()))
         .build()
         .unwrap();
     let item = sched.apply_peak(dec!(0)).unwrap();
@@ -507,12 +486,9 @@ fn capacity_zero_peak_uses_first_tier() {
 
 #[test]
 fn apply_peak_negative_is_error() {
-    let sched = TariffSchedule::capacity()
+    let sched = RateSchedule::capacity()
         .unit("kW")
-        .band(TariffBand::up_to(
-            dec!(50),
-            Amount::parse("5.00000").unwrap(),
-        ))
+        .band(RateBand::up_to(dec!(50), Amount::parse("5.00000").unwrap()))
         .build()
         .unwrap();
     assert!(sched.apply_peak(dec!(-1)).is_err());
@@ -526,8 +502,8 @@ fn apply_peak_negative_is_error() {
 fn tou_zero_quantity_band_skipped() {
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
-        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
-        .band(TouBand::new("off-peak", Amount::parse("0.18000").unwrap()))
+        .band(TimeBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("off-peak", Amount::parse("0.18000").unwrap()))
         .build()
         .unwrap();
     // Zero quantity in "off-peak" → should be omitted
@@ -546,8 +522,8 @@ fn tou_unknown_band_is_an_error_not_a_silent_skip() {
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
         .currency(Currency::EUR)
-        .band(TouBand::new("HT", Amount::parse("0.32000").unwrap()))
-        .band(TouBand::new("NT", Amount::parse("0.18000").unwrap()))
+        .band(TimeBand::new("HT", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("NT", Amount::parse("0.18000").unwrap()))
         .build()
         .unwrap();
 
@@ -851,19 +827,19 @@ fn with_extra_position_preserves_assert_valid() {
 
 #[test]
 fn builder_with_tariff_then_extra_tax() {
-    // A usage-less tariff: `ScalarTariff` needs no `type Usage = ()` and no
-    // ignored `usage` parameter, and the blanket impl still makes it a `Tariff`.
-    struct FlatTariff;
-    impl ScalarTariff for FlatTariff {
+    // A tariff that takes no usage: `type Usage = ()` and an ignored argument.
+    struct FlatModel;
+    impl PricingModel for FlatModel {
+        type Usage = ();
         type Error = BillingError;
         type NotBillable = Infallible;
-        fn positions(&self) -> Result<Positions<Infallible>, BillingError> {
+        fn positions(&self, _: &()) -> Result<Positions<Infallible>, BillingError> {
             Ok(vec![LineItem::fixed("Flat", Amount::<5>::from_int(100)).build()?].into())
         }
     }
     let doc = BillingDocument::builder()
         .meta(DocumentMeta::default())
-        .tariff(&FlatTariff, &())
+        .pricing(&FlatModel, &())
         .unwrap()
         .extra_tax(FixedRateTax::new("VAT", dec!(0.10)).unwrap().boxed())
         .build()
@@ -1137,21 +1113,15 @@ fn integration_saas_invoice() {
 /// Water utility: tiered m³ + minimum + 3-way allocation all consistent.
 #[test]
 fn integration_water_utility_allocation() {
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("m³")
-        .band(TariffBand::up_to(
-            dec!(5),
-            Amount::parse("0.80000").unwrap(),
-        ))
-        .band(TariffBand::between(
+        .band(RateBand::up_to(dec!(5), Amount::parse("0.80000").unwrap()))
+        .band(RateBand::between(
             dec!(5),
             dec!(20),
             Amount::parse("1.40000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(20),
-            Amount::parse("2.60000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(20), Amount::parse("2.60000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(28.5)).unwrap();
@@ -1171,7 +1141,7 @@ fn integration_water_utility_allocation() {
     }
 }
 
-/// Tariff-change mid-period: two half-period docs merged.
+/// PricingModel-change mid-period: two half-period docs merged.
 #[test]
 fn integration_tariff_change_merge() {
     // Old tariff: flat 10 EUR/day for 15 days
@@ -1325,18 +1295,18 @@ fn per_unit_levy_zero_rate_ok() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// TariffSchedule — zero quantity consistency across all modes
+// RateSchedule — zero quantity consistency across all modes
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
 fn volume_zero_quantity_returns_empty() {
-    let sched = TariffSchedule::volume()
+    let sched = RateSchedule::volume()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(1000),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.28000").unwrap(),
         ))
@@ -1351,12 +1321,9 @@ fn volume_zero_quantity_returns_empty() {
 
 #[test]
 fn block_zero_quantity_returns_empty() {
-    let sched = TariffSchedule::block()
+    let sched = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
-            dec!(10),
-            Amount::parse("1.50000").unwrap(),
-        ))
+        .band(RateBand::block(dec!(10), Amount::parse("1.50000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(0)).unwrap();
@@ -1369,25 +1336,22 @@ fn block_zero_quantity_returns_empty() {
 #[test]
 fn all_modes_zero_qty_consistent() {
     // All four (non-capacity) modes must return empty vec for qty=0.
-    let g = TariffSchedule::graduated()
-        .band(TariffBand::up_to(
+    let g = RateSchedule::graduated()
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
         .build()
         .unwrap();
-    let v = TariffSchedule::volume()
-        .band(TariffBand::up_to(
+    let v = RateSchedule::volume()
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
         .build()
         .unwrap();
-    let b = TariffSchedule::block()
-        .band(TariffBand::block(
-            dec!(10),
-            Amount::parse("1.00000").unwrap(),
-        ))
+    let b = RateSchedule::block()
+        .band(RateBand::block(dec!(10), Amount::parse("1.00000").unwrap()))
         .build()
         .unwrap();
 
@@ -1419,12 +1383,12 @@ fn minimum_charge_none_returns_ok_none() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// TariffBand::free_up_to — description no longer hardcodes "units"
+// RateBand::free_up_to — description no longer hardcodes "units"
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
 fn free_up_to_description_no_hardcoded_units() {
-    let band = TariffBand::free_up_to(dec!(1000));
+    let band = RateBand::free_up_to(dec!(1000));
     let desc = band.description.as_deref().unwrap_or("");
     assert!(
         !desc.contains(" units"),
@@ -1434,10 +1398,10 @@ fn free_up_to_description_no_hardcoded_units() {
 
 #[test]
 fn free_up_to_with_description_override() {
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::free_up_to(dec!(1000)).with_description("Free tier (first 1000 kWh)"))
-        .band(TariffBand::over(
+        .band(RateBand::free_up_to(dec!(1000)).with_description("Free tier (first 1000 kWh)"))
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.00100").unwrap(),
         ))
@@ -1691,15 +1655,15 @@ fn percentage_discount_label_exact_rate() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// TariffBand — lower >= upper rejected at build time
+// RateBand — lower >= upper rejected at build time
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
 fn tariff_band_inverted_bounds_rejected() {
     // between(20, 5) has lower > upper — must fail at build.
-    let result = TariffSchedule::graduated()
+    let result = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::between(
+        .band(RateBand::between(
             dec!(20),
             dec!(5),
             Amount::parse("1.00000").unwrap(),
@@ -1711,9 +1675,9 @@ fn tariff_band_inverted_bounds_rejected() {
 #[test]
 fn tariff_band_equal_bounds_rejected() {
     // between(5, 5) has lower == upper — empty range, must fail.
-    let result = TariffSchedule::graduated()
+    let result = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::between(
+        .band(RateBand::between(
             dec!(5),
             dec!(5),
             Amount::parse("1.00000").unwrap(),
@@ -1725,21 +1689,15 @@ fn tariff_band_equal_bounds_rejected() {
 #[test]
 fn tariff_band_valid_bounds_ok() {
     // Three contiguous bands starting from 0 — must build successfully.
-    let result = TariffSchedule::graduated()
+    let result = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::up_to(
-            dec!(5),
-            Amount::parse("0.80000").unwrap(),
-        ))
-        .band(TariffBand::between(
+        .band(RateBand::up_to(dec!(5), Amount::parse("0.80000").unwrap()))
+        .band(RateBand::between(
             dec!(5),
             dec!(20),
             Amount::parse("1.40000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(20),
-            Amount::parse("2.60000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(20), Amount::parse("2.60000").unwrap()))
         .build();
     assert!(
         result.is_ok(),
@@ -1860,7 +1818,7 @@ fn tou_negative_quantity_returns_err() {
     // propagate as Err so the caller can detect bad meter readings.
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
-        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("peak", Amount::parse("0.32000").unwrap()))
         .build()
         .unwrap();
     let result = tou.calculate(&[("peak", dec!(-100))]);
@@ -1872,7 +1830,7 @@ fn tou_negative_quantity_on_unknown_band_also_err() {
     // Even if the band name is unknown, a negative quantity must error before
     // the unknown-band skip logic is reached.
     let tou = TimeOfUsePricing::builder()
-        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("peak", Amount::parse("0.32000").unwrap()))
         .build()
         .unwrap();
     let result = tou.calculate(&[("unknown-band", dec!(-50))]);
@@ -1884,7 +1842,7 @@ fn tou_zero_quantity_on_known_band_skipped_ok() {
     // Zero quantity for a known band is valid — no line item emitted.
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
-        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("peak", Amount::parse("0.32000").unwrap()))
         .build()
         .unwrap();
     let items = tou.calculate(&[("peak", dec!(0))]).unwrap();
@@ -1896,8 +1854,8 @@ fn tou_mixed_valid_and_valid_quantities_ok() {
     // One zero-qty band (skipped) and one positive-qty band (billed).
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
-        .band(TouBand::new("peak", Amount::parse("0.32000").unwrap()))
-        .band(TouBand::new("off-peak", Amount::parse("0.18000").unwrap()))
+        .band(TimeBand::new("peak", Amount::parse("0.32000").unwrap()))
+        .band(TimeBand::new("off-peak", Amount::parse("0.18000").unwrap()))
         .build()
         .unwrap();
     let items = tou
@@ -2084,20 +2042,17 @@ fn line_item_fixed_amount_with_any_sign_ok() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// TariffSchedule::build — new structural validations
+// RateSchedule::build — new structural validations
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
 fn block_schedule_multiple_bands_rejected() {
     // split_block() only uses the first band; extra bands are silently
     // unserviceable — reject at build time to prevent silent data loss.
-    let result = TariffSchedule::block()
+    let result = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
-            dec!(10),
-            Amount::parse("1.00000").unwrap(),
-        ))
-        .band(TariffBand::block(
+        .band(RateBand::block(dec!(10), Amount::parse("1.00000").unwrap()))
+        .band(RateBand::block(
             dec!(100),
             Amount::parse("0.80000").unwrap(),
         ))
@@ -2110,12 +2065,9 @@ fn block_schedule_multiple_bands_rejected() {
 
 #[test]
 fn block_schedule_exactly_one_band_ok() {
-    let result = TariffSchedule::block()
+    let result = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
-            dec!(10),
-            Amount::parse("1.50000").unwrap(),
-        ))
+        .band(RateBand::block(dec!(10), Amount::parse("1.50000").unwrap()))
         .build();
     assert!(result.is_ok());
 }
@@ -2124,9 +2076,9 @@ fn block_schedule_exactly_one_band_ok() {
 fn graduated_schedule_with_negative_price_rejected() {
     // Negative band prices would create negative-net debits; catch at build time
     // before the error surfaces obscurely in LineItem::build().
-    let result = TariffSchedule::graduated()
+    let result = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(500),
             Amount::parse("-0.32000").unwrap(),
         ))
@@ -2136,13 +2088,13 @@ fn graduated_schedule_with_negative_price_rejected() {
 
 #[test]
 fn volume_schedule_with_negative_price_rejected() {
-    let result = TariffSchedule::volume()
+    let result = RateSchedule::volume()
         .unit("seats")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("-1.00000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(100),
             Amount::parse("-0.80000").unwrap(),
         ))
@@ -2153,10 +2105,10 @@ fn volume_schedule_with_negative_price_rejected() {
 #[test]
 fn zero_band_price_is_valid() {
     // Zero-price bands are valid (free tier, promotional).
-    let result = TariffSchedule::graduated()
+    let result = RateSchedule::graduated()
         .unit("calls")
-        .band(TariffBand::free_up_to(dec!(1000)))
-        .band(TariffBand::over(
+        .band(RateBand::free_up_to(dec!(1000)))
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.00100").unwrap(),
         ))
@@ -2168,9 +2120,9 @@ fn zero_band_price_is_valid() {
 fn block_size_on_non_block_band_rejected() {
     // A graduated/volume band with block_size set is a configuration error —
     // block_size is ignored in non-block modes and would confuse users.
-    let mut band = TariffBand::up_to(dec!(100), Amount::parse("1.00000").unwrap());
+    let mut band = RateBand::up_to(dec!(100), Amount::parse("1.00000").unwrap());
     band.block_size = Some(dec!(10)); // manually inject a block_size
-    let result = TariffSchedule::graduated().unit("units").band(band).build();
+    let result = RateSchedule::graduated().unit("units").band(band).build();
     assert!(
         result.is_err(),
         "block_size on non-block band must be rejected"
@@ -2181,14 +2133,14 @@ fn block_size_on_non_block_band_rejected() {
 fn block_band_without_block_size_rejected() {
     // If a band in a block schedule doesn't have block_size, split_block()
     // would fail at runtime. Catch it at build time.
-    let band_without_bs = TariffBand {
+    let band_without_bs = RateBand {
         description: None,
         lower: None,
         upper: None,
         price: Amount::parse("1.00000").unwrap(),
         block_size: None, // missing
     };
-    let result = TariffSchedule::block()
+    let result = RateSchedule::block()
         .unit("pkt")
         .band(band_without_bs)
         .build();
@@ -2514,16 +2466,13 @@ fn full_pipeline_graduated_tou_minimum_allocation() {
     // Graduated kWh schedule + ToU pricing + minimum charge + 2-way allocation.
     // Verifies that every intermediate and final document passes assert_valid().
 
-    let graduated = TariffSchedule::graduated()
+    let graduated = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(500),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(500),
-            Amount::parse("0.28000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(500), Amount::parse("0.28000").unwrap()))
         .build()
         .unwrap();
 
@@ -4091,9 +4040,9 @@ fn checked_abs_min_returns_err() {
 #[test]
 fn graduated_quantity_exceeds_last_finite_band_errors() {
     // One band: [0, 100]. split(200) must error — 100 units would be silently dropped.
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("kWh")
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
@@ -4113,8 +4062,8 @@ fn graduated_quantity_exceeds_last_finite_band_errors() {
 #[test]
 fn graduated_quantity_exactly_at_last_finite_band_ok() {
     // Exactly at the upper bound must succeed.
-    let sched = TariffSchedule::graduated()
-        .band(TariffBand::up_to(
+    let sched = RateSchedule::graduated()
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
@@ -4128,15 +4077,12 @@ fn graduated_quantity_exactly_at_last_finite_band_ok() {
 #[test]
 fn graduated_open_ended_last_band_handles_any_quantity() {
     // Open-ended last band: should work for any quantity.
-    let sched = TariffSchedule::graduated()
-        .band(TariffBand::up_to(
+    let sched = RateSchedule::graduated()
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
-        .band(TariffBand::over(
-            dec!(100),
-            Amount::parse("0.50000").unwrap(),
-        ))
+        .band(RateBand::over(dec!(100), Amount::parse("0.50000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(500)).unwrap();
@@ -4164,7 +4110,9 @@ fn sign_usable_as_hashmap_key() {
 #[test]
 fn percentage_charge_includes_debit_at_negative_price() {
     use billing::PercentageCharge;
-    // A debit at negative price: platform commission should still apply to the position.
+    // A debit at a negative price is still *in the base* — that is what separates it
+    // from a `Sign::Credit` position, which is excluded outright. It reduces the base
+    // rather than being skipped.
     let epex = LineItem::debit("EPEX negativ")
         .quantity(Quantity::new(dec!(1000), "kWh"))
         .unit_price(UnitPrice::new(dec!(-0.01), "EUR/kWh"))
@@ -4173,10 +4121,42 @@ fn percentage_charge_includes_debit_at_negative_price() {
     assert!(epex.is_debit());
     assert!(epex.net_amount.is_negative()); // net = -10.00
 
+    let arbeit = LineItem::fixed("Arbeit", Amount::parse("110.00000").unwrap())
+        .build()
+        .unwrap();
+    let charge = PercentageCharge::new("Commission", dec!(0.05)).unwrap();
+
+    // Base = 110.00 − 10.00 = 100.00; the negative-price hour is netted, not dropped.
+    let fee = charge.compute(&[arbeit, epex.clone()]).unwrap();
+    assert_eq!(fee.net_amount, Amount::parse("5.00000").unwrap());
+}
+
+#[test]
+fn percentage_charge_does_not_become_a_credit_on_a_negative_base() {
+    use billing::PercentageCharge;
+    // Earlier releases returned −0.50 here: 5 % of a base of −10.00. That is a
+    // "charge" that increases what the supplier owes the customer, which is exactly
+    // what `PercentageCharge::new` refuses when the same result is asked for through
+    // a negative *rate* ("a negative charge is a discount"). Reaching it through the
+    // base is no different, and `PercentageDiscount` had always clamped for the
+    // mirror-image reason. Both layers now agree: there is nothing to charge a
+    // percentage of, so the charge is zero.
+    let epex = LineItem::debit("EPEX negativ")
+        .quantity(Quantity::new(dec!(1000), "kWh"))
+        .unit_price(UnitPrice::new(dec!(-0.01), "EUR/kWh"))
+        .build()
+        .unwrap();
+
     let charge = PercentageCharge::new("Commission", dec!(0.05)).unwrap();
     let fee = charge.compute(&[epex]).unwrap();
-    // Base = -10.00 (debit at negative price included), fee = -10.00 × 0.05 = -0.50
-    assert_eq!(fee.net_amount, Amount::parse("-0.50000").unwrap());
+    assert_eq!(fee.net_amount, Amount::<5>::ZERO);
+    // BT-100 states the *clamped* base, not the negative one. Stating −10.00 against
+    // an amount of 0.00 would put the pair 0.50 apart, and PEPPOL-EN16931-R040 —
+    // fatal, ±0.02 — recomputes exactly that product.
+    let basis = fee.allowance_charge.as_ref().expect("basis is stated");
+    assert_eq!(basis.base_amount, Some(Amount::<5>::ZERO));
+    basis.check_amount(fee.net_amount).unwrap();
+    fee.validate().unwrap();
 }
 
 #[test]

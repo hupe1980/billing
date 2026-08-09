@@ -271,15 +271,12 @@ fn schedule_rejects_non_monotonic_bands() {
     // `up_to` leaves `lower` as None, so the contiguity check never fired and this
     // built successfully, then failed later inside split() with a misleading
     // "quantity exceeds coverage" message.
-    let r = TariffSchedule::graduated()
-        .band(TariffBand::up_to(
+    let r = RateSchedule::graduated()
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("1.00000").unwrap(),
         ))
-        .band(TariffBand::up_to(
-            dec!(50),
-            Amount::parse("2.00000").unwrap(),
-        ))
+        .band(RateBand::up_to(dec!(50), Amount::parse("2.00000").unwrap()))
         .build();
     assert!(
         r.is_err(),
@@ -288,12 +285,12 @@ fn schedule_rejects_non_monotonic_bands() {
 
     // Equal consecutive bounds are a zero-width band — also rejected.
     assert!(
-        TariffSchedule::graduated()
-            .band(TariffBand::up_to(
+        RateSchedule::graduated()
+            .band(RateBand::up_to(
                 dec!(100),
                 Amount::parse("1.00000").unwrap()
             ))
-            .band(TariffBand::up_to(
+            .band(RateBand::up_to(
                 dec!(100),
                 Amount::parse("2.00000").unwrap()
             ))
@@ -302,12 +299,9 @@ fn schedule_rejects_non_monotonic_bands() {
     );
 
     // The ascending equivalent still builds and prices correctly.
-    let ok = TariffSchedule::graduated()
-        .band(TariffBand::up_to(
-            dec!(50),
-            Amount::parse("1.00000").unwrap(),
-        ))
-        .band(TariffBand::up_to(
+    let ok = RateSchedule::graduated()
+        .band(RateBand::up_to(dec!(50), Amount::parse("1.00000").unwrap()))
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("2.00000").unwrap(),
         ))
@@ -350,15 +344,15 @@ fn tou_rejects_empty_duplicate_and_negative_bands() {
     assert!(TimeOfUsePricing::builder().build().is_err());
     assert!(
         TimeOfUsePricing::builder()
-            .band(TouBand::new("HT", Amount::parse("0.32").unwrap()))
-            .band(TouBand::new("HT", Amount::parse("0.18").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("0.32").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("0.18").unwrap()))
             .build()
             .is_err(),
         "a duplicate band name is unreachable and almost always a config error"
     );
     assert!(
         TimeOfUsePricing::builder()
-            .band(TouBand::new("HT", Amount::parse("-0.1").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("-0.1").unwrap()))
             .build()
             .is_err()
     );
@@ -370,10 +364,10 @@ fn tou_rejects_empty_duplicate_and_negative_bands() {
 
 #[test]
 fn generated_labels_use_the_configured_currency_not_hardcoded_eur() {
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("GB")
         .currency(Currency::USD)
-        .band(TariffBand::over(dec!(0), Amount::parse("0.10000").unwrap()))
+        .band(RateBand::over(dec!(0), Amount::parse("0.10000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(100)).unwrap();
@@ -382,9 +376,9 @@ fn generated_labels_use_the_configured_currency_not_hardcoded_eur() {
 
 #[test]
 fn unconfigured_currency_is_visible_as_xxx_not_silently_eur() {
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("GB")
-        .band(TariffBand::over(dec!(0), Amount::parse("0.10000").unwrap()))
+        .band(RateBand::over(dec!(0), Amount::parse("0.10000").unwrap()))
         .build()
         .unwrap();
     let items = sched.split(dec!(100)).unwrap();
@@ -569,18 +563,15 @@ mod serde_tests {
 
     #[test]
     fn schedule_roundtrips_and_validates_on_deserialise() {
-        let sched = TariffSchedule::graduated()
+        let sched = RateSchedule::graduated()
             .unit("m³")
             .currency(Currency::EUR)
-            .band(TariffBand::up_to(
-                dec!(5),
-                Amount::parse("0.80000").unwrap(),
-            ))
-            .band(TariffBand::over(dec!(5), Amount::parse("1.40000").unwrap()))
+            .band(RateBand::up_to(dec!(5), Amount::parse("0.80000").unwrap()))
+            .band(RateBand::over(dec!(5), Amount::parse("1.40000").unwrap()))
             .build()
             .unwrap();
         let json = serde_json::to_string(&sched).unwrap();
-        let back: TariffSchedule = serde_json::from_str(&json).unwrap();
+        let back: RateSchedule = serde_json::from_str(&json).unwrap();
         assert_eq!(back.unit(), "m³");
         assert_eq!(back.currency(), Currency::EUR);
         assert_eq!(
@@ -591,7 +582,7 @@ mod serde_tests {
         // A schedule with a gap between bands is refused at the boundary.
         let bad = json.replace(r#""upper":"5""#, r#""upper":"3""#);
         if bad != json {
-            assert!(serde_json::from_str::<TariffSchedule>(&bad).is_err());
+            assert!(serde_json::from_str::<RateSchedule>(&bad).is_err());
         }
     }
 
@@ -756,9 +747,9 @@ fn proportional_split_is_fallible_not_panicking() {
 fn block_schedule_with_tiny_block_size_is_fallible_not_panicking() {
     // block_size is only validated as > 0, so a tiny value overflowed Decimal's
     // division inside a Result-returning method.
-    let sched = TariffSchedule::block()
+    let sched = RateSchedule::block()
         .unit("GB")
-        .band(TariffBand::block(
+        .band(RateBand::block(
             Decimal::new(1, 28),
             Amount::parse("1.00000").unwrap(),
         ))
@@ -959,8 +950,8 @@ fn a_prepaid_invoice_can_be_reversed_into_a_valid_credit_note() {
 fn a_single_band_schedule_is_still_checked_for_contiguity() {
     // The contiguity loop was gated on `bands.len() > 1`, so a lone band declaring
     // a non-zero lower bound built fine and then billed from zero.
-    let r = TariffSchedule::graduated()
-        .band(TariffBand::between(
+    let r = RateSchedule::graduated()
+        .band(RateBand::between(
             dec!(500),
             dec!(1000),
             Amount::parse("0.30000").unwrap(),
@@ -973,8 +964,8 @@ fn a_single_band_schedule_is_still_checked_for_contiguity() {
 
     // A band that genuinely starts at zero is still fine.
     assert!(
-        TariffSchedule::graduated()
-            .band(TariffBand::up_to(
+        RateSchedule::graduated()
+            .band(RateBand::up_to(
                 dec!(1000),
                 Amount::parse("0.30000").unwrap()
             ))
@@ -987,10 +978,10 @@ fn a_single_band_schedule_is_still_checked_for_contiguity() {
 fn volume_and_capacity_modes_error_on_uncovered_quantities() {
     // `find_tier_price` fell back to the last band, so a bounded top band silently
     // priced anything above it — while `graduated` correctly errored.
-    let volume = TariffSchedule::volume()
+    let volume = RateSchedule::volume()
         .unit("kWh")
         .currency(Currency::EUR)
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(1000),
             Amount::parse("0.32000").unwrap(),
         ))
@@ -1002,10 +993,10 @@ fn volume_and_capacity_modes_error_on_uncovered_quantities() {
     );
     assert!(volume.split(dec!(900)).is_ok());
 
-    let capacity = TariffSchedule::capacity()
+    let capacity = RateSchedule::capacity()
         .unit("Mbps")
         .currency(Currency::EUR)
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(100),
             Amount::parse("50.00000").unwrap(),
         ))
@@ -1015,14 +1006,14 @@ fn volume_and_capacity_modes_error_on_uncovered_quantities() {
     assert!(capacity.apply_peak(dec!(50)).is_ok());
 
     // An open-ended top band covers everything, as before.
-    let open = TariffSchedule::volume()
+    let open = RateSchedule::volume()
         .unit("kWh")
         .currency(Currency::EUR)
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(1000),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(1000),
             Amount::parse("0.28000").unwrap(),
         ))
@@ -1155,13 +1146,13 @@ fn a_tou_band_cannot_hijack_an_engine_reserved_tag() {
         "minimum-charge",
     ] {
         let r = TimeOfUsePricing::builder()
-            .band(TouBand::new(reserved, Amount::parse("0.30000").unwrap()))
+            .band(TimeBand::new(reserved, Amount::parse("0.30000").unwrap()))
             .build();
         assert!(r.is_err(), "band name {reserved:?} must be rejected");
     }
     assert!(
         TimeOfUsePricing::builder()
-            .band(TouBand::new("HT", Amount::parse("0.30000").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("0.30000").unwrap()))
             .build()
             .is_ok()
     );
@@ -1382,16 +1373,16 @@ fn empty_unit_labels_are_rejected() {
     // An empty unit renders as "EUR/" in a price label and a bare space in the
     // description — visible nonsense on an invoice.
     assert!(
-        TariffSchedule::graduated()
+        RateSchedule::graduated()
             .unit("")
-            .band(TariffBand::over(dec!(0), Amount::parse("1.00000").unwrap()))
+            .band(RateBand::over(dec!(0), Amount::parse("1.00000").unwrap()))
             .build()
             .is_err()
     );
     assert!(
         TimeOfUsePricing::builder()
             .unit("  ")
-            .band(TouBand::new("HT", Amount::parse("0.3").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("0.3").unwrap()))
             .build()
             .is_err()
     );
@@ -1402,15 +1393,15 @@ fn empty_unit_labels_are_rejected() {
 fn schedule_mode_deserialises_from_the_documented_lowercase_names() {
     // The module docs advertise JSON/YAML config loading with lowercase mode names,
     // but the derived names were TitleCase, so `"graduated"` failed.
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("kWh")
         .currency(Currency::EUR)
-        .band(TariffBand::over(dec!(0), Amount::parse("0.30000").unwrap()))
+        .band(RateBand::over(dec!(0), Amount::parse("0.30000").unwrap()))
         .build()
         .unwrap();
     let json = serde_json::to_string(&sched).unwrap();
     assert!(json.contains(r#""mode":"graduated""#), "{json}");
-    let back: TariffSchedule = serde_json::from_str(&json).unwrap();
+    let back: RateSchedule = serde_json::from_str(&json).unwrap();
     assert_eq!(back.unit(), "kWh");
 }
 
@@ -1420,7 +1411,7 @@ fn schedule_mode_deserialises_from_the_documented_lowercase_names() {
 
 /// An empty unit label must not survive into a document.
 ///
-/// `TariffSchedule` and `TimeOfUsePricing` had always rejected empty units, but
+/// `RateSchedule` and `TimeOfUsePricing` had always rejected empty units, but
 /// `Quantity` / `UnitPrice` did not, so a hand-built position could carry one. That
 /// is not merely cosmetic: `PerUnitLevy` selects its base by matching `unit_label`,
 /// so an empty unit silently drops the position out of every per-unit levy — the
@@ -1518,7 +1509,7 @@ fn unit_price_rounded_clamps_scale_to_decimal_max() {
 /// The "nothing to bill, because X" outcome must survive to the caller.
 #[test]
 fn not_billable_reason_survives_instead_of_becoming_an_empty_document() {
-    use billing::{Billing, Positions, ScalarTariff};
+    use billing::{Billing, Positions, PricingModel};
     use std::fmt;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1536,10 +1527,11 @@ fn not_billable_reason_survives_instead_of_becoming_an_empty_document() {
     }
 
     struct Settle(Option<Why>);
-    impl ScalarTariff for Settle {
+    impl PricingModel for Settle {
+        type Usage = ();
         type Error = BillingError;
         type NotBillable = Why;
-        fn positions(&self) -> Result<Positions<Why>, BillingError> {
+        fn positions(&self, _: &()) -> Result<Positions<Why>, BillingError> {
             match self.0 {
                 Some(Why::NoData) => Ok(Billing::NotBillable(Why::NoData)),
                 Some(Why::PriceMissing) => Ok(Billing::NotBillable(Why::PriceMissing)),
@@ -1583,18 +1575,19 @@ fn not_billable_reason_survives_instead_of_becoming_an_empty_document() {
     );
 }
 
-/// A `ScalarTariff` needs neither `type Usage = ()` nor an ignored `usage` argument,
-/// and is still usable everywhere a `Tariff` is.
+/// A tariff that takes no usage still declares its tax and discount layers, and
+/// `settle` reaches them without an `&()` at the call site.
 #[test]
-fn scalar_tariff_composes_as_a_tariff() {
-    use billing::{Positions, ScalarTariff, Tariff};
+fn a_usageless_tariff_still_carries_its_layers() {
+    use billing::{Positions, PricingModel};
     use std::convert::Infallible;
 
     struct Payout(i64);
-    impl ScalarTariff for Payout {
+    impl PricingModel for Payout {
+        type Usage = ();
         type Error = BillingError;
         type NotBillable = Infallible;
-        fn positions(&self) -> Result<Positions<Infallible>, BillingError> {
+        fn positions(&self, _: &()) -> Result<Positions<Infallible>, BillingError> {
             Ok(vec![LineItem::fixed("Payout", Amount::<5>::from_int(self.0)).build()?].into())
         }
         fn tax_layers(&self) -> Vec<Box<dyn billing::TaxLayer>> {
@@ -1609,17 +1602,17 @@ fn scalar_tariff_composes_as_a_tariff() {
         }
     }
 
-    // Via the scalar convenience…
+    // Via the no-usage convenience…
     let doc = Payout(100).settle(DocumentMeta::default()).unwrap();
     // 100 billed, less a 10.00 discount, taxed at 19 % of the reduced base.
     assert_eq!(doc.net_total(), Amount::parse("90.00000").unwrap());
     assert_eq!(doc.discount_total(), Amount::parse("-10.00000").unwrap());
     assert_eq!(doc.tax_total(), Amount::parse("17.10000").unwrap());
 
-    // …and via the generic `Tariff` surface. The blanket impl forwards *both*
-    // layer kinds; forwarding only the taxes would silently drop the discount and
-    // over-bill by its amount plus the tax on it.
-    let doc2 = Tariff::bill(&Payout(100), DocumentMeta::default(), &()).unwrap();
+    // …and via `bill`, which is the same call with the unit usage written out.
+    // Both layer kinds must reach the document: dropping the discounts would
+    // over-bill by their amount plus the tax on it.
+    let doc2 = PricingModel::bill(&Payout(100), DocumentMeta::default(), &()).unwrap();
     assert_eq!(doc2.gross_total(), doc.gross_total());
     assert_eq!(doc2.discount_total(), doc.discount_total());
     assert_eq!(doc2.discount_positions().len(), 1);
@@ -1627,7 +1620,7 @@ fn scalar_tariff_composes_as_a_tariff() {
     // …and through the document builder.
     let doc3 = BillingDocument::builder()
         .meta(DocumentMeta::default())
-        .tariff(&Payout(100), &())
+        .pricing(&Payout(100), &())
         .unwrap()
         .build()
         .unwrap();

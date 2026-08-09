@@ -627,7 +627,8 @@ impl Prepayment {
     pub fn itemised(advances: Vec<AdvancePayment>) -> Result<Self, BillingError> {
         if advances.is_empty() {
             return Err(BillingError::InvalidInput {
-                reason: "Prepayment::itemised requires at least one advance;                          use Prepayment::None for no prepayment"
+                reason: "Prepayment::itemised requires at least one advance; \
+                         use Prepayment::None for no prepayment"
                     .into(),
             });
         }

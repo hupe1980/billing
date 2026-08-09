@@ -8,7 +8,7 @@ use crate::line_item::LineItem;
 use crate::quantity::{Quantity, UnitPrice};
 use crate::tags;
 
-// ── TouBand ───────────────────────────────────────────────────────────────────
+// ── TimeBand ───────────────────────────────────────────────────────────────────
 
 /// A named pricing band for time-of-use billing.
 ///
@@ -16,16 +16,16 @@ use crate::tags;
 /// consumption per band (e.g. from a smart-meter read).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
-pub struct TouBand {
+pub struct TimeBand {
     /// Display name for this band (e.g. `"HT"`, `"peak"`).
     pub name: String,
     /// Price per unit for this band.
     pub price: Amount<5>,
 }
 
-impl TouBand {
+impl TimeBand {
     #[must_use]
-    /// Create a new `TouBand`.
+    /// Create a new `TimeBand`.
     pub fn new(name: impl Into<String>, price: Amount<5>) -> Self {
         Self {
             name: name.into(),
@@ -45,18 +45,18 @@ impl TouBand {
 /// # Construction
 ///
 /// Built through [`TimeOfUsePricing::builder`], matching
-/// [`crate::TariffSchedule`]: the setters are infallible and chainable, and every
+/// [`crate::RateSchedule`]: the setters are infallible and chainable, and every
 /// check happens once in [`TimeOfUsePricingBuilder::build`].
 ///
 /// ```rust
-/// use billing::{Amount, Currency, TimeOfUsePricing, TouBand};
+/// use billing::{Amount, Currency, TimeOfUsePricing, TimeBand};
 /// use rust_decimal::dec;
 ///
 /// let tou = TimeOfUsePricing::builder()
 ///     .unit("kWh")
 ///     .currency(Currency::EUR)
-///     .band(TouBand::new("HT", Amount::parse("0.32000")?))
-///     .band(TouBand::new("NT", Amount::parse("0.18000")?))
+///     .band(TimeBand::new("HT", Amount::parse("0.32000")?))
+///     .band(TimeBand::new("NT", Amount::parse("0.18000")?))
 ///     .build()?;
 ///
 /// assert_eq!(tou.calculate(&[("HT", dec!(100)), ("NT", dec!(50))])?.len(), 2);
@@ -66,7 +66,7 @@ impl TouBand {
 #[cfg_attr(feature = "serde", serde(try_from = "TimeOfUsePricingRepr"))]
 #[derive(Debug, Clone)]
 pub struct TimeOfUsePricing {
-    bands: Vec<TouBand>,
+    bands: Vec<TimeBand>,
     unit: String,
     currency: Currency,
 }
@@ -74,7 +74,7 @@ pub struct TimeOfUsePricing {
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct TimeOfUsePricingRepr {
-    bands: Vec<TouBand>,
+    bands: Vec<TimeBand>,
     unit: String,
     #[serde(default)]
     currency: Currency,
@@ -99,7 +99,7 @@ impl TryFrom<TimeOfUsePricingRepr> for TimeOfUsePricing {
 /// Builder for [`TimeOfUsePricing`]. Obtain via [`TimeOfUsePricing::builder`].
 #[derive(Debug, Clone)]
 pub struct TimeOfUsePricingBuilder {
-    bands: Vec<TouBand>,
+    bands: Vec<TimeBand>,
     unit: String,
     currency: Currency,
 }
@@ -117,14 +117,14 @@ impl Default for TimeOfUsePricingBuilder {
 impl TimeOfUsePricingBuilder {
     /// Append a pricing band.
     #[must_use]
-    pub fn band(mut self, band: TouBand) -> Self {
+    pub fn band(mut self, band: TimeBand) -> Self {
         self.bands.push(band);
         self
     }
 
     /// Append several pricing bands.
     #[must_use]
-    pub fn bands(mut self, bands: impl IntoIterator<Item = TouBand>) -> Self {
+    pub fn bands(mut self, bands: impl IntoIterator<Item = TimeBand>) -> Self {
         self.bands.extend(bands);
         self
     }
@@ -167,7 +167,7 @@ impl TimeOfUsePricing {
     }
 
     fn assemble(
-        bands: Vec<TouBand>,
+        bands: Vec<TimeBand>,
         unit: String,
         currency: Currency,
     ) -> Result<Self, BillingError> {
@@ -254,13 +254,13 @@ impl TimeOfUsePricing {
     /// a database works directly without rebuilding it as borrowed tuples.
     ///
     /// ```rust
-    /// use billing::{TimeOfUsePricing, TouBand, Amount, Currency};
+    /// use billing::{TimeOfUsePricing, TimeBand, Amount, Currency};
     /// use rust_decimal::dec;
     ///
     /// let tou = TimeOfUsePricing::builder()
     ///     .unit("kWh")
     ///     .currency(Currency::EUR)
-    ///     .band(TouBand::new("HT", Amount::parse("0.32000").unwrap()))
+    ///     .band(TimeBand::new("HT", Amount::parse("0.32000").unwrap()))
     ///     .build()
     ///     .unwrap();
     ///
@@ -516,8 +516,8 @@ mod tests {
     fn tou_two_bands_with_unit() {
         let tou = TimeOfUsePricing::builder()
             .unit("kWh")
-            .band(TouBand::new("HT", Amount::parse("0.32000").unwrap()))
-            .band(TouBand::new("NT", Amount::parse("0.18000").unwrap()))
+            .band(TimeBand::new("HT", Amount::parse("0.32000").unwrap()))
+            .band(TimeBand::new("NT", Amount::parse("0.18000").unwrap()))
             .build()
             .unwrap();
         let items = tou
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn tou_default_unit_is_units() {
         let tou = TimeOfUsePricing::builder()
-            .band(TouBand::new("peak", Amount::parse("0.10000").unwrap()))
+            .band(TimeBand::new("peak", Amount::parse("0.10000").unwrap()))
             .build()
             .unwrap();
         let items = tou.calculate(&[("peak", dec!(100))]).unwrap();
@@ -566,10 +566,10 @@ mod tests {
             .unit("kWh")
             .currency(Currency::EUR)
             .bands([
-                TouBand::new("peak", Amount::parse("0.35000").unwrap()),
-                TouBand::new("offpeak", Amount::parse("0.22000").unwrap()),
+                TimeBand::new("peak", Amount::parse("0.35000").unwrap()),
+                TimeBand::new("offpeak", Amount::parse("0.22000").unwrap()),
             ])
-            .band(TouBand::new("night", Amount::parse("0.15000").unwrap()))
+            .band(TimeBand::new("night", Amount::parse("0.15000").unwrap()))
             .build()
             .unwrap();
 
@@ -600,7 +600,7 @@ mod tests {
         // An empty plural call is a no-op, not a reset.
         let still_there = TimeOfUsePricing::builder()
             .unit("kWh")
-            .band(TouBand::new("flat", Amount::parse("0.30000").unwrap()))
+            .band(TimeBand::new("flat", Amount::parse("0.30000").unwrap()))
             .bands([])
             .build()
             .unwrap();

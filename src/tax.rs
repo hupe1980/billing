@@ -119,7 +119,7 @@ pub trait TaxLayer {
         None
     }
 
-    /// Box this layer for [`crate::Tariff::tax_layers`].
+    /// Box this layer for [`crate::PricingModel::tax_layers`].
     ///
     /// `vec![tax.boxed()]` rather than `vec![Box::new(tax) as Box<dyn TaxLayer>]`,
     /// which is the form that actually type-checks when the vector holds more than
@@ -835,7 +835,23 @@ impl TaxLayer for PerUnitLevy {
 /// `PercentageCharge` implements [`TaxLayer`], so its output lands in
 /// `tax_positions` and is counted in [`crate::BillingDocument::tax_total`] —
 /// a commercial commission will therefore appear inside the document's tax total.
-/// Filter by the `"percentage-charge"` tag to separate them for display.
+/// Filter by the `"percentage-charge"` tag to separate them for display, or use
+/// [`crate::BillingDocument::charge_total`], which is exact.
+///
+/// # A charge never becomes a credit
+///
+/// [`PercentageCharge::new`] refuses a negative rate, because a negative charge is
+/// a discount and belongs in a [`DiscountLayer`]. The same result is reachable
+/// through a negative *base* — debit positions that net out below zero, which
+/// sustained negative spot prices produce — and it is refused the same way: the
+/// base is clamped to zero, so there is simply nothing to take a percentage of.
+///
+/// Without the clamp a "charge" would increase what the supplier owes the
+/// customer, which is the mirror image of the case [`PercentageDiscount`] has
+/// always clamped. A debit at a negative price still *contributes* to the base and
+/// reduces it — that is what distinguishes it from a [`crate::Sign::Credit`]
+/// position, which is excluded outright. Only a base that ends up below zero is
+/// clamped.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "PercentageChargeRepr"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -979,6 +995,18 @@ impl TaxLayer for PercentageCharge {
                 .filter(|p| p.is_debit()) // charges only; exclude Sign::Credit positions
                 .map(|p| p.net_amount),
         )?;
+        // A negative base — debit positions that net out below zero, which sustained
+        // negative spot prices produce — would turn this charge into a credit. That
+        // contradicts the type's own invariant: `PercentageCharge::new` refuses a
+        // negative rate precisely because "a negative charge is a discount", and
+        // arriving at the same thing through the base rather than the rate is no
+        // different. `PercentageDiscount` has always clamped for the mirror-image
+        // reason; the two now agree.
+        let base = if base.is_negative() {
+            Amount::<5>::ZERO
+        } else {
+            base
+        };
         let uncapped = base.checked_mul_qty(self.rate)?;
         let mut charge = uncapped;
         if let Some(min) = self.min_amount {
@@ -1017,9 +1045,11 @@ impl TaxLayer for PercentageCharge {
     }
 
     fn allowance_charge(&self) -> Option<crate::line_item::AllowanceCharge> {
-        // A per-unit levy is quantity x rate, not a percentage of anything, so
-        // BT-100 / BT-101 stay unset — which is exactly what PEPPOL-EN16931-R041
-        // and R042 require of a charge that has no percentage.
+        // Fallback only. `compute` already attaches BT-100 / BT-101 whenever the
+        // charge really is `base x percentage`, and deliberately omits them when a
+        // min/max guard clamped the result — so this supplies the reason code alone
+        // for the clamped case, which is what R041 / R042 require of a charge with
+        // no percentage.
         self.reason_code
             .as_ref()
             .map(crate::line_item::AllowanceCharge::coded)
@@ -1070,7 +1100,7 @@ pub trait DiscountLayer {
         None
     }
 
-    /// Box this layer for [`crate::Tariff::discount_layers`].
+    /// Box this layer for [`crate::PricingModel::discount_layers`].
     #[must_use]
     fn boxed(self) -> Box<dyn DiscountLayer>
     where
@@ -1209,9 +1239,9 @@ impl DiscountLayer for PercentageDiscount {
     }
 
     fn allowance_charge(&self) -> Option<crate::line_item::AllowanceCharge> {
-        // A per-unit levy is quantity x rate, not a percentage of anything, so
-        // BT-100 / BT-101 stay unset — which is exactly what PEPPOL-EN16931-R041
-        // and R042 require of a charge that has no percentage.
+        // Fallback only — `compute` already attaches BT-93 / BT-94 together with
+        // this reason code, because only it knows the base the percentage was
+        // taken of.
         self.reason_code
             .as_ref()
             .map(crate::line_item::AllowanceCharge::coded)
@@ -1319,9 +1349,9 @@ impl DiscountLayer for FixedDiscount {
     }
 
     fn allowance_charge(&self) -> Option<crate::line_item::AllowanceCharge> {
-        // A per-unit levy is quantity x rate, not a percentage of anything, so
-        // BT-100 / BT-101 stay unset — which is exactly what PEPPOL-EN16931-R041
-        // and R042 require of a charge that has no percentage.
+        // A fixed discount is an amount, not a percentage of anything, so BT-93 /
+        // BT-94 stay unset — which is exactly what PEPPOL-EN16931-R041 and R042
+        // require of an allowance that has no percentage.
         self.reason_code
             .as_ref()
             .map(crate::line_item::AllowanceCharge::coded)

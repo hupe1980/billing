@@ -461,11 +461,11 @@ proptest! {
         p1 in 1i64..500_000,
         p2 in 1i64..500_000,
     ) {
-        let sched = TariffSchedule::graduated()
+        let sched = RateSchedule::graduated()
             .unit("kWh")
             .currency(Currency::EUR)
-            .band(TariffBand::up_to(Decimal::from(500), Amount::<5>::from_raw_units(p1)))
-            .band(TariffBand::over(Decimal::from(500), Amount::<5>::from_raw_units(p2)))
+            .band(RateBand::up_to(Decimal::from(500), Amount::<5>::from_raw_units(p1)))
+            .band(RateBand::over(Decimal::from(500), Amount::<5>::from_raw_units(p2)))
             .build()
             .unwrap();
 
@@ -702,5 +702,47 @@ proptest! {
             prop_assert!(lac.amount.fits_scale(2));
         }
         prop_assert!(doc.fits_amount_scale(2));
+    }
+
+    // ── Tax-inclusive amounts ────────────────────────────────────────────────
+
+    /// The gross split is *lossless*: the net and the tax always re-sum to the
+    /// price that was quoted, under every rate and every rounding strategy.
+    ///
+    /// This is only true because the net is defined as the remainder. Rounding
+    /// `gross / (1 + rate)` and `gross * rate / (1 + rate)` independently fails
+    /// here for roughly half of all inputs, and the symptom on a real invoice is
+    /// a cent that appears or vanishes between the shelf price and BT-112.
+    #[test]
+    fn a_gross_amount_splits_into_net_and_tax_without_loss(
+        gross in arb_amount(),
+        rate in arb_rate(),
+        strategy in arb_strategy(),
+    ) {
+        let tax = gross.extract_tax(rate, strategy).unwrap();
+        let net = gross.net_of_tax(rate, strategy).unwrap();
+        prop_assert_eq!(net.checked_add(tax).unwrap(), gross);
+
+        // The extracted tax never exceeds the amount it came out of, and shares
+        // its sign — a gross of 119 cannot contain 130 of tax, nor -19.
+        prop_assert_eq!(tax.is_negative(), gross.is_negative() && !tax.is_zero());
+        prop_assert!(tax.checked_abs().unwrap() <= gross.checked_abs().unwrap());
+    }
+
+    /// `TaxBreakdownEntry::from_gross` produces a group a validator accepts:
+    /// BT-116 + BT-117 is the quoted gross, and BR-CO-17 holds on the result.
+    #[test]
+    fn a_breakdown_built_from_a_gross_price_satisfies_br_co_17(
+        gross in arb_positive_amount(),
+        rate in arb_rate(),
+    ) {
+        let entry = TaxBreakdownEntry::from_gross(
+            TaxCategory::Standard, rate, gross, AmountScale::EN16931,
+        ).unwrap();
+        prop_assert_eq!(
+            entry.taxable_base.checked_add(entry.tax_amount).unwrap(),
+            gross
+        );
+        prop_assert!(entry.validate().is_ok());
     }
 }

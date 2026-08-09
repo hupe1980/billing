@@ -53,10 +53,10 @@ src/tou.rs: replace DynamicPricing::builder -> DynamicPricingBuilder with Defaul
 #
 # `split_graduated`: `qty > 0` guards against emitting a zero-quantity tier line,
 # which needs a band of zero width — `cap == band.upper - prev_upper == 0`.
-# `TariffScheduleBuilder::build` refuses that: upper bounds must be strictly
+# `RateScheduleBuilder::build` refuses that: upper bounds must be strictly
 # increasing, and only the last band may be unbounded. Deserialisation cannot
-# route around it either, because `TariffSchedule` is `#[serde(try_from)]` onto
+# route around it either, because `RateSchedule` is `#[serde(try_from)]` onto
 # the builder. Verified against both paths rather than assumed — an identical
 # "unreachable" comment in `proportional_split` turned out to be wrong, and the
 # bug it hid is in the 0.11.0 changelog.
-src/schedule.rs: replace > with >= in TariffSchedule::split_graduated
+src/schedule.rs: replace > with >= in RateSchedule::split_graduated

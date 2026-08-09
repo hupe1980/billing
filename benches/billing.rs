@@ -43,19 +43,19 @@ fn amount_ops(c: &mut Criterion) {
 }
 
 fn schedule(c: &mut Criterion) {
-    let sched = TariffSchedule::graduated()
+    let sched = RateSchedule::graduated()
         .unit("kWh")
         .currency(Currency::EUR)
-        .band(TariffBand::up_to(
+        .band(RateBand::up_to(
             dec!(500),
             Amount::parse("0.32000").unwrap(),
         ))
-        .band(TariffBand::between(
+        .band(RateBand::between(
             dec!(500),
             dec!(2000),
             Amount::parse("0.28000").unwrap(),
         ))
-        .band(TariffBand::over(
+        .band(RateBand::over(
             dec!(2000),
             Amount::parse("0.24000").unwrap(),
         ))

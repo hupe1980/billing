@@ -1,4 +1,4 @@
-//! # billing — Generic tariff billing engine
+//! # billing — a domain-agnostic invoice and usage-billing engine
 //!
 //! `billing` is a **pure, domain-agnostic, dependency-minimal** calculation engine.
 //! It knows nothing about energy, jurisdictions, or currencies beyond an ISO 4217
@@ -12,17 +12,19 @@
 //! | [`Currency`] | ISO 4217 code for generated labels and cross-document checks |
 //! | [`LineItem`] | Atomic billing unit: quantity × unit-price → net amount |
 //! | [`Period`] | Billing period — construct from strings or any `Display` type |
-//! | [`TariffSchedule`] | Graduated / volume / block / capacity pricing |
+//! | [`RateSchedule`] | Graduated / volume / block / capacity pricing |
 //! | [`TimeOfUsePricing`] | N-band time-of-use pricing (peak / off-peak / …) |
 //! | [`DynamicPricing`] | Per-interval price sequence (spot, real-time) |
 //! | [`UsageAggregator`] | Pre-billing event aggregation (SUM / MAX / COUNT / …) |
 //! | [`TaxLayer`] | Composable tax and surcharge overlays |
 //! | [`DiscountLayer`] | Composable discount overlays |
-//! | [`Tariff`] | Primary extension point for usage-driven pricing |
-//! | [`ScalarTariff`] | Pricing for pre-computed settlements — no `Usage` type, no ignored argument |
+//! | [`PricingModel`] | The extension point: usage in, priced positions and layers out |
 //! | [`Billing`] | Three outcomes: billable, not billable (with a domain reason), error |
 //! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
 //! | [`AmountScale`] | Assemble every amount at an interchange format's decimal limit |
+//! | [`VatAccountingCurrency`] | EN 16931 BT-6 / BT-111 — the VAT total in the reporting currency |
+//! | [`PaymentTerms`] | EN 16931 BT-20 — free text plus structured early-payment discounts |
+//! | [`EarlyPaymentDiscount`] | Skonto: the BR-DE-18 `#SKONTO#…#` syntax, and what the buyer pays |
 //! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
 //! | [`LineVat`] | Per-position VAT category + rate (EN 16931 BT-151/152, BT-95/96, BT-102/103) |
 //! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
@@ -44,7 +46,7 @@
 //! - **Comparisons are total** — [`Amount::within_tolerance_ppm`] returns `bool`, so
 //!   a tolerance check can never degrade into a spurious finding via `unwrap_or`.
 //! - **"Nothing to bill" is not an error and not an empty list** — [`Billing`]
-//!   carries the domain's own reason, and tariffs that always bill opt out at the
+//!   carries the domain's own reason, and models that always bill opt out at the
 //!   type level with `NotBillable = Infallible`.
 //! - **No implicit currency** — [`Currency`] defaults to ISO 4217 `XXX`, never `EUR`.
 //! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
@@ -59,6 +61,15 @@
 //!   [`BillingDocument::charge_total`] (BT-108) are exact rather than heuristic.
 //!   The mark comes from the layer's own `breakdown` return value, so it is as
 //!   accurate for a third-party [`TaxLayer`] as for a built-in one.
+//! - **A gross price is split, never multiplied** — [`Amount::extract_tax`] applies
+//!   the VAT fraction `r/(1+r)`, and [`Amount::net_of_tax`] takes the remainder, so
+//!   `net + tax` reconstructs the quoted price exactly under every strategy.
+//! - **A conditional discount is not a discount** — an early-payment
+//!   [`PaymentTerms`] entry changes no total and no VAT breakdown, because it is
+//!   earned by a payment that has not happened when the invoice is issued.
+//! - **A layer never reverses its own direction** — [`PercentageCharge`] refuses a
+//!   negative rate *and* clamps a negative base, as [`PercentageDiscount`] does, so
+//!   neither can move the total the way the other one should.
 //! - **Precision reduction happens at the leaves** — [`AmountScale`] rounds every
 //!   position and layer output *before* the totals are summed, so an interchange
 //!   format's decimal limit and its totals identities hold at once. Rounding a
@@ -88,11 +99,12 @@ pub mod line_item;
 pub mod lookup;
 pub mod minimum;
 pub mod period;
+pub mod pricing;
 pub mod quantity;
 pub mod schedule;
 pub mod settlement;
-pub mod tariff;
 pub mod tax;
+pub mod terms;
 pub mod tou;
 pub mod vat;
 
@@ -102,7 +114,7 @@ pub use aggregation::{
     UsageAggregator, WeightedSumAggregator,
 };
 pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
-pub use amount::{Amount, AmountScale, EuroAmount, InvoiceAmt, RoundingStrategy};
+pub use amount::{Amount, AmountScale, RoundingStrategy};
 pub use currency::Currency;
 pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
 pub use error::{BillingError, ParseAmountError};
@@ -112,16 +124,17 @@ pub use line_item::{
 pub use lookup::{RateLookup, RateLookupBuilder};
 pub use minimum::minimum_charge;
 pub use period::{Period, merge_period_documents, prorate, prorate_amount};
+pub use pricing::{Billed, Billing, Positions, PricingModel};
 pub use quantity::{Quantity, UnitPrice};
-pub use schedule::{TariffBand, TariffSchedule};
-pub use settlement::CashRounding;
-pub use tariff::{Billed, Billing, Positions, ScalarTariff, Tariff};
+pub use schedule::{RateBand, RateSchedule};
+pub use settlement::{CashRounding, VatAccountingCurrency};
 pub use tax::{
     DiscountLayer, FixedDiscount, FixedRateTax, PerUnitLevy, PercentageCharge, PercentageDiscount,
     TaxLayer,
 };
+pub use terms::{EarlyPaymentDiscount, PaymentTerms};
 pub use tou::{
-    DynamicPricing, DynamicPricingBuilder, TimeOfUsePricing, TimeOfUsePricingBuilder, TouBand,
+    DynamicPricing, DynamicPricingBuilder, TimeBand, TimeOfUsePricing, TimeOfUsePricingBuilder,
 };
 pub use vat::{LineVat, TaxBreakdownEntry, TaxCategory};
 
@@ -133,10 +146,11 @@ pub use vat::{LineVat, TaxBreakdownEntry, TaxCategory};
 /// position with no natural quantity still satisfies BR-23.
 ///
 /// ```rust
-/// use billing::{LineItem, Amount, UNIT_CODE_ONE};
+/// use billing::{Currency, LineItem, Amount, UNIT_CODE_ONE};
 ///
 /// assert_eq!(UNIT_CODE_ONE, "C62");
-/// let fee = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap())
+/// let fee = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap(),
+///                              Currency::EUR)
 ///     .build().unwrap();
 /// assert_eq!(fee.quantity.unwrap().code.as_deref(), Some(UNIT_CODE_ONE));
 /// ```
@@ -227,14 +241,14 @@ pub mod prelude {
     pub use crate::{
         AdvancePayment, AllocationRule, AllowanceCharge, Amount, AmountScale, Billed, Billing,
         BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
-        Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EqualAllocation,
-        EuroAmount, FixedDiscount, FixedRateTax, InvoiceAmt, LatestAggregator, LineAllowanceCharge,
-        LineItem, LineVat, MaxAggregator, ParseAmountError, PerUnitLevy, PercentageCharge,
-        PercentageDiscount, Period, Positions, Prepayment, ProportionalAllocation, Quantity,
-        RateLookup, RateLookupBuilder, RoundingStrategy, ScalarTariff, Sign, SumAggregator, Tariff,
-        TariffBand, TariffSchedule, TaxBreakdownEntry, TaxCategory, TaxLayer, TimeOfUsePricing,
-        TouBand, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice, UsageAggregator,
-        WeightedSumAggregator, merge_period_documents, minimum_charge, proportional_split, prorate,
-        prorate_amount, residual_breakdown,
+        Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EarlyPaymentDiscount,
+        EqualAllocation, FixedDiscount, FixedRateTax, LatestAggregator, LineAllowanceCharge,
+        LineItem, LineVat, MaxAggregator, ParseAmountError, PaymentTerms, PerUnitLevy,
+        PercentageCharge, PercentageDiscount, Period, Positions, Prepayment, PricingModel,
+        ProportionalAllocation, Quantity, RateBand, RateLookup, RateLookupBuilder, RateSchedule,
+        RoundingStrategy, Sign, SumAggregator, TaxBreakdownEntry, TaxCategory, TaxLayer, TimeBand,
+        TimeOfUsePricing, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice, UsageAggregator,
+        VatAccountingCurrency, WeightedSumAggregator, merge_period_documents, minimum_charge,
+        proportional_split, prorate, prorate_amount, residual_breakdown,
     };
 }

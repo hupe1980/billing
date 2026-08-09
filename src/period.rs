@@ -198,6 +198,35 @@ pub fn merge_period_documents(
     let prepaid = doc_a.prepaid().checked_add(doc_b.prepaid())?;
     let rounding = doc_a.rounding().checked_add(doc_b.rounding())?;
 
+    // BT-111 sums like every other VAT total, but only when both halves state one
+    // in the same currency. The asymmetric case — one half reporting VAT in PLN and
+    // the other not reporting it at all — cannot be summed: the missing figure is
+    // *unstated*, not zero, and treating it as zero would understate BT-111 on a
+    // document where BR-53 makes it mandatory.
+    let vat_accounting_currency = match (
+        doc_a.vat_accounting_currency(),
+        doc_b.vat_accounting_currency(),
+    ) {
+        (None, None) => None,
+        (Some(a), Some(b)) if a.currency() == b.currency() => {
+            Some(a.with_vat_total(a.vat_total().checked_add(b.vat_total())?))
+        }
+        (Some(a), Some(b)) => {
+            return Err(BillingError::CurrencyMismatch {
+                left: a.currency(),
+                right: b.currency(),
+            });
+        }
+        _ => {
+            return Err(BillingError::InvalidInput {
+                reason: "cannot merge documents where only one states a VAT accounting \
+                         currency (BT-6 / BT-111): the other's VAT in that currency is \
+                         unstated, not zero"
+                    .into(),
+            });
+        }
+    };
+
     let merged = BillingDocument::from_raw(crate::document::DocumentParts {
         meta: doc_a.meta,
         net_positions,
@@ -210,6 +239,7 @@ pub fn merge_period_documents(
         // Both halves' already-paid amounts and rounding adjustments carry over.
         prepaid,
         rounding,
+        vat_accounting_currency,
     })?;
     // `from_raw` performs no validation, so without this the function could hand
     // back a document that fails `validate()`. Two individually lawful halves do

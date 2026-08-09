@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 /// Aggregate a slice of raw usage events to a single scalar quantity.
 ///
 /// This is a pure function — no I/O, no state.  The result is passed to a
-/// `TariffSchedule` or `DynamicPricing` for billing.
+/// `RateSchedule` or `DynamicPricing` for billing.
 ///
 /// 6 built-in types: `SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST`, `WEIGHTED_SUM`.
 pub trait UsageAggregator<E> {
@@ -142,7 +142,7 @@ where
 /// Maximum value of a numeric field across all events in the period.
 ///
 /// Use case: peak active seats, peak bandwidth (Mbps).
-/// Pairs well with `TariffSchedule::capacity()`.
+/// Pairs well with `RateSchedule::capacity()`.
 #[derive(Clone, Copy)]
 pub struct MaxAggregator<E, F: Fn(&E) -> Decimal> {
     value_fn: F,
@@ -320,6 +320,31 @@ mod tests {
         ];
         let agg = MaxAggregator::new(|e: &Event| Decimal::from(e.value));
         assert_eq!(agg.aggregate(&events), dec!(50));
+    }
+
+    #[test]
+    fn latest_agg() {
+        // The only aggregator with no unit test until 0.12.0 — a README doctest was
+        // the sole thing standing between `aggregate` and returning `Default`, which
+        // a mutation sweep noticed the moment doctests left the sweep. "Latest" is
+        // slice order, not the largest or the last-nonzero, so the fixture has to be
+        // one where those three answers differ.
+        let events = vec![
+            Event {
+                value: 90,
+                user: "a".into(),
+            },
+            Event {
+                value: 10,
+                user: "b".into(),
+            },
+        ];
+        let agg = LatestAggregator::new(|e: &Event| Decimal::from(e.value));
+        assert_eq!(agg.aggregate(&events), dec!(10));
+
+        // Snapshot billing over an empty period is zero, not a panic: there is no
+        // "current storage GB" to read, and an error channel does not exist here.
+        assert_eq!(agg.aggregate(&[]), Decimal::ZERO);
     }
 
     #[test]

@@ -1,0 +1,53 @@
+{#- A documentation page: sidebar, article, on-page table of contents, pager. -#}
+{% extends "base.html" %}
+
+{% block content %}
+{%- set docs = get_section(path="docs/_index.md") -%}
+<div class="wrap docs-layout">
+  {% include "_sidebar.html" %}
+
+  <article class="doc">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ docs.permalink }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.title }}</span>
+    </nav>
+
+    <h1>{{ page.title }}</h1>
+    {%- if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
+
+    {%- if page.toc | length > 1 %}
+    <details class="toc" open>
+      <summary>On this page</summary>
+      <ul>
+        {%- for h in page.toc %}
+        <li><a href="#{{ h.id }}">{{ h.title }}</a></li>
+        {%- endfor %}
+      </ul>
+    </details>
+    {%- endif %}
+
+    {{ page.content | safe }}
+
+    <nav class="pager" aria-label="Pagination">
+      {%- if page.lower %}
+      <a class="prev" href="{{ page.lower.permalink }}">
+        <span>Previous</span><strong>{{ page.lower.title }}</strong>
+      </a>
+      {%- else %}<span></span>{% endif %}
+      {%- if page.higher %}
+      <a class="next" href="{{ page.higher.permalink }}">
+        <span>Next</span><strong>{{ page.higher.title }}</strong>
+      </a>
+      {%- endif %}
+    </nav>
+
+    <p class="edit">
+      <a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path }}"
+         rel="noopener">Improve this page on GitHub</a>
+    </p>
+  </article>
+</div>
+{% endblock content %}

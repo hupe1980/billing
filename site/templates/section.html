@@ -1,0 +1,30 @@
+{#- The documentation index. -#}
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap docs-layout">
+  {% include "_sidebar.html" %}
+
+  <article class="doc">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">Docs</span>
+    </nav>
+
+    <h1>{{ section.title }}</h1>
+    {%- if section.description %}<p class="lede">{{ section.description }}</p>{% endif %}
+
+    {{ section.content | safe }}
+
+    <ul class="doc-index">
+      {%- for p in section.pages %}
+      <li>
+        <a href="{{ p.permalink }}">{{ p.title }}</a>
+        <span>{{ p.description }}</span>
+      </li>
+      {%- endfor %}
+    </ul>
+  </article>
+</div>
+{% endblock content %}

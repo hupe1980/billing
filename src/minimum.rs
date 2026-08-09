@@ -62,7 +62,7 @@ pub fn minimum_charge(
     let shortfall = minimum.checked_sub(doc.net_total())?;
     let item = LineItem::debit(description)
         .fixed_amount(shortfall)
-        .tag("minimum-charge")
+        .tag(crate::tags::MINIMUM_CHARGE)
         .build()?;
     Ok(Some(item))
 }

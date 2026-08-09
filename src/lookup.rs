@@ -1,6 +1,6 @@
 //! [`RateLookup`] — capacity-based rate table (EEG/KWKG style).
 //!
-//! Unlike a [`crate::TariffSchedule`] (which applies different prices to consumption
+//! Unlike a [`crate::RateSchedule`] (which applies different prices to consumption
 //! *bands*), a `RateLookup` returns a **single uniform rate** determined by a
 //! *parameter value* (e.g. installed capacity in kWp). All consumption is then
 //! multiplied by that one rate.

@@ -6,7 +6,7 @@
 
 use billing::prelude::*;
 use billing::{CashRounding, FixedRateTax, PerUnitLevy, PercentageCharge};
-use rust_decimal::dec;
+use rust_decimal::{Decimal, dec};
 
 fn meta(number: &str) -> DocumentMeta {
     DocumentMeta {
@@ -3474,9 +3474,13 @@ fn flat_fee_is_a_complete_invoice_line_where_fixed_is_not() {
     assert!(bare.quantity.is_none());
     assert!(bare.unit_price.is_none());
 
-    let complete = LineItem::flat_fee("Grundpreis", Amount::parse("8.50000").unwrap())
-        .build()
-        .unwrap();
+    let complete = LineItem::flat_fee(
+        "Grundpreis",
+        Amount::parse("8.50000").unwrap(),
+        Currency::EUR,
+    )
+    .build()
+    .unwrap();
     assert_eq!(complete.net_amount, bare.net_amount); // same money
     let q = complete.quantity.as_ref().unwrap();
     assert_eq!(q.value, dec!(1)); // BR-22 — BT-129
@@ -3491,9 +3495,13 @@ fn flat_fee_is_a_complete_invoice_line_where_fixed_is_not() {
     );
 
     // The credit counterpart is symmetric.
-    let refund = LineItem::credit_flat_fee("Gutschrift", Amount::parse("8.50000").unwrap())
-        .build()
-        .unwrap();
+    let refund = LineItem::credit_flat_fee(
+        "Gutschrift",
+        Amount::parse("8.50000").unwrap(),
+        Currency::EUR,
+    )
+    .build()
+    .unwrap();
     assert_eq!(refund.net_amount, Amount::<5>::parse("-8.50000").unwrap());
     assert!(refund.is_credit());
     refund.validate().unwrap();
@@ -3507,12 +3515,20 @@ fn flat_fee_survives_scale_reduction_and_vat() {
         .meta(meta("INV-FF"))
         .amount_scale(AmountScale::EN16931)
         .positions(vec![
-            LineItem::flat_fee("Grundpreis", Amount::parse("8.50000").unwrap())
-                .build()
-                .unwrap(),
-            LineItem::flat_fee("Zählermiete", Amount::parse("2.33000").unwrap())
-                .build()
-                .unwrap(),
+            LineItem::flat_fee(
+                "Grundpreis",
+                Amount::parse("8.50000").unwrap(),
+                Currency::EUR,
+            )
+            .build()
+            .unwrap(),
+            LineItem::flat_fee(
+                "Zählermiete",
+                Amount::parse("2.33000").unwrap(),
+                Currency::EUR,
+            )
+            .build()
+            .unwrap(),
         ])
         .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
         .build()
@@ -3525,4 +3541,758 @@ fn flat_fee_survives_scale_reduction_and_vat() {
     assert_eq!(doc.vat_total().unwrap(), Amount::parse("2.06000").unwrap()); // 10.83 × 0.19
     assert!(doc.fits_amount_scale(2));
     doc.assert_valid();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tax-inclusive (gross) pricing — the consumer-catalogue boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The whole point of `extract_tax`: a gross price is not `net × (1 + rate)` run
+/// backwards by multiplying, and the naive form over-states the tax by `rate²` of
+/// the net. On 119,00 at 19 % that is 22,61 instead of 19,00 — 19 % too much output
+/// tax declared on every B2C line.
+#[test]
+fn the_tax_in_a_gross_amount_is_the_vat_fraction_not_the_rate() {
+    let gross = Amount::<5>::parse("119.00000").unwrap();
+    let naive = gross.checked_mul_qty(dec!(0.19)).unwrap();
+    assert_eq!(naive, Amount::parse("22.61000").unwrap()); // wrong, and plausible
+
+    let tax = gross
+        .extract_tax(dec!(0.19), RoundingStrategy::MidpointAwayFromZero)
+        .unwrap();
+    assert_eq!(tax, Amount::parse("19.00000").unwrap());
+}
+
+/// `net + tax == gross` must hold **exactly**, for every rate and every strategy,
+/// because the gross is the number on the price tag. Deriving the net as the
+/// remainder is what guarantees it; rounding both halves independently does not.
+#[test]
+fn the_gross_split_reconstructs_the_quoted_price_under_every_strategy() {
+    let rates = [
+        dec!(0.19),
+        dec!(0.07),
+        dec!(0.2),
+        dec!(0.055),
+        dec!(0.077),
+        dec!(0),
+    ];
+    let strategies = [
+        RoundingStrategy::MidpointAwayFromZero,
+        RoundingStrategy::MidpointToEven,
+        RoundingStrategy::Ceiling,
+        RoundingStrategy::Floor,
+        RoundingStrategy::Truncate,
+    ];
+    for raw in ["0.01000", "9.99000", "119.00000", "1234.56000", "-59.50000"] {
+        let gross = Amount::<5>::parse(raw).unwrap();
+        for rate in rates {
+            for strategy in strategies {
+                let tax = gross.extract_tax(rate, strategy).unwrap();
+                let net = gross.net_of_tax(rate, strategy).unwrap();
+                assert_eq!(
+                    net.checked_add(tax).unwrap(),
+                    gross,
+                    "{raw} at {rate} under {strategy:?} must re-sum exactly"
+                );
+            }
+        }
+    }
+    // A negative rate is not a tax-inclusive amount at all.
+    assert!(
+        Amount::<5>::parse("119.00000")
+            .unwrap()
+            .extract_tax(dec!(-0.19), RoundingStrategy::Floor)
+            .is_err()
+    );
+}
+
+/// A gross-quoted catalogue becomes a lawful BG-23: BT-116 net, BT-117 tax, and
+/// BR-CO-17 satisfied — which is what a validator recomputes.
+#[test]
+fn a_gross_price_becomes_a_valid_vat_breakdown_entry() {
+    let entry = TaxBreakdownEntry::from_gross(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("119.00000").unwrap(),
+        AmountScale::EN16931,
+    )
+    .unwrap();
+
+    assert_eq!(entry.taxable_base, Amount::parse("100.00000").unwrap());
+    assert_eq!(entry.tax_amount, Amount::parse("19.00000").unwrap());
+    entry.validate().unwrap();
+    assert_eq!(
+        entry
+            .taxable_base
+            .checked_add(entry.tax_amount)
+            .unwrap()
+            .to_string(),
+        "119.00000"
+    );
+
+    // A price that does not split evenly still re-sums to the quoted figure.
+    let odd = TaxBreakdownEntry::from_gross(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("9.99000").unwrap(),
+        AmountScale::EN16931,
+    )
+    .unwrap();
+    assert_eq!(odd.taxable_base, Amount::parse("8.39000").unwrap());
+    assert_eq!(odd.tax_amount, Amount::parse("1.60000").unwrap());
+    assert_eq!(
+        odd.taxable_base.checked_add(odd.tax_amount).unwrap(),
+        Amount::parse("9.99000").unwrap()
+    );
+    odd.validate().unwrap();
+
+    // A zero-tax category contains no tax: the whole gross is the base.
+    let exempt = TaxBreakdownEntry::from_gross(
+        TaxCategory::ReverseCharge,
+        dec!(0),
+        Amount::parse("500.00000").unwrap(),
+        AmountScale::EN16931,
+    )
+    .unwrap()
+    .with_exemption_reason_code("VATEX-EU-AE");
+    assert_eq!(exempt.taxable_base, Amount::parse("500.00000").unwrap());
+    assert!(exempt.tax_amount.is_zero());
+    exempt.validate().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BR-CO-04 / BR-32 / BR-37 — every position needs a VAT category
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `verify_vat_attribution` checks that the attributions which *exist* agree with
+/// the breakdown, and passes vacuously when there are none. That is deliberate, and
+/// it means passing it is not on its own a licence to emit — `unattributed_positions`
+/// answers the other half.
+#[test]
+fn a_charge_outside_the_vat_base_is_reported_as_unattributed() {
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-ATTR"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .tag("energy")
+            .build()
+            .unwrap(),
+        ])
+        // The levy is a BG-21 charge; the VAT layer below is restricted to "energy",
+        // so nothing attributes a BT-102 to it.
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("MwSt", dec!(0.19))
+                .unwrap()
+                .with_tag("energy")
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+
+    doc.assert_valid();
+    doc.verify_vat_attribution().unwrap();
+
+    let missing: Vec<&str> = doc
+        .unattributed_positions()
+        .map(|p| p.description.as_str())
+        .collect();
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0].starts_with("Stromsteuer"));
+
+    // Declaring the levy's own BT-102 / BT-103 closes it.
+    let fixed = BillingDocument::builder()
+        .meta(meta("INV-ATTR-2"))
+        .positions(vec![
+            LineItem::for_usage(
+                "Arbeit",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(0.30), "EUR/kWh"),
+            )
+            .tag("energy")
+            .build()
+            .unwrap(),
+        ])
+        .extra_tax(
+            PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050").unwrap(), "kWh")
+                .unwrap()
+                .with_vat(LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap())
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("MwSt", dec!(0.19))
+                .unwrap()
+                .with_tag("energy")
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    assert_eq!(fixed.unattributed_positions().count(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BT-20 — payment terms and Skonto
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attaching payment terms must not move a single figure on the invoice. A Skonto
+/// is conditional on early payment, which has not happened yet; deducting it up
+/// front would understate the taxable base for a supply that may be paid in full.
+#[test]
+fn payment_terms_change_nothing_but_the_header() {
+    let build = |terms: Option<PaymentTerms>| {
+        BillingDocument::from_positions(
+            DocumentMeta {
+                payment_terms: terms,
+                ..meta("INV-SKONTO")
+            },
+            vec![
+                LineItem::fixed("Leistung", Amount::parse("1000.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()],
+            vec![],
+        )
+        .unwrap()
+    };
+
+    let skonto = EarlyPaymentDiscount::new(14, dec!(2)).unwrap();
+    let plain = build(None);
+    let with_terms = build(Some(
+        PaymentTerms::text("Zahlbar in 30 Tagen.").with_discount(skonto),
+    ));
+
+    assert_eq!(with_terms.net_total(), plain.net_total());
+    assert_eq!(with_terms.gross_total(), plain.gross_total());
+    assert_eq!(with_terms.tax_breakdown(), plain.tax_breakdown());
+    assert_eq!(
+        with_terms.amount_due().unwrap(),
+        plain.amount_due().unwrap()
+    );
+    with_terms.assert_valid();
+
+    // The discount is off the gross amount due, not the net — which is exactly why
+    // taking it later needs a §17 UStG correction rather than a smaller invoice.
+    let due = with_terms.amount_due().unwrap();
+    assert_eq!(due, Amount::parse("1190.00000").unwrap());
+    assert_eq!(
+        skonto.payable_on(due).unwrap(),
+        Amount::parse("1166.20000").unwrap()
+    );
+
+    // BT-20 round-trips through the field a validator reads.
+    let rendered = with_terms.meta.payment_terms.as_ref().unwrap().to_string();
+    assert_eq!(
+        rendered,
+        "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=14#PROZENT=2.00#"
+    );
+    assert_eq!(
+        rendered.parse::<PaymentTerms>().unwrap(),
+        *with_terms.meta.payment_terms.as_ref().unwrap()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generated labels carry the document's currency
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every generated unit-price label is built from a `Currency`. `flat_fee` was the
+/// last place that hardcoded `"EUR"`, which put a euro price on the face of every
+/// non-euro invoice — the exact failure `Currency` exists to prevent.
+#[test]
+fn generated_price_labels_never_assume_a_currency() {
+    let fee = LineItem::flat_fee(
+        "Grundgebühr",
+        Amount::parse("8.50000").unwrap(),
+        Currency::CHF,
+    )
+    .build()
+    .unwrap();
+    assert_eq!(fee.unit_price.as_ref().unwrap().unit, "CHF");
+
+    // A capacity charge is a flat fee too, and takes the schedule's currency.
+    let sched = RateSchedule::capacity()
+        .unit("Mbps")
+        .currency(Currency::GBP)
+        .band(RateBand::up_to(dec!(50), Amount::parse("5.00000").unwrap()))
+        .band(RateBand::over(dec!(50), Amount::parse("10.00000").unwrap()))
+        .build()
+        .unwrap();
+    let peak = sched.apply_peak(dec!(63.4)).unwrap();
+    assert_eq!(peak.net_amount, Amount::parse("10.00000").unwrap());
+    assert_eq!(peak.unit_price.as_ref().unwrap().unit, "GBP");
+    // …and it is now a complete EN 16931 line: BR-22, BR-23, BR-26.
+    assert_eq!(peak.quantity.as_ref().unwrap().value, dec!(1));
+    assert_eq!(
+        peak.quantity.as_ref().unwrap().code.as_deref(),
+        Some(billing::UNIT_CODE_ONE)
+    );
+    peak.validate().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BT-6 / BT-111 — VAT reported in the accounting currency
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn eur_with_vat(number: &str) -> BillingDocument {
+    BillingDocument::builder()
+        .meta(meta(number))
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Leistung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(FixedRateTax::new("VAT", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap()
+}
+
+fn pln() -> Currency {
+    Currency::new("PLN").unwrap()
+}
+
+/// Art. 230 of the VAT Directive: the invoice may be in any currency, but the VAT
+/// must also be stated in the currency the tax is accounted for in. BT-6 names it,
+/// BT-111 states it, and BR-53 makes the pair inseparable — which is why they are
+/// one value here rather than two optional fields.
+#[test]
+fn the_vat_total_can_be_restated_in_the_accounting_currency() {
+    let doc = eur_with_vat("INV-PLN")
+        .with_vat_accounting_currency(
+            VatAccountingCurrency::converted(
+                pln(),
+                Amount::parse("190.00000").unwrap(),
+                dec!(4.30),
+                AmountScale::EN16931,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    // Everything else stays in the invoice currency — PEPPOL-EN16931-R051.
+    assert_eq!(doc.currency(), Currency::EUR);
+    assert_eq!(
+        doc.vat_total().unwrap(),
+        Amount::parse("190.00000").unwrap()
+    );
+    assert_eq!(doc.gross_total(), Amount::parse("1190.00000").unwrap());
+
+    let acct = doc.vat_accounting_currency().unwrap();
+    assert_eq!(acct.currency(), pln());
+    assert_eq!(acct.vat_total(), Amount::parse("817.00000").unwrap());
+
+    // BR-DEC-15 caps BT-111 at two decimals, and `fits_amount_scale` covers it.
+    assert!(doc.fits_amount_scale(2));
+    doc.assert_valid();
+}
+
+/// `PEPPOL-EN16931-R005` — BT-6 must differ from BT-5. Restating the VAT in the
+/// currency it is already in conveys nothing and is fatal, not merely redundant.
+#[test]
+fn the_accounting_currency_must_differ_from_the_invoice_currency() {
+    let same =
+        VatAccountingCurrency::new(Currency::EUR, Amount::parse("190.00000").unwrap()).unwrap();
+    assert!(
+        eur_with_vat("INV-SAME")
+            .with_vat_accounting_currency(same)
+            .is_err()
+    );
+
+    // XXX is a valid ISO 4217 code that BR-CL-04 accepts, so nothing downstream
+    // would catch "VAT accounted for in no currency at all".
+    assert!(VatAccountingCurrency::new(Currency::XXX, Amount::ZERO).is_err());
+    // A non-positive rate would flip or erase the sign R055 requires to match.
+    assert!(
+        VatAccountingCurrency::converted(
+            pln(),
+            Amount::parse("190.00000").unwrap(),
+            dec!(0),
+            AmountScale::EN16931
+        )
+        .is_err()
+    );
+}
+
+/// `PEPPOL-EN16931-R055` — BT-110 and BT-111 must share an operational sign. The
+/// check lives in `validate()` rather than only in the setter, because `reverse`,
+/// allocation, merging and serde all reach the field without passing through it.
+#[test]
+fn a_credit_note_negates_the_accounting_currency_vat_too() {
+    let doc = eur_with_vat("INV-REV")
+        .with_vat_accounting_currency(
+            VatAccountingCurrency::new(pln(), Amount::parse("817.00000").unwrap()).unwrap(),
+        )
+        .unwrap();
+
+    let credit = doc
+        .reverse(DocumentMeta {
+            invoice_number: "CN-REV".into(),
+            ..meta("CN-REV")
+        })
+        .unwrap();
+
+    assert_eq!(
+        credit.vat_total().unwrap(),
+        Amount::parse("-190.00000").unwrap()
+    );
+    assert_eq!(
+        credit.vat_accounting_currency().unwrap().vat_total(),
+        Amount::parse("-817.00000").unwrap()
+    );
+    // Both VAT figures point the same way, so the credit note validates.
+    credit.assert_valid();
+
+    // Carrying BT-111 over unnegated is refused rather than stored: on a credit
+    // note BT-110 is negative, so a positive BT-111 is a fatal R055 violation.
+    assert!(
+        credit
+            .clone()
+            .with_vat_accounting_currency(
+                VatAccountingCurrency::new(pln(), Amount::parse("817.00000").unwrap()).unwrap(),
+            )
+            .is_err(),
+        "opposing signs must be refused"
+    );
+    // Zero is compatible with either direction — "same operational sign" is a test
+    // for strict opposition, not for equal `signum`.
+    assert!(
+        credit
+            .with_vat_accounting_currency(VatAccountingCurrency::new(pln(), Amount::ZERO).unwrap())
+            .is_ok()
+    );
+}
+
+/// Allocation splits BT-111 exactly as it splits BT-110 — dropping it would leave
+/// every recipient naming an accounting currency with no amount, which BR-53 makes
+/// impossible to emit.
+#[test]
+fn allocation_splits_the_accounting_currency_vat_without_drift() {
+    use billing::{AllocationRule, EqualAllocation};
+
+    let doc = eur_with_vat("INV-SPLIT")
+        .with_vat_accounting_currency(
+            VatAccountingCurrency::new(pln(), Amount::parse("817.00000").unwrap()).unwrap(),
+        )
+        .unwrap();
+
+    let parts = EqualAllocation::new(3).unwrap().allocate(&doc).unwrap();
+    let sum: Amount<5> = parts
+        .iter()
+        .map(|d| d.vat_accounting_currency().unwrap().vat_total())
+        .sum();
+    assert_eq!(
+        sum,
+        Amount::parse("817.00000").unwrap(),
+        "BT-111 must not drift"
+    );
+    for d in &parts {
+        assert_eq!(d.vat_accounting_currency().unwrap().currency(), pln());
+        d.assert_valid();
+    }
+}
+
+/// Merging sums BT-111, and refuses the two shapes that cannot be summed: a
+/// currency mismatch, and one half stating it while the other does not — where the
+/// missing figure is *unstated*, not zero.
+#[test]
+fn merging_sums_the_accounting_currency_vat_or_refuses() {
+    let with_pln = |n: &str, amount: &str| {
+        eur_with_vat(n)
+            .with_vat_accounting_currency(
+                VatAccountingCurrency::new(pln(), Amount::parse(amount).unwrap()).unwrap(),
+            )
+            .unwrap()
+    };
+
+    let merged =
+        billing::merge_period_documents(with_pln("A", "817.00000"), with_pln("B", "430.00000"))
+            .unwrap();
+    assert_eq!(
+        merged.vat_accounting_currency().unwrap().vat_total(),
+        Amount::parse("1247.00000").unwrap()
+    );
+    merged.assert_valid();
+
+    // Different accounting currencies cannot be added — and the two refusals are
+    // *different* failures, so each must name itself. Asserting only `is_err()`
+    // would let a mismatch be reported as "one half did not state it", sending a
+    // reader after a field that is present.
+    let czk = eur_with_vat("C")
+        .with_vat_accounting_currency(
+            VatAccountingCurrency::new(
+                Currency::new("CZK").unwrap(),
+                Amount::parse("100.00000").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = billing::merge_period_documents(with_pln("A", "817.00000"), czk).unwrap_err();
+    assert!(
+        matches!(err, BillingError::CurrencyMismatch { left, right }
+                 if left == pln() && right == Currency::new("CZK").unwrap()),
+        "expected a CurrencyMismatch naming both, got {err:?}"
+    );
+
+    // Neither can a stated figure and an unstated one.
+    let err =
+        billing::merge_period_documents(with_pln("A", "817.00000"), eur_with_vat("D")).unwrap_err();
+    assert!(
+        matches!(&err, BillingError::InvalidInput { reason } if reason.contains("BT-111")),
+        "expected the unstated-half refusal, got {err:?}"
+    );
+    // …in either order.
+    assert!(
+        billing::merge_period_documents(eur_with_vat("D"), with_pln("A", "817.00000")).is_err()
+    );
+    // Both absent is fine.
+    assert!(billing::merge_period_documents(eur_with_vat("E"), eur_with_vat("F")).is_ok());
+}
+
+/// The conversion is rounded **once**, at the scale BT-111 is emitted at. Rounding
+/// the product to the engine's five decimals and reducing afterwards is a different
+/// operation, and a tax authority recomputing from the same rate gets the first one.
+#[test]
+fn the_conversion_rounds_once_at_the_target_scale() {
+    // 190.00 x 4.3059 = 818.121 exactly.
+    let once = VatAccountingCurrency::converted(
+        pln(),
+        Amount::parse("190.00000").unwrap(),
+        dec!(4.3059),
+        AmountScale::EN16931,
+    )
+    .unwrap();
+    assert_eq!(once.vat_total(), Amount::parse("818.12000").unwrap());
+    assert!(once.vat_total().fits_scale(2)); // BR-DEC-15
+
+    // At full engine precision the exact product survives instead.
+    let exact = VatAccountingCurrency::converted(
+        pln(),
+        Amount::parse("190.00000").unwrap(),
+        dec!(4.3059),
+        AmountScale::new(5, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(exact.vat_total(), Amount::parse("818.12100").unwrap());
+    assert!(!exact.vat_total().fits_scale(2));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A percentage layer never reverses its own direction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `PercentageCharge::new` refuses a negative rate because "a negative charge is a
+/// discount". Reaching the same result through a negative *base* is no different,
+/// and sustained negative spot prices produce one. Both percentage layers clamp.
+#[test]
+fn a_negative_base_cannot_turn_a_charge_into_a_credit() {
+    use billing::PercentageDiscount;
+
+    // Debit positions netting out below zero: EPEX negative-price hours.
+    let positions = || {
+        vec![
+            LineItem::for_usage(
+                "EPEX Spot (negativ)",
+                Quantity::new(dec!(1000), "kWh"),
+                UnitPrice::new(dec!(-0.05), "EUR/kWh"),
+            )
+            .build()
+            .unwrap(),
+        ]
+    };
+
+    let charged = BillingDocument::builder()
+        .meta(meta("INV-NEG-CHARGE"))
+        .positions(positions())
+        .extra_tax(
+            PercentageCharge::new("Plattformgebühr", dec!(0.05))
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    assert_eq!(charged.net_total(), Amount::parse("-50.00000").unwrap());
+    // Nothing to charge a commission on — not a commission paid *to* the customer.
+    assert_eq!(charged.tax_total(), Amount::ZERO);
+    assert_eq!(charged.charge_total().unwrap(), Amount::ZERO);
+    charged.assert_valid();
+
+    let discounted = BillingDocument::builder()
+        .meta(meta("INV-NEG-DISCOUNT"))
+        .positions(positions())
+        .extra_discount(
+            PercentageDiscount::new("Treuerabatt", dec!(0.05))
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    // The mirror image, and the behaviour the discount layer already had.
+    assert_eq!(discounted.discount_total(), Amount::ZERO);
+    assert_eq!(discounted.net_total(), Amount::parse("-50.00000").unwrap());
+    discounted.assert_valid();
+
+    // A positive base is untouched by the clamp.
+    let normal = BillingDocument::builder()
+        .meta(meta("INV-POS-CHARGE"))
+        .positions(vec![
+            LineItem::fixed("Umsatz", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            PercentageCharge::new("Plattformgebühr", dec!(0.05))
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    assert_eq!(
+        normal.charge_total().unwrap(),
+        Amount::parse("50.00000").unwrap()
+    );
+}
+
+/// Converting a gross-quoted catalogue does **not** make the invoice total the sum
+/// of the shelf prices, and that is BR-CO-17 rather than a rounding defect.
+///
+/// VAT on an invoice is charged once per category, not once per line: BT-117 is a
+/// single rounding of BT-116 × rate, which a validator recomputes. The per-line
+/// taxes here sum to one cent more than the tax on the summed base. Pinned because
+/// the tempting "fix" — nudging a line so the two agree — trades a checkable rule
+/// for an identity the standard does not have.
+#[test]
+fn a_gross_quoted_catalogue_does_not_reconcile_to_the_shelf_price_sum() {
+    let scale = AmountScale::EN16931;
+    let rate = dec!(0.23);
+    let catalogue = [
+        (dec!(3), "249.99000"),
+        (dec!(2), "529.00000"),
+        (dec!(4), "89.95000"),
+    ];
+
+    let mut positions = Vec::new();
+    let mut shelf_total = Amount::<5>::ZERO;
+    let mut per_line_tax = Amount::<5>::ZERO;
+    for (qty, gross) in catalogue {
+        let gross_unit = Amount::<5>::parse(gross).unwrap();
+        let net_unit = gross_unit.net_of_tax(rate, scale.strategy()).unwrap();
+        let line_gross = gross_unit.checked_mul_qty(qty).unwrap();
+        shelf_total = shelf_total.checked_add(line_gross).unwrap();
+        // The per-line tax as a line-by-line invoice would state it: one rounding
+        // at the emission scale, per line.
+        let line_tax =
+            TaxBreakdownEntry::from_gross(TaxCategory::Standard, rate, line_gross, scale)
+                .unwrap()
+                .tax_amount;
+        per_line_tax = per_line_tax.checked_add(line_tax).unwrap();
+        positions.push(
+            LineItem::for_usage(
+                "Ware",
+                Quantity::new(qty, "Stk"),
+                UnitPrice::new(net_unit.into_decimal(), "EUR/Stk"),
+            )
+            .build()
+            .unwrap(),
+        );
+    }
+
+    let doc = BillingDocument::builder()
+        .meta(meta("INV-GROSS"))
+        .amount_scale(scale)
+        .positions(positions)
+        .extra_tax(FixedRateTax::new("VAT", rate).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    // The invoice is internally exact — BR-CO-15 at two decimals.
+    assert_eq!(
+        doc.taxable_total()
+            .unwrap()
+            .checked_add(doc.vat_total().unwrap())
+            .unwrap(),
+        doc.gross_total()
+    );
+    doc.assert_valid();
+    doc.verify_vat_attribution().unwrap();
+    assert!(doc.fits_amount_scale(2));
+
+    // …and one cent below the shelf-price sum, because the tax was rounded once on
+    // the whole base rather than once per line.
+    assert_eq!(shelf_total, Amount::parse("2167.77000").unwrap());
+    assert_eq!(doc.gross_total(), Amount::parse("2167.76000").unwrap());
+    assert_eq!(per_line_tax, Amount::parse("405.36000").unwrap());
+    assert_eq!(
+        doc.vat_total().unwrap(),
+        Amount::parse("405.35000").unwrap()
+    );
+
+    // The gap is bounded by one minor unit per line — it is a sum of discarded
+    // per-line halves, not unbounded drift.
+    let drift = doc
+        .gross_total()
+        .checked_sub(shelf_total)
+        .unwrap()
+        .checked_abs()
+        .unwrap();
+    let bound = Amount::<5>::parse("0.01000")
+        .unwrap()
+        .checked_mul_qty(Decimal::from(catalogue.len()))
+        .unwrap();
+    assert!(drift <= bound, "drift {drift} exceeds {bound}");
+}
+
+/// BR-DEC-15 caps BT-111 at two decimals, and it is the one amount in the document
+/// that no other check covers: it is a conversion at a rate the engine never sees,
+/// derived from nothing else here. `amount_scale_violation` has to name it.
+#[test]
+fn an_over_precise_bt111_is_reported_by_the_decimal_check() {
+    let doc = eur_with_vat("INV-DEC15")
+        .with_vat_accounting_currency(
+            // 190.00 × 4.3059 = 818.121 — three decimals, which BR-DEC-15 forbids.
+            VatAccountingCurrency::converted(
+                pln(),
+                Amount::parse("190.00000").unwrap(),
+                dec!(4.3059),
+                AmountScale::new(5, RoundingStrategy::MidpointAwayFromZero).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    // Every other amount fits; only BT-111 does not, so the document must not pass.
+    assert!(!doc.fits_amount_scale(2));
+    let (what, value) = doc.amount_scale_violation(2).expect("BT-111 must be named");
+    assert!(what.contains("BT-111"), "{what}");
+    assert!(what.contains("PLN"), "{what}");
+    assert_eq!(value, Amount::parse("818.12100").unwrap());
+    // It is still arithmetically valid — precision and validity are different
+    // questions, which is why one is `validate()` and the other `fits_amount_scale`.
+    doc.assert_valid();
+
+    // Converting at the emission scale instead clears it.
+    let ok = eur_with_vat("INV-DEC15-OK")
+        .with_vat_accounting_currency(
+            VatAccountingCurrency::converted(
+                pln(),
+                Amount::parse("190.00000").unwrap(),
+                dec!(4.3059),
+                AmountScale::EN16931,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(ok.fits_amount_scale(2));
+    assert_eq!(
+        ok.vat_accounting_currency().unwrap().vat_total(),
+        Amount::parse("818.12000").unwrap()
+    );
 }

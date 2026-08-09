@@ -1,6 +1,10 @@
-//! [`CashRounding`] — rounding the payable total to the smallest coin in circulation.
+//! Settlement-level terms: [`CashRounding`] (EN 16931 **BT-114**) and
+//! [`VatAccountingCurrency`] (**BT-6** / **BT-111**).
 //!
-//! # What this models
+//! Both sit *after* the totals chain and describe how the document is settled and
+//! reported rather than what was supplied, so neither moves the taxable base.
+//!
+//! # Cash rounding — what this models
 //!
 //! Many jurisdictions withdrew their smallest coins and round the amount actually
 //! *tendered* to a coarser step: 0.05 in Switzerland, Belgium, Ireland, Italy,
@@ -48,8 +52,10 @@
 //! assert_eq!(chf.difference(gross).unwrap(), Amount::parse("0.01000").unwrap());
 //! ```
 
-use crate::amount::{Amount, RoundingStrategy};
+use crate::amount::{Amount, AmountScale, RoundingStrategy};
+use crate::currency::Currency;
 use crate::error::BillingError;
+use rust_decimal::Decimal;
 
 /// A cash-rounding rule: an increment plus the strategy used at the midpoint.
 ///
@@ -145,6 +151,158 @@ impl CashRounding {
     /// [`BillingError::MonetaryOverflow`] for amounts near the representable limit.
     pub fn difference(&self, amount: Amount<5>) -> Result<Amount<5>, BillingError> {
         self.round(amount)?.checked_sub(amount)
+    }
+}
+
+// ── VatAccountingCurrency ─────────────────────────────────────────────────────
+
+/// EN 16931 **BT-6** and **BT-111** — the VAT total restated in the currency the
+/// seller accounts for VAT in.
+///
+/// # Why an invoice carries two VAT totals
+///
+/// The invoice currency (BT-5) is a commercial choice; the currency VAT is
+/// *reported* in is not. Art. 230 of the VAT Directive lets an invoice be
+/// denominated in any currency but requires the VAT amount to be expressed in the
+/// national currency of the member state where the tax is due. So a Polish, Czech,
+/// Swedish, Danish, Hungarian or Romanian supplier invoicing in EUR must state the
+/// VAT again in PLN, CZK, SEK, DKK, HUF or RON — the same tax, converted.
+///
+/// EN 16931 models exactly that pair and nothing more: BT-6 names the currency,
+/// BT-111 states the amount. **The exchange rate is not a business term.** The
+/// standard carries the converted figure, not the arithmetic that produced it,
+/// which is why [`converted`](Self::converted) takes the rate as an argument and
+/// keeps none of it.
+///
+/// # The rules this satisfies
+///
+/// | Rule | Source | Requires |
+/// |---|---|---|
+/// | **BR-53** | CEN, fatal | BT-6 present ⇒ BT-111 provided — they are one value here, so the pair cannot be half-stated |
+/// | **BR-DEC-15** | CEN, fatal | BT-111 at most two decimals — [`converted`](Self::converted) rounds once at the target scale, and [`fits_amount_scale`](crate::BillingDocument::fits_amount_scale) checks it |
+/// | **`PEPPOL-EN16931-R005`** | Peppol, fatal | BT-6 ≠ BT-5 — checked by [`with_vat_accounting_currency`](crate::BillingDocument::with_vat_accounting_currency), which is the first place both are known |
+/// | **`PEPPOL-EN16931-R055`** | Peppol, fatal | BT-110 and BT-111 share an operational sign — checked by [`validate`](crate::BillingDocument::validate), so a reversal or an allocation cannot break it silently |
+///
+/// ```rust
+/// use billing::{Amount, AmountScale, Currency, VatAccountingCurrency};
+/// use rust_decimal::dec;
+///
+/// // 190,00 € of VAT reported in złoty at 4.30 PLN/EUR.
+/// let bt111 = VatAccountingCurrency::converted(
+///     Currency::new("PLN")?,
+///     Amount::parse("190.00000")?,
+///     dec!(4.30),
+///     AmountScale::EN16931,
+/// )?;
+///
+/// assert_eq!(bt111.currency(), Currency::new("PLN")?);   // BT-6
+/// assert_eq!(bt111.vat_total(), Amount::parse("817.00000")?); // BT-111
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "VatAccountingCurrencyRepr"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VatAccountingCurrency {
+    currency: Currency,
+    vat_total: Amount<5>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct VatAccountingCurrencyRepr {
+    currency: Currency,
+    vat_total: Amount<5>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<VatAccountingCurrencyRepr> for VatAccountingCurrency {
+    type Error = BillingError;
+    fn try_from(r: VatAccountingCurrencyRepr) -> Result<Self, Self::Error> {
+        Self::new(r.currency, r.vat_total)
+    }
+}
+
+impl VatAccountingCurrency {
+    /// State BT-111 directly, in the currency BT-6 names.
+    ///
+    /// Use when the converted figure comes from elsewhere — an ERP that already
+    /// applied the official rate, or a rate this crate has no business holding.
+    /// [`converted`](Self::converted) does the arithmetic instead.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if `currency` is [`Currency::XXX`]. BT-6
+    /// names the currency a tax authority is reported in; "no currency involved"
+    /// is not one, and it would pass `BR-CL-04` unnoticed.
+    pub fn new(currency: Currency, vat_total: Amount<5>) -> Result<Self, BillingError> {
+        if currency.is_unset() {
+            return Err(BillingError::InvalidInput {
+                reason: "VAT accounting currency (BT-6) must be a real currency, not XXX".into(),
+            });
+        }
+        Ok(Self {
+            currency,
+            vat_total,
+        })
+    }
+
+    /// Convert a VAT total at `rate`, rounding **once** at `scale`.
+    ///
+    /// `rate` is units of `currency` per unit of the invoice currency: converting
+    /// EUR to PLN at 4.30 means `dec!(4.30)`.
+    ///
+    /// The single rounding is the point. BT-111 is capped at two decimals by
+    /// **BR-DEC-15**, and computing the product at the engine's five decimals and
+    /// reducing afterwards rounds twice — which can land a minor unit away from the
+    /// figure a tax authority recomputes from the same rate. Passing
+    /// [`AmountScale::EN16931`] rounds the exact product straight onto two decimals.
+    ///
+    /// # Errors
+    /// - [`BillingError::InvalidInput`] if `currency` is [`Currency::XXX`] or `rate`
+    ///   is not strictly positive — a non-positive rate would flip or erase the sign
+    ///   that `PEPPOL-EN16931-R055` requires to match BT-110.
+    /// - [`BillingError::MonetaryOverflow`] if the converted amount leaves range.
+    pub fn converted(
+        currency: Currency,
+        vat_total: Amount<5>,
+        rate: Decimal,
+        scale: AmountScale,
+    ) -> Result<Self, BillingError> {
+        if rate <= Decimal::ZERO {
+            return Err(BillingError::InvalidInput {
+                reason: format!("VAT accounting currency exchange rate must be > 0, got {rate}"),
+            });
+        }
+        let exact =
+            vat_total
+                .into_decimal()
+                .checked_mul(rate)
+                .ok_or(BillingError::MonetaryOverflow {
+                    precision: 5,
+                    input_value: None,
+                })?;
+        Self::new(currency, scale.apply_decimal(exact)?)
+    }
+
+    /// EN 16931 **BT-6** — the currency VAT is accounted for in.
+    #[must_use]
+    pub fn currency(&self) -> Currency {
+        self.currency
+    }
+
+    /// EN 16931 **BT-111** — the VAT total in that currency.
+    pub fn vat_total(&self) -> Amount<5> {
+        self.vat_total
+    }
+
+    /// The same currency carrying a different BT-111 — for the transforms that move
+    /// the VAT total with it.
+    pub(crate) fn with_vat_total(self, vat_total: Amount<5>) -> Self {
+        Self { vat_total, ..self }
+    }
+
+    /// Negate BT-111, for [`crate::BillingDocument::reverse`].
+    pub(crate) fn negated(self) -> Result<Self, BillingError> {
+        Ok(self.with_vat_total(self.vat_total.checked_neg()?))
     }
 }
 

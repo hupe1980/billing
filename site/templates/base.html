@@ -1,0 +1,169 @@
+{#- Shared shell. Every page-level template extends this one.
+
+    The head is where the SEO lives, and it is derived here rather than in each
+    child template so that no page can quietly ship without a description or a
+    canonical URL. Zola puts `page` in scope for page templates and `section` for
+    section templates; neither exists on a bare template, so each lookup falls back
+    to the site-level value. -#}
+
+{%- if page is defined -%}
+  {%- set node_title = page.title -%}
+  {%- set node_desc = page.description | default(value=config.description) -%}
+  {%- set node_url = page.permalink -%}
+  {%- set node_type = "article" -%}
+{%- elif section is defined and section.title -%}
+  {%- set node_title = section.title -%}
+  {%- set node_desc = section.description | default(value=config.description) -%}
+  {%- set node_url = section.permalink -%}
+  {%- set node_type = "website" -%}
+{%- else -%}
+  {%- set node_title = "" -%}
+  {%- set node_desc = config.description -%}
+  {%- set node_url = config.base_url -%}
+  {%- set node_type = "website" -%}
+{%- endif -%}
+
+{#- The landing page owns the site title verbatim; every other page gets
+    "Page · billing", which keeps the brand in the SERP without pushing the
+    distinguishing words past the ~60 characters Google renders. The landing page is
+    identified by its path rather than by comparing permalinks, because a trailing
+    slash makes that comparison silently false and the title doubles. -#}
+{%- set is_home = section is defined and section.relative_path == "_index.md" -%}
+{%- if node_title and not is_home -%}
+  {%- set head_title = node_title ~ " · billing" -%}
+{%- else -%}
+  {%- set head_title = config.title -%}
+{%- endif -%}
+<!DOCTYPE html>
+<html lang="{{ config.default_language }}" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>{{ head_title }}</title>
+<meta name="description" content="{{ node_desc }}">
+<link rel="canonical" href="{{ node_url }}">
+
+{#- Open Graph and Twitter decide what a link looks like when it is pasted into
+    Slack, Mastodon or a search-result preview. -#}
+<meta property="og:type" content="{{ node_type }}">
+<meta property="og:site_name" content="billing">
+<meta property="og:title" content="{{ head_title }}">
+<meta property="og:description" content="{{ node_desc }}">
+<meta property="og:url" content="{{ node_url }}">
+<meta property="og:image" content="{{ get_url(path='og.png') }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ head_title }}">
+<meta name="twitter:description" content="{{ node_desc }}">
+<meta name="twitter:image" content="{{ get_url(path='og.png') }}">
+
+<meta name="theme-color" content="#0e1117" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+{#- Two highlighting palettes selected by the media attribute. The theme toggle
+    rewrites those attributes rather than swapping a stylesheet, so there is no
+    flash of the wrong palette. -#}
+<link rel="stylesheet" id="syntax-light" href="{{ get_url(path='giallo-light.css') }}" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" id="syntax-dark" href="{{ get_url(path='giallo-dark.css') }}" media="(prefers-color-scheme: dark)">
+<link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') }}">
+
+{#- Applied before first paint, so a stored dark preference never flashes white. -#}
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem("theme");
+    if (t !== "dark" && t !== "light") return;
+    document.documentElement.dataset.theme = t;
+    document.addEventListener("DOMContentLoaded", function () {
+      document.getElementById("syntax-light").media = t === "light" ? "all" : "not all";
+      document.getElementById("syntax-dark").media = t === "dark" ? "all" : "not all";
+    });
+  } catch (e) {}
+})();
+</script>
+
+<script type="application/ld+json">
+{%- if page is defined %}
+{"@context":"https://schema.org","@type":"TechArticle",
+ "headline":{{ page.title | json_encode | safe }},
+ "description":{{ node_desc | json_encode | safe }},
+ "url":{{ node_url | json_encode | safe }},
+ "inLanguage":"en",
+ "isPartOf":{"@type":"WebSite","name":"billing","url":{{ config.base_url | json_encode | safe }}},
+ "about":{"@type":"SoftwareSourceCode","name":"billing","programmingLanguage":"Rust",
+          "codeRepository":{{ config.extra.repo | json_encode | safe }}}}
+{%- else %}
+{"@context":"https://schema.org","@type":"SoftwareSourceCode",
+ "name":"billing",
+ "description":{{ config.description | json_encode | safe }},
+ "url":{{ config.base_url | json_encode | safe }},
+ "codeRepository":{{ config.extra.repo | json_encode | safe }},
+ "programmingLanguage":{"@type":"ComputerLanguage","name":"Rust"},
+ "license":"https://spdx.org/licenses/MIT.html",
+ "author":{"@type":"Person","name":{{ config.author | json_encode | safe }}}}
+{%- endif %}
+</script>
+</head>
+
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+      <span class="brand-mark" aria-hidden="true">§</span>
+      <span class="brand-name">billing</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
+      <a href="{{ config.extra.crate }}" rel="noopener">crates.io</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      <button type="button" class="theme-toggle" id="theme-toggle"
+              aria-label="Switch between light and dark theme">
+        <span aria-hidden="true">◐</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+{% block content %}{% endblock content %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>billing</strong> {{ config.extra.version }} — dual-licensed
+      <a href="{{ config.extra.repo }}/blob/main/LICENSE-MIT" rel="noopener">MIT</a> or
+      <a href="{{ config.extra.repo }}/blob/main/LICENSE-APACHE" rel="noopener">Apache-2.0</a>.
+    </p>
+    <p class="muted">
+      Not legal or tax advice. Rule citations are given so that you can check them
+      against the published CEN and Peppol artefacts yourself.
+    </p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var btn = document.getElementById("theme-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", function () {
+    var root = document.documentElement;
+    var dark = root.dataset.theme === "dark" ||
+      (root.dataset.theme !== "light" &&
+       window.matchMedia("(prefers-color-scheme: dark)").matches);
+    var next = dark ? "light" : "dark";
+    root.dataset.theme = next;
+    document.getElementById("syntax-light").media = next === "light" ? "all" : "not all";
+    document.getElementById("syntax-dark").media = next === "dark" ? "all" : "not all";
+    try { localStorage.setItem("theme", next); } catch (e) {}
+  });
+})();
+</script>
+{% block scripts %}{% endblock scripts %}
+</body>
+</html>

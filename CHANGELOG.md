@@ -26,8 +26,450 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.11.0"`) if you need to schedule migrations yourself;
-`"0.11"` will pick up `0.11.x` patch fixes only.
+Pin exactly (`billing = "=0.12.0"`) if you need to schedule migrations yourself;
+`"0.12"` will pick up `0.12.x` patch fixes only.
+
+## [0.12.0]
+
+The release that turned a domain-flavoured billing library into a domain-agnostic one,
+and taught it three things it could not express.
+
+**Naming.** The primary extension point was called `Tariff` — the vocabulary of
+utilities and telecoms, in a crate whose own description says "no domain assumptions".
+It, the rate types and two aliases are renamed or gone.
+
+**Tax-inclusive pricing.** Consumer prices are quoted gross almost everywhere, and
+EN 16931 is uncompromisingly net. The conversion had to be done by hand, and the
+obvious way to do it is wrong.
+
+**VAT in the accounting currency.** An invoice may be denominated in any currency, but
+the VAT has to be reported in the one the tax is due in. That second figure — BT-111 —
+had nowhere to live.
+
+**Early payment discounts.** A Skonto changes what the buyer transfers, has a
+structured wire format XRechnung makes mandatory, and must *not* touch the taxable
+base. None of that was modelled.
+
+Every rule cited below was re-derived from the CEN and Peppol Schematron rather than
+from recollection. That check earned its keep: an earlier draft added a validation for
+**BR-CO-25** ("if the amount due is positive, either BT-9 or BT-20 shall be present").
+The rule does not exist. The CEN artefacts run BR-CO-20 … BR-CO-24 and then BR-CO-26;
+it was dropped before publication, and the check was deleted rather than shipped.
+
+### Changed — `Tariff` is now `PricingModel`, and the rate types are neutral
+
+| Old | New |
+|---|---|
+| `Tariff` | `PricingModel` |
+| `TariffSchedule` | `RateSchedule` |
+| `TariffScheduleBuilder` | `RateScheduleBuilder` |
+| `TariffBand` | `RateBand` |
+| `BillingDocumentBuilder::tariff` | `BillingDocumentBuilder::pricing` |
+| `BillingDocumentBuilder::try_tariff` | `BillingDocumentBuilder::try_pricing` |
+| module `billing::tariff` | module `billing::pricing` |
+
+*Tariff* is perfectly good English for a published schedule of rates. The sense is as
+old as the customs-duty one — both are attested from the 1590s, from Arabic `taʿrīf`
+via Italian `tariffa` — and UK primary legislation is titled the *Domestic Gas and
+Electricity (Tariff Cap) Act 2018*. The word was not the problem.
+
+Being *the neutral word* was. This crate advertises zero domain assumptions, and every
+other public name keeps that promise: `LineItem`, `Quantity`, `UnitPrice`, `TaxLayer`,
+`DiscountLayer`, `UsageAggregator`, `AllocationRule`, `AmountScale`, `RateLookup`.
+`Tariff`, `TariffSchedule` and `TariffBand` were the only three exceptions out of
+roughly forty public names — and they carry the vocabulary of utilities and telecoms
+specifically. Two of the four worked examples are SaaS and cloud, where the word is
+*plan*, *pricing model* or *rate card*; and in American English the dominant sense of
+*tariff* is an import duty, which this crate has nothing to do with.
+
+`PricingModel` is the phrase all of those domains already use for "how we work out what
+to charge". `RateSchedule` and `RateBand` join the existing `RateLookup` in a neutral
+family of rate tables — and, as a side effect, the old `Tariff` / `TariffSchedule`
+near-collision is gone: nobody will now assume a `RateSchedule` implements a
+`PricingModel`. (It does not, and could not usefully; the docs say so explicitly.)
+
+`tariff` was also dropped from the crate keywords in favour of `en16931`, which is what
+the crate has spent two releases becoming good at.
+
+### Removed — `ScalarTariff`
+
+It existed to spare a settlement-style tariff two tokens: `type Usage = ();` and an
+ignored `usage` parameter. For that it charged:
+
+- **a second vocabulary** — `positions()` versus `line_items()`, `settle()` versus
+  `bill()`, for the same two operations;
+- **a coherence hazard** — implementing both traits for one type was a compile error,
+  which the documentation had to warn about in three places;
+- **a name that said nothing true.** "Scalar" suggests a single number. The method
+  returned a `Vec<LineItem>`. What the trait actually meant was *"takes no usage"*, and
+  no reader could have guessed that from the name.
+
+The ergonomics are now on `Tariff` itself. `settle` and `try_settle` are bounded on
+`Usage = ()`, so they exist exactly where `&()` would otherwise have to be written at
+every call site — and nowhere else.
+
+```rust
+// before
+impl ScalarTariff for EegSettlement {
+    type Error = Infallible;
+    type NotBillable = Infallible;
+    fn positions(&self) -> Result<Positions<Infallible>, Self::Error> { … }
+}
+
+// after
+impl Tariff for EegSettlement {
+    type Usage = ();
+    type Error = Infallible;
+    type NotBillable = Infallible;
+    fn positions(&self, _: &()) -> Result<Positions<Infallible>, Self::Error> { … }
+}
+```
+
+`settle(meta)` and `try_settle(meta)` are unchanged at the call site.
+
+### Removed — `EuroAmount` and `InvoiceAmt`
+
+Both were type aliases, both were **unused** anywhere in the crate, and both said
+something untrue.
+
+`EuroAmount = Amount<5>` named a currency in a crate whose own design invariant reads
+*"No implicit currency — `Currency` defaults to ISO 4217 `XXX`, never `EUR`."* It is
+the same defect as `Tariff`, one line further down: a domain assumption smuggled into a
+name in a library that advertises none.
+
+`InvoiceAmt = Amount<2>` abbreviated a word for no reason, and implied that two
+decimals is "the invoice precision" here. It is not: documents are assembled at
+`Amount<5>` and reduced with `AmountScale`, which is the whole point of that type.
+
+Write `Amount<5>` and `Amount<2>`. They are shorter than the explanations.
+
+### Changed — `TouBand` is now `TimeBand`
+
+`Tou` is an abbreviation, sitting next to `TimeOfUsePricing` spelled out in full and,
+since this release, `RateBand`. `TimeBand` matches both.
+
+### Added — tax-inclusive (gross) arithmetic
+
+`Amount::extract_tax` returns the tax **contained in** a tax-inclusive amount, and
+`Amount::net_of_tax` the rest of it:
+
+```rust
+let gross = Amount::<5>::parse("119.00000")?;
+assert_eq!(gross.extract_tax(dec!(0.19), MidpointAwayFromZero)?, Amount::parse("19.00000")?);
+assert_eq!(gross.net_of_tax(dec!(0.19), MidpointAwayFromZero)?, Amount::parse("100.00000")?);
+```
+
+The rate applies to the *net* part, not to the gross, so the extraction is the VAT
+fraction `r/(1+r)` — `19/119`, `7/107`, `1/6` at 20 %. The plausible alternative,
+`gross × rate`, over-states the tax by `rate²` of the net: `22.61` instead of
+`19.00`, which is 19 % too much output tax declared on every B2C line.
+
+`net_of_tax` is the **remainder** rather than an independent rounding of
+`gross ÷ (1 + rate)`, so `net + tax == gross` holds exactly for every rate and
+every strategy — the number on the price tag survives into BT-112. Rounding both
+halves separately breaks that for roughly half of all inputs; `tests/properties.rs`
+now pins the law.
+
+`TaxBreakdownEntry::from_gross(category, rate, gross, scale)` does the same split
+straight into a BG-23 group. It takes an `AmountScale` rather than a
+`RoundingStrategy` on purpose: the exact product is rounded **once**, at the
+precision the document will be emitted at. BR-CO-17 defines BT-117 as that single
+rounding, and a validator recomputes it that way; extracting at five decimals and
+reducing afterwards rounds twice and can land a minor unit away.
+
+### Added — VAT in the accounting currency (BT-6 / BT-111)
+
+New `VatAccountingCurrency` in `billing::settlement`, plus
+`BillingDocument::with_vat_accounting_currency` and `vat_accounting_currency()`.
+
+The invoice currency is a commercial choice; the currency VAT is *reported* in is
+not. Art. 230 of the VAT Directive lets an invoice be denominated in any currency
+but requires the VAT amount in the national currency of the member state where the
+tax is due — so a Polish, Czech, Swedish, Danish, Hungarian or Romanian supplier
+invoicing in EUR must state the VAT again in PLN, CZK, SEK, DKK, HUF or RON. The
+crate could not express that at all, and it is the one remaining EN 16931 gap that
+is genuinely *arithmetic* rather than identity data.
+
+EN 16931 models the pair and nothing more: BT-6 names the currency, BT-111 states
+the amount. **The exchange rate is not a business term**, so `converted` takes it
+as an argument and keeps none of it. Four fatal rules govern the pair, re-derived
+from the CEN and Peppol Schematron rather than from memory:
+
+| Rule | Source | Requires | How it holds |
+|---|---|---|---|
+| **BR-53** | CEN | BT-6 present ⇒ BT-111 provided | one value, so the pair cannot be half-stated |
+| **BR-DEC-15** | CEN | BT-111 ≤ 2 decimals | `converted` rounds the exact product **once** at the target `AmountScale`; `fits_amount_scale` and `amount_scale_violation` now cover BT-111 |
+| **`PEPPOL-EN16931-R005`** | Peppol | BT-6 ≠ BT-5 | rejected by the setter, the first place both are known |
+| **`PEPPOL-EN16931-R055`** | Peppol | BT-110 and BT-111 share an operational sign | new check 14 in `validate()` |
+
+The sign check is in `validate()` rather than only in the setter because
+`reverse()`, `AllocationRule` and `merge_period_documents` all reach the field
+without passing through it. Each now handles it: a credit note negates BT-111 with
+BT-110, allocation splits it with the same last-recipient remainder that keeps
+BT-110 exact, and merging sums it. Merging **refuses** two shapes it cannot sum — a
+currency mismatch, and one half stating BT-111 while the other does not, where the
+missing figure is unstated rather than zero.
+
+`BillingDocument::validate` now checks **fourteen** invariants, not thirteen.
+
+### Added — payment terms and Skonto (BT-20)
+
+New module `billing::terms`, with `PaymentTerms` and `EarlyPaymentDiscount`.
+
+EN 16931 models payment terms as one free-text field, so an early-payment discount
+is not machine-readable in the core standard at all. Germany's CIUS embeds a
+micro-syntax in that text, made mandatory by **BR-DE-18** and read by ZUGFeRD too:
+
+```text
+#SKONTO#TAGE=10#PROZENT=2.00#
+#SKONTO#TAGE=10#PROZENT=2.50#BASISBETRAG=485.98#
+```
+
+`Display` writes exactly that form and `FromStr` reads it back, strictly — a
+lowercase keyword, a missing closing `#` or a third decimal is refused rather than
+normalised, because a validator enforcing BR-DE-18 refuses it too. A percentage or
+base amount the syntax cannot state is rejected at construction, not silently
+rounded at render time.
+
+`PaymentTerms::discount_within(days)` returns the best qualifying window, which is
+what staged terms ("3 % in 10 days, 2 % in 20, net 30") mean for a buyer paying on
+day five.
+
+`DocumentMeta::payment_terms` carries it, and attaching it moves **nothing**:
+not `net_total`, not `gross_total`, not `amount_due`, not the VAT breakdown. A
+Skonto is conditional on early payment, which has not happened when the invoice is
+issued; deducting it up front would understate the taxable base for a supply that
+may well be paid in full. When it *is* taken the consideration shrinks after the
+fact and the tax follows — §17 Abs. 1 UStG, art. 90 of the VAT Directive — and that
+correction is triggered by a payment event the invoice cannot know. So the crate
+computes the payable figure and stops there.
+
+### Added — `BillingDocument::unattributed_positions`
+
+The positions carrying no VAT category: BT-151 on a line, BT-95 on an allowance,
+BT-102 on a charge — mandatory under BR-CO-04, BR-32 and BR-37, all fatal.
+
+`verify_vat_attribution` checks that the attributions which *exist* agree with the
+breakdown, and passes **vacuously** on a document that has none. That is the right
+behaviour — this crate bills things that are not invoices — but it meant "verify
+passed" read as a licence to emit when it was only half the question. A per-unit
+levy outside a tag-restricted VAT layer's base is the ordinary way to reach that
+state, and it was invisible.
+
+### Added — `examples/cross_border_retail.rs`
+
+A Polish shop invoicing a business customer in EUR: a gross-quoted catalogue, VAT
+reported in złoty, and 2 % Skonto for payment within ten days. It exercises all
+three of this release's additions end to end, and is where the gross-drift
+explanation above lives. `just examples` now runs four examples, not three.
+
+Writing it also caught a misuse the crate correctly refused: BT-150 stated without
+BT-149. `UnitPrice::validate` rejects that pair, because BT-150 is an attribute of
+`cbc:BaseQuantity` in UBL and cannot exist alone.
+
+### Added — a documentation site
+
+New `site/` directory: a [Zola](https://www.getzola.org/) landing page and guide,
+deployed to GitHub Pages by `.github/workflows/site.yml`. It is a **guide**, organised
+by task, with search and cross-links; the README remains the complete reference and the
+doctest source, and `docs.rs` remains the exhaustive API listing.
+
+No framework, no font CDN, no analytics — one hand-written stylesheet, ~50 lines of
+vanilla JavaScript for search (index fetched on first keystroke, not on load) and a
+theme toggle. A crate whose whole argument is that it has three dependencies should not
+need a build pipeline to say so.
+
+Per page: a distinct `<title>` and description, a canonical URL, Open Graph and Twitter
+cards, and `TechArticle` JSON-LD tied to the site's `SoftwareSourceCode` node. Zola
+generates `sitemap.xml`; `robots.txt` points at it. `zola check` runs in CI on any site
+change, so a renamed page that something still links to fails review rather than
+becoming a 404.
+
+**The site's Rust examples are compiled and run**, for the same reason the README's
+are. It cannot use the README's `include_str!` trick — rustdoc needs a hidden
+`# Ok::<(), _>(())` trailer wherever a snippet uses `?`, and Zola would print that line
+on the page — so `just site-verify` extracts each fenced block into a git-ignored
+integration test instead. It earned its keep immediately: the first run found a wrong
+figure in the margin-scheme example (200,00 × 19/119 is 31,93277, not 31,93).
+
+`just site-serve`, `just site-build`, `just site-check`, `just site-verify`. The last
+two also run as part of `just ci`.
+
+### Added — tests for functions whose only coverage was a doctest
+
+Excluding doctests from the sweep made a handful of previously-caught mutants survive,
+and every one of them was a function with **no test other than an example**:
+`LatestAggregator::aggregate` — the only one of the six aggregators without a unit test
+— and `Amount::checked_div` among them.
+
+The fix was a unit test each, not a slower sweep. A function tested only by a doctest
+is a gap whether or not a mutation run is what reveals it, and the faster configuration
+is what made these visible at all.
+
+### Fixed — a `PercentageCharge` could turn into a credit ⚠️ silent
+
+`PercentageCharge::new` refuses a negative rate, with the reason spelled out in its
+own error: *"a negative charge is a discount; use a `DiscountLayer` instead"*. The
+same result was reachable through a negative **base** — debit positions that net out
+below zero, which sustained negative spot prices produce — and it was not refused:
+
+```rust
+// 1000 kWh at −0.01 EUR/kWh, then a 5 % platform commission.
+// before: −0.50   ← a "charge" that increases what the supplier owes the customer
+// now:     0.00   ← nothing to take a percentage of
+```
+
+`PercentageDiscount` had clamped a negative base since 0.4.0, with the mirror-image
+reasoning already in its source: a discount must not make a credit balance larger.
+A charge must not either, and the two layers now agree.
+
+A debit at a negative price still **contributes** to the base and reduces it — that
+is what distinguishes it from a `Sign::Credit` position, which is excluded outright.
+Only a base that ends up below zero is clamped. The BT-100 basis follows the clamped
+base, which matters: stating the unclamped −10.00 against an amount of 0.00 puts the
+pair 0.50 apart, and `PEPPOL-EN16931-R040` recomputes exactly that product with a
+±0.02 tolerance.
+
+This compiles unchanged and alters a computed amount, so it is marked silent. It
+can only affect a document whose charge base is negative overall; on every other
+document the result is bit-identical.
+
+### Fixed — `RateSchedule::apply_peak` produced an incomplete invoice line
+
+A capacity charge was built with `LineItem::debit(..).fixed_amount(..)`, which
+states an amount and nothing else. BR-22 (BT-129), BR-23 (BT-130) and BR-26
+(BT-146) all have `$Invoice_Line` as their Schematron context and apply to every
+line without exception, so a consumer had to synthesise all three. It now uses the
+`flat_fee` shape — `1 × C62` at the full amount, which satisfies `R120` trivially —
+and carries the schedule's own currency in the price label.
+
+### Fixed — documentation that described code that no longer existed
+
+- `BillingError::ValidationFailed` listed `"prepaid_vs_advances"`, a check name
+  removed when `Prepayment` was introduced in 0.9.0, and omitted
+  `"vat_breakdown_presence"`, `"prepaid_vs_prepayment"`, `"vat_attribution"` and
+  `"vat_total"`. The full set is now tabulated by the method that emits it.
+- Three `allowance_charge()` implementations — `PercentageCharge`,
+  `PercentageDiscount`, `FixedDiscount` — carried a comment copied from
+  `PerUnitLevy` explaining that "a per-unit levy is quantity × rate". Each now
+  says what its own layer does.
+- `Prepayment::itemised`'s error message ran twenty-five spaces together from a
+  string that was wrapped without a continuation.
+- `minimum_charge` tagged its position with a `"minimum-charge"` string literal
+  rather than `tags::MINIMUM_CHARGE`, so the two could drift apart.
+- The README stated that `BillingDocument` enforces **eleven** invariants and
+  listed eleven. It has enforced thirteen since 0.10.0 — BR-CO-18 and BR-O-11 were
+  added without the table following — and fourteen as of this release. The table
+  now lists every one, and names the two identities that are deliberately *outside*
+  `validate()` because an allocated document cannot preserve them.
+
+### Changed — breaking
+
+| Old | New | Why |
+|---|---|---|
+| `Tariff` | `PricingModel` | a domain word for the primary extension point of a domain-agnostic crate |
+| `TariffSchedule` / `TariffScheduleBuilder` | `RateSchedule` / `RateScheduleBuilder` | joins the existing `RateLookup` in a neutral family of rate tables |
+| `TariffBand` | `RateBand` | same |
+| module `billing::tariff` | module `billing::pricing` | same |
+| `BillingDocumentBuilder::tariff` / `try_tariff` | `::pricing` / `::try_pricing` | same |
+| `Tariff::line_items(&self, usage)` | `PricingModel::positions(&self, usage)` | the crate says *positions* everywhere else — `net_positions`, `tax_positions`, `all_positions`, `positions_by_tag`, `BillingDocumentBuilder::positions`, and the return alias `Positions<R>`. `line_items` was the one holdout, and it is also the wrong word: a discount position is not an EN 16931 invoice line |
+| `ScalarTariff` | `PricingModel` with `type Usage = ()` | one trait, one vocabulary, no coherence hazard |
+| `ScalarTariff::positions(&self)` | `PricingModel::positions(&self, _: &())` | one method, one signature |
+| `TouBand` | `TimeBand` | `Tou` is an abbreviation; the neighbours are spelled out |
+| `EuroAmount` | `Amount<5>` | removed — named a currency the crate refuses to assume |
+| `InvoiceAmt` | `Amount<2>` | removed — abbreviated, and two decimals is not "the invoice precision" here |
+| `LineItem::flat_fee(desc, amount)` | `LineItem::flat_fee(desc, amount, currency)` | the generated price label hardcoded `"EUR"` |
+| `LineItem::credit_flat_fee(desc, amount)` | `LineItem::credit_flat_fee(desc, amount, currency)` | same |
+| — | `DocumentMeta { payment_terms, .. }` | new field (BT-20); use `..Default::default()` |
+| — | `BillingDocument` gained a private `vat_accounting_currency` | serde-visible as an optional field; a payload without it deserialises unchanged |
+
+`settle` / `try_settle` moved from `ScalarTariff` to `PricingModel`; both keep their
+names and signatures.
+
+`flat_fee` builds a complete EN 16931 line — one unit at a unit price equal to the
+whole amount — and generated that price label as `"EUR"` regardless of the document.
+Every Swiss, sterling and dollar invoice carried a euro price on its face. It was the
+last place in the crate that assumed a currency; `RateSchedule`, `TimeOfUsePricing`,
+`DynamicPricing` and `PerUnitLevy` had all taken one since 0.5.0.
+
+`DocumentMeta` is documented as extensible by struct-update syntax, so its new field
+breaks only exhaustive struct literals.
+
+### Changed — mutation testing is no longer a CI gate
+
+It was wired into CI on pull requests. It is not any more, and the nightly sweep that
+briefly existed has been removed too.
+
+A sweep is ~1 000 mutants. Even after the tuning below that is tens of minutes on a
+laptop and considerably worse on a four-core runner, and it buys a signal that changes
+rarely. Waiting for it on every pull request is the fastest way to make people stop
+reading it. It is now run **by hand, when it is worth running** — `just mutants-gate`,
+`just mutants-diff`, `just mutants-file`, or `just mutants-shard i n` to spread a sweep
+over several sittings.
+
+CI keeps everything fast and deterministic: fmt, clippy `-D warnings`, the full suite
+on three platforms, MSRV, doctests, `cargo-deny`, `cargo-semver-checks`, benchmarks
+compiling, plus the site's link check and its Rust examples.
+
+**The tuning stays**, because it makes the ad-hoc runs bearable. Three settings roughly
+halved the per-mutant cost — measured on a fixed shard, **239 s → 122 s** — and none of
+them changes which mutants are caught:
+
+- `[profile.mutants]` with `debug = false, incremental = false`. The crate is compiled
+  a thousand times and debugged zero times, and incremental state never hits because
+  every mutant is a different tree.
+- `additional_cargo_test_args = ["--lib", "--tests"]`. Doctests were **17 of the
+  baseline's 18 test seconds**.
+- `just site-verify` now deletes the `tests/site_examples.rs` it generates. Leaving it
+  meant every mutant rebuilt and reran a test binary that checks *documentation*.
+  (Self-inflicted, and introduced earlier in this same release.)
+
+`just mutants*` derives `--jobs` from the core count instead of running one mutant at a
+time, and `just mutants-shard i n` / `just mutants-union-check dir` split a sweep into
+slices that can be run separately and checked together.
+
+### Documentation — an over-claim about gross-to-net, corrected
+
+Writing `examples/cross_border_retail.rs` disproved a sentence this release had
+already drafted into the README: that converting a gross-quoted catalogue means
+"the number on the price tag survives into BT-112". It does not, and the example
+prints the counterexample:
+
+| | |
+|---|---|
+| 3 × 249,99 + 2 × 529,00 + 4 × 89,95 | **2 167,77** — the sum of shelf prices |
+| BT-109 1 762,41 + BT-110 405,35 | **2 167,76** — what the invoice states |
+
+Nothing is lost in the conversion. VAT on an invoice is charged **once per
+category**, not once per line — BR-CO-17 defines BT-117 as a single rounding of
+BT-116 × rate, and a validator recomputes it that way. The per-line taxes sum to
+405,36; the tax on the summed base is 405,35. The shelf-price total is the figure
+built from independently rounded numbers, and the one with no standing in EN 16931.
+
+`extract_tax` / `net_of_tax` do guarantee `net + tax == gross` exactly — for the
+amount they are applied to. The README now says that, and no more, with a section
+explaining why forcing the two totals to agree would trade a checkable rule
+(BR-CO-17) for an identity the standard does not have.
+`tests/invoice_compliance.rs` pins the numbers so the claim cannot drift again.
+
+A second over-claim went with it: that building net positions and calling
+`TaxBreakdownEntry::from_gross` "agree, because both round once from the exact
+value". They do not, and they are not alternatives. **BR-S-08** fixes BT-116 as the
+sum of the line net amounts, so where lines exist the breakdown must follow them;
+`from_gross` is for a gross *total* with no lines to sum. Stating one next to the
+other is the BR-S-08 violation `verify_vat_attribution` reports, and the README now
+tabulates which to use when.
+
+### Documentation — mutation figures replaced with the durable claim
+
+The README quoted "958 mutants generated, 724 caught, 98.2 %". Those were the 0.11.0
+numbers, and they were already wrong: the crate has grown by roughly a thousand lines
+since. A score printed in a README goes stale the next time a function is added.
+
+What replaces it is the property that does not go stale — every surviving mutant is
+**enumerated** in `.cargo/mutants-baseline.txt` with the reason it is tolerated, and
+the gate fails both on a new survivor and on a recorded one that is now caught. Run
+`just mutants-gate` for the counts.
 
 ## [0.11.0]
 

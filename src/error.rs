@@ -73,7 +73,7 @@ pub enum BillingError {
         input_value: Decimal,
     },
 
-    /// A [`crate::TariffSchedule`] was built or used incorrectly.
+    /// A [`crate::RateSchedule`] was built or used incorrectly.
     InvalidSchedule {
         /// Human-readable explanation. Accepts static literals (`"msg".into()`)
         /// and dynamic messages (`format!(...)`).
@@ -89,11 +89,16 @@ pub enum BillingError {
 
     /// [`crate::BillingDocument::assert_valid`] detected an arithmetic inconsistency.
     ///
-    /// The `check` field identifies which invariant failed — one of
-    /// `"net_total"`, `"tax_total"`, `"gross_total"`, `"discount_total"`,
-    /// `"tax_breakdown"`, `"tax_breakdown_total"`, `"discount_positions"`,
-    /// `"prepaid"`, `"rounding"`, `"prepaid_vs_advances"`, `"net_positions"` or
-    /// `"tax_positions"`.
+    /// The `check` field identifies which invariant failed. The set is stable
+    /// enough to match on, and every value it can take is listed here:
+    ///
+    /// | Emitted by | `check` |
+    /// |---|---|
+    /// | [`crate::BillingDocument::validate`] totals | `"net_total"`, `"tax_total"`, `"gross_total"`, `"discount_total"` |
+    /// | …VAT breakdown | `"tax_breakdown"`, `"tax_breakdown_total"`, `"vat_breakdown_presence"` |
+    /// | …settlement | `"prepaid"`, `"prepaid_vs_prepayment"`, `"rounding"` |
+    /// | …positions | `"net_positions"`, `"discount_positions"`, `"tax_positions"` |
+    /// | [`crate::BillingDocument::verify_vat_attribution`] | `"vat_attribution"`, `"vat_total"` |
     ValidationFailed {
         /// Which consistency check failed.
         check: String,
@@ -162,7 +167,7 @@ impl fmt::Display for BillingError {
                 "precision loss: {input_value} has more non-zero fractional digits than \
                  Amount<{precision}> can represent — use from_decimal_rounded to round explicitly"
             ),
-            Self::InvalidSchedule { reason } => write!(f, "invalid tariff schedule: {reason}"),
+            Self::InvalidSchedule { reason } => write!(f, "invalid rate schedule: {reason}"),
             Self::InvalidInput { reason } => write!(f, "invalid input: {reason}"),
             Self::ValidationFailed {
                 check,
@@ -202,7 +207,7 @@ impl From<ParseAmountError> for BillingError {
     }
 }
 
-/// `Infallible` → `BillingError` conversion needed when `Tariff::Error = Infallible`.
+/// `Infallible` → `BillingError` conversion needed when `PricingModel::Error = Infallible`.
 impl From<std::convert::Infallible> for BillingError {
     fn from(x: std::convert::Infallible) -> Self {
         match x {}

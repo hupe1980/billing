@@ -2,7 +2,7 @@
 //!
 //! Demonstrates:
 //! - `WeightedSumAggregator` for CPU-hours (VMs active for fractions of period)
-//! - `MaxAggregator` + `TariffSchedule::capacity()` for peak-bandwidth billing
+//! - `MaxAggregator` + `RateSchedule::capacity()` for peak-bandwidth billing
 //! - `DynamicPricing` with `.with_unit("GB")?` for spot-priced storage
 //! - `BillingDocument::builder()` with extra tax layer
 //! - Domain-specific unit labels (`"CPU-h"`, `"Mbps"`, `"GB"`)
@@ -48,16 +48,16 @@ fn main() {
     );
     let total_cpu_hours = cpu_agg.aggregate(&vms);
 
-    let cpu_schedule = TariffSchedule::graduated()
+    let cpu_schedule = RateSchedule::graduated()
         .unit("CPU-h")
         .currency(Currency::EUR)
-        .band(TariffBand::free_up_to(dec!(1000)).with_description("Free tier (first 1 000 CPU-h)"))
+        .band(RateBand::free_up_to(dec!(1000)).with_description("Free tier (first 1 000 CPU-h)"))
         .band(
-            TariffBand::between(dec!(1000), dec!(5000), Amount::parse("0.04800").unwrap())
+            RateBand::between(dec!(1000), dec!(5000), Amount::parse("0.04800").unwrap())
                 .with_description("Standard (1k–5k CPU-h)"),
         )
         .band(
-            TariffBand::over(dec!(5000), Amount::parse("0.03200").unwrap())
+            RateBand::over(dec!(5000), Amount::parse("0.03200").unwrap())
                 .with_description("Volume discount (>5k CPU-h)"),
         )
         .build()
@@ -76,19 +76,19 @@ fn main() {
     let peak_agg = MaxAggregator::new(|b: &BandwidthSample| b.mbps);
     let peak_mbps = peak_agg.aggregate(&bandwidth_samples);
 
-    let bandwidth_schedule = TariffSchedule::capacity()
+    let bandwidth_schedule = RateSchedule::capacity()
         .unit("Mbps")
         .currency(Currency::EUR)
         .band(
-            TariffBand::up_to(dec!(100), Amount::parse("50.00000").unwrap())
+            RateBand::up_to(dec!(100), Amount::parse("50.00000").unwrap())
                 .with_description("Up to 100 Mbps"),
         )
         .band(
-            TariffBand::between(dec!(100), dec!(500), Amount::parse("100.00000").unwrap())
+            RateBand::between(dec!(100), dec!(500), Amount::parse("100.00000").unwrap())
                 .with_description("101–500 Mbps"),
         )
         .band(
-            TariffBand::over(dec!(500), Amount::parse("200.00000").unwrap())
+            RateBand::over(dec!(500), Amount::parse("200.00000").unwrap())
                 .with_description("Over 500 Mbps"),
         )
         .build()
