@@ -1,6 +1,6 @@
 +++
 title = "The totals chain"
-description = "BT-106 to BT-115 mapped onto the crate's accessors — including the two places where the obvious accessor is the wrong one, and the fourteen invariants a document checks."
+description = "BT-106 to BT-115 mapped onto the crate's accessors — including the two places where the obvious accessor is the wrong one, and the sixteen invariants a document checks."
 weight = 60
 +++
 
@@ -12,7 +12,7 @@ This is the mapping:
 | Term | Meaning | Accessor | Rule |
 |---|---|---|---|
 | **BT-106** | sum of invoice line net amounts | `line_total()` | `BR-CO-10` |
-| **BT-107** | sum of document level allowances | `−discount_total()` | `BR-CO-11` |
+| **BT-107** | sum of document level allowances | `allowance_total()` | `BR-CO-11` |
 | **BT-108** | sum of document level charges | `charge_total()` | `BR-CO-12` |
 | **BT-109** | total without VAT | `taxable_total()` | `BR-CO-13` |
 | **BT-110** | total VAT amount | `vat_total()` | `BR-CO-14` |
@@ -126,12 +126,18 @@ The engine therefore does not check it, and this page mentions it only because a
 earlier draft of the crate nearly shipped a validation for a rule that no validator
 enforces. If your target profile reinstates it, check it in your own mapping layer.
 
-## The fourteen invariants
+## The sixteen invariants
 
 `validate()` re-derives all of these from the positions, exactly, with no tolerance.
-`assert_valid()` is the panicking form for tests. Deserialisation runs `validate()`
-too, so untrusted JSON cannot introduce a document whose stored totals disagree with
-its own lines.
+`assert_valid()` is the panicking form for tests.
+
+It runs in **three** places, not one: at the end of every constructor, on
+deserialisation, and whenever you call it. The constructor matters most — computing
+the totals only establishes checks 1–4, while 12, 13 and 14 are properties of the VAT
+breakdown that an ordinary combination of layers can violate. Until 0.13.0
+`from_positions` did not run it, and two tagged tax layers — one "not subject to VAT",
+one standard-rated — were enough to get back a document that failed its own
+`assert_valid()`.
 
 | # | Invariant |
 |---|---|
@@ -145,10 +151,12 @@ its own lines.
 | 8 | `Σ(tax_breakdown)` is a component of `tax_total` — same sign, no larger |
 | 9 | no discount position opposes the document's own direction |
 | 10 | `prepaid` equals `prepayment.total()` |
-| 11 | every position satisfies `LineItem::validate` |
+| 11 | every position satisfies `LineItem::validate`, and no invoice line carries BG-20 / BG-21 detail |
 | 12 | VAT charged ⇔ a VAT breakdown exists (`BR-CO-18`) |
 | 13 | an `O` breakdown group is the only group (`BR-O-11`) |
-| 14 | BT-6 differs from BT-5, and BT-111 shares BT-110's sign (`PEPPOL-EN16931-R005` / `R055`) |
+| 14 | a `B` (split payment) group does not coexist with an `S` one (`BR-B-02`) |
+| 15 | the invoicing period is ordered (`BR-29`) and every line period lies inside it (`PEPPOL-EN16931-R110` / `R111`) |
+| 16 | BT-6 differs from BT-5, and BT-111 shares BT-110's sign (`PEPPOL-EN16931-R005` / `R055`) |
 
 Check 8 is a *component* test rather than equality on purpose: a non-VAT layer adds to
 `tax_total` without contributing a breakdown entry, so exact equality would be wrong —
@@ -159,6 +167,11 @@ Check 9 is relative to the document's own direction, not to zero. On a credit no
 every amount is negated, so its allowances are positive; an absolute "discounts ≤ 0"
 rule made `reverse()` produce a document that failed its own `assert_valid()` whenever
 the original had any discount.
+
+Checks 13 and 14 have a second half each. `BR-O-11` and `BR-B-02` are stated over the
+breakdown *and* over the per-position categories (BT-151, BT-95, BT-102), so the
+attribution half lives in `verify_vat_attribution()` as `BR-O-12` / `BR-O-13` /
+`BR-O-14` and the position half of `BR-B-02`.
 
 Two identities are deliberately **outside** this list because
 [allocation](../allocation/) cannot preserve them:

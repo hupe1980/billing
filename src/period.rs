@@ -105,17 +105,79 @@ impl Period {
     /// ```
     #[must_use]
     pub fn is_ordered(&self) -> Option<bool> {
-        /// `YYYY-MM-DD`, zero-padded — the only shape a lexicographic compare
-        /// orders the same way a calendar does.
-        fn is_iso_date(s: &str) -> bool {
-            s.len() == 10
-                && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
-                    4 | 7 => *b == b'-',
-                    _ => b.is_ascii_digit(),
-                })
-        }
         (is_iso_date(&self.from) && is_iso_date(&self.to)).then(|| self.to >= self.from)
     }
+
+    /// Whether this period lies inside `outer` — `PEPPOL-EN16931-R110` and
+    /// `PEPPOL-EN16931-R111`.
+    ///
+    /// > `[PEPPOL-EN16931-R110]` Start date of line period MUST be within invoice
+    /// > period.
+    /// >
+    /// > `[PEPPOL-EN16931-R111]` End date of line period MUST be within invoice
+    /// > period.
+    ///
+    /// Both **fatal**, and both stated exactly as the two comparisons below:
+    /// `line.from >= invoice.from` and `line.to <= invoice.to`.
+    ///
+    /// Returns `None` when any of the four endpoints is not a zero-padded ISO 8601
+    /// date, for the same reason [`is_ordered`](Self::is_ordered) does — a confident
+    /// answer on `"1.6.2026"` would be worse than none.
+    ///
+    /// ```rust
+    /// use billing::Period;
+    ///
+    /// let invoice = Period::new("2026-06-01", "2026-06-30");
+    /// assert_eq!(Period::new("2026-06-01", "2026-06-14").within(&invoice), Some(true));
+    /// assert_eq!(Period::new("2026-06-01", "2026-06-30").within(&invoice), Some(true));
+    /// // A line that starts before the invoice period, or ends after it.
+    /// assert_eq!(Period::new("2026-05-28", "2026-06-14").within(&invoice), Some(false));
+    /// assert_eq!(Period::new("2026-06-15", "2026-07-02").within(&invoice), Some(false));
+    /// // Not ISO 8601 — the engine declines to guess.
+    /// assert_eq!(Period::new("1.6.2026", "14.6.2026").within(&invoice), None);
+    /// ```
+    #[must_use]
+    pub fn within(&self, outer: &Period) -> Option<bool> {
+        let all_iso = [&self.from, &self.to, &outer.from, &outer.to]
+            .into_iter()
+            .all(|s| is_iso_date(s));
+        all_iso.then(|| self.from >= outer.from && self.to <= outer.to)
+    }
+
+    /// Check the period rules that are decidable from the dates themselves —
+    /// **BR-29** (document) and **BR-30** (line), both *fatal*.
+    ///
+    /// > If both … period start date and … period end date are given then the end
+    /// > date shall be later or equal to the start date.
+    ///
+    /// Silent when either endpoint is not a zero-padded ISO 8601 date: the engine
+    /// stays date-type-agnostic and does not guess at a format it cannot order.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if both endpoints are ISO 8601 dates and the
+    /// end precedes the start.
+    pub fn validate(&self) -> Result<(), BillingError> {
+        if self.is_ordered() == Some(false) {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "period end {:?} precedes its start {:?}; BR-29 / BR-30 require the \
+                     end date to be later than or equal to the start date",
+                    self.to, self.from
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `YYYY-MM-DD`, zero-padded — the only shape a lexicographic compare orders the
+/// same way a calendar does.
+fn is_iso_date(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 // ── merge_period_documents ────────────────────────────────────────────────────

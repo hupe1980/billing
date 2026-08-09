@@ -46,7 +46,7 @@ fn main() {
         |v: &VmSnapshot| Decimal::from(v.vcpus) * dec!(744),
         |v: &VmSnapshot| v.active_fraction,
     );
-    let total_cpu_hours = cpu_agg.aggregate(&vms);
+    let total_cpu_hours = cpu_agg.aggregate(&vms).unwrap();
 
     let cpu_schedule = RateSchedule::graduated()
         .unit("CPU-h")
@@ -74,7 +74,7 @@ fn main() {
     ];
 
     let peak_agg = MaxAggregator::new(|b: &BandwidthSample| b.mbps);
-    let peak_mbps = peak_agg.aggregate(&bandwidth_samples);
+    let peak_mbps = peak_agg.aggregate(&bandwidth_samples).unwrap();
 
     let bandwidth_schedule = RateSchedule::capacity()
         .unit("Mbps")

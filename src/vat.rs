@@ -73,11 +73,18 @@ pub enum TaxCategory {
     /// [`requires_exemption_reason`](Self::requires_exemption_reason) and
     /// [`forbids_exemption_reason`](Self::forbids_exemption_reason) are `false`.
     ///
-    /// Its two rules are jurisdictional rather than arithmetic, and stay with the
-    /// caller — the engine only refuses states that cannot add up:
+    /// Its two rules divide neatly, and the engine checks exactly the one it can:
     ///
     /// - **BR-B-01** — an invoice using `B` shall be a domestic Italian invoice.
-    /// - **BR-B-02** — `B` shall not appear in the same document as `S`.
+    ///   This needs the *parties' countries*, which this crate never sees, so it
+    ///   stays with the caller.
+    /// - **BR-B-02** — `B` shall not appear in the same document as `S`. This is a
+    ///   property of the categories present, which the engine owns entirely, so it
+    ///   is checked: at breakdown level by
+    ///   [`BillingDocument::validate`](crate::BillingDocument::validate) and at
+    ///   position level by
+    ///   [`verify_vat_attribution`](crate::BillingDocument::verify_vat_attribution),
+    ///   exactly as BR-O-11 and BR-O-12/13/14 are.
     SplitPayment,
 }
 
@@ -595,11 +602,44 @@ impl TaxBreakdownEntry {
         }
         // BR-CO-17: the tax amount must follow from the base and the rate.
         //
-        // Checked with EN 16931's own tolerance rather than exact equality. The
-        // CEN reference Schematron asserts `|BT-117 − base × rate| < 1.00`, and
-        // the slack is necessary here too: merging two entries sums amounts that
-        // were each rounded to 5 dp, so `Σ(base_i × rate)` and `(Σbase_i) × rate`
-        // can legitimately differ in the last place.
+        // The CEN Schematron is two branches, and this implements both:
+        //
+        //   round(BT-119) = 0  ⇒  round(BT-117) = 0
+        //   round(BT-119) ≠ 0  ⇒  |abs(BT-117) − round(abs(BT-116) × rate)| < 1.00
+        //
+        // The ±1.00 slack in the second branch is necessary here too: merging two
+        // entries sums amounts that were each rounded to 5 dp, so `Σ(base_i × rate)`
+        // and `(Σbase_i) × rate` can legitimately differ in the last place.
+        //
+        // This crate compares the *signed* difference where the Schematron compares
+        // magnitudes, which is strictly stricter — it additionally catches a tax
+        // that opposes its own base, a state no lawful document reaches and one the
+        // magnitude form would wave through.
+        //
+        // The zero-rate branch is the tighter of the two — `round(x) = 0` means
+        // `|x| < 0.5`, not `< 1` — and it is reachable: `L`, `M` and `B` may carry a
+        // zero rate (BR-AF-05, BR-AG-05, and no BR-B-05 at all) while still levying
+        // tax in general, so `carries_tax()` does not force BT-117 to zero for them.
+        //
+        // Applied at a rate of **exactly** zero, not at "a percentage that rounds to
+        // zero". The Schematron's `round(BT-119)` is a quirk of expressing the branch
+        // in XPath: taken literally it also selects every rate below 0.5 %, and would
+        // then demand a tax of zero on a lawful 0.4 % supply. Where the two readings
+        // differ the crate refuses to reject an arithmetically correct document;
+        // where they agree — a rate of zero — the tighter bound applies.
+        if self.rate.is_zero() {
+            const HALF: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
+            if self.tax_amount.into_decimal().abs() >= HALF {
+                return Err(BillingError::InvalidInput {
+                    reason: format!(
+                        "VAT breakdown inconsistent (BR-CO-17): a rate of 0 % requires \
+                         a tax amount that rounds to zero, got {}",
+                        self.tax_amount
+                    ),
+                });
+            }
+            return Ok(());
+        }
         let expected = self
             .taxable_base
             .into_decimal()

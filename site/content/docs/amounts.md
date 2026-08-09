@@ -205,12 +205,35 @@ The default is `Currency::XXX`, ISO 4217 for *"no currency involved"* — delibe
 not `EUR`. A document that reaches production still labelled `XXX` is a visible bug; a
 silent `EUR` default is not.
 
-> **A consumer must reject `XXX` explicitly.** EN 16931 will not do it for you:
-> `BR-CL-04` requires BT-5 to be a valid ISO 4217 alpha-3 code, and `XXX` is one.
-> `Currency::is_unset()` is the check to run before emitting.
-
 `minor_units()` reports the ISO exponent, and distinguishes *zero decimals* (JPY) from
 *no fractional subdivision at all* (`XAU`, `XXX`), which are not the same thing.
+
+### Two boundary questions, and neither answers the other
+
+`Currency::new` accepts any three ASCII letters, and keeps doing so on purpose: this
+crate bills things that are not EN 16931 invoices, and a private clearing unit is a
+legitimate thing to denominate an internal document in. What it must not do is let
+such a code reach an *invoice* unremarked — `BR-CL-03`, `BR-CL-04` and `BR-CL-05` are
+fatal, and they are enforced at an access point rather than at a boundary you control.
+
+So ask both questions before you emit:
+
+```rust
+use billing::Currency;
+
+// Is it a code EN 16931 admits? (BR-CL-04, fatal)
+assert!(Currency::EUR.is_iso4217());
+assert!(!Currency::new("XBT").unwrap().is_iso4217());  // well-formed, and fatal
+
+// Was a currency actually configured?
+assert!(Currency::XXX.is_unset());
+assert!(Currency::XXX.is_iso4217());                   // XXX *is* in the list
+```
+
+The 178-code list is transcribed verbatim from the `contains(' AED AFN … ZWG ')` in
+`BR-CL-03` of the pinned CEN artefact, so it answers the question a validator will
+actually ask. It also makes `minor_units()` honest: its fall-back to `Some(2)` is a
+documented default for the codes `is_iso4217()` rejects, not an unmarked guess.
 
 ## Serialisation
 

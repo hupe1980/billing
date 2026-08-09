@@ -16,6 +16,7 @@ use billing::prelude::*;
 use billing::{CashRounding, FixedRateTax, LineAllowanceCharge, TaxCategory};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
+use rust_decimal::dec;
 
 // ── Strategies ───────────────────────────────────────────────────────────────
 
@@ -343,6 +344,73 @@ proptest! {
         );
     }
 
+    /// The whole EN 16931 totals chain, spelled the way the standard spells it —
+    /// with BT-107 as a positive magnitude that BR-CO-13 *subtracts*.
+    ///
+    /// `documents_are_always_internally_consistent` above checks BR-CO-15 on a
+    /// document with neither allowances nor charges, where BT-107 and BT-108 are
+    /// both zero and the identity degenerates. This one puts a discount layer and a
+    /// levy on every document, so BR-CO-11, BR-CO-12 and BR-CO-13 are each doing
+    /// work — and it reads the allowance total through `allowance_total()`, which
+    /// is the accessor a consumer emits as the unsigned `cbc:AllowanceTotalAmount`.
+    #[test]
+    fn the_totals_chain_holds_with_allowances_and_charges_present(
+        amounts in prop::collection::vec(1i64..100_000_000, 1..8),
+        vat_rate in arb_rate(),
+        discount_rate in (0u32..=100).prop_map(|p| Decimal::new(p as i64, 2)),
+        levy_raw in 0i64..500_000,
+    ) {
+        let positions: Vec<LineItem> = amounts
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                LineItem::for_usage(
+                    format!("Item {i}"),
+                    Quantity::new(Decimal::new(*raw, 5), "kWh"),
+                    UnitPrice::new(Decimal::ONE, "EUR/kWh"),
+                )
+                .build()
+                .unwrap()
+            })
+            .collect();
+
+        let doc = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .positions(positions)
+            .extra_discount(PercentageDiscount::new("Rabatt", discount_rate).unwrap().boxed())
+            // A per-unit levy is a BG-21 charge: it feeds BT-108, not BT-110.
+            .extra_tax(
+                PerUnitLevy::new("Abgabe", Amount::<5>::from_raw_units(levy_raw), "kWh")
+                    .unwrap()
+                    .boxed(),
+            )
+            .extra_tax(FixedRateTax::new("MwSt", vat_rate).unwrap().boxed())
+            .build()
+            .unwrap();
+
+        let bt106 = doc.line_total().unwrap();
+        let bt107 = doc.allowance_total().unwrap();
+        let bt108 = doc.charge_total().unwrap();
+        let bt109 = doc.taxable_total().unwrap();
+        let bt110 = doc.vat_total().unwrap();
+
+        // BT-107 is a magnitude, never a negative number.
+        prop_assert!(!bt107.is_negative(), "BT-107 must be stated as a magnitude");
+        // …and it is exactly the negation of the engine's signed view.
+        prop_assert_eq!(bt107, doc.discount_total().checked_neg().unwrap());
+
+        // BR-CO-13: BT-109 = BT-106 − BT-107 + BT-108.
+        prop_assert_eq!(
+            bt109,
+            bt106.checked_sub(bt107).unwrap().checked_add(bt108).unwrap()
+        );
+        // BR-CO-15: BT-112 = BT-109 + BT-110. This is the identity that fails if a
+        // charge is mistaken for VAT, which is why BT-108 and BT-110 are separate.
+        prop_assert_eq!(bt109.checked_add(bt110).unwrap(), doc.gross_total());
+        // BR-CO-14: BT-110 = Σ BT-117.
+        doc.verify_vat_attribution().unwrap();
+    }
+
     #[test]
     fn allocation_conserves_every_total_and_keeps_documents_valid(
         amounts in prop::collection::vec(1i64..100_000_000, 1..8),
@@ -570,6 +638,51 @@ proptest! {
         }
     }
 
+    /// The two entry points must agree on **exactly** what is representable.
+    ///
+    /// `Amount::parse` and `Amount::checked_from_decimal` are documented as the
+    /// text and `Decimal` halves of one conversion — *"a value refused as text is
+    /// refused as a `Decimal`"*. Nothing enforced that across arbitrary inputs, and
+    /// the two did disagree: `Decimal::from_str` accepts an omitted integer part
+    /// and `parse` rejected it until 0.13.0, so `".5"` was refused as text and
+    /// accepted as a `Decimal` — the exact shape a CSV export produces.
+    ///
+    /// Comparing acceptance rather than the value is what makes this a real check:
+    /// it fails whichever of the two is the stricter one.
+    #[test]
+    fn parse_and_checked_from_decimal_accept_the_same_strings(
+        sign in "[+-]?",
+        whole in "[0-9]{0,12}",
+        sep in "[.,]?",
+        frac in "[0-9]{0,8}",
+    ) {
+        let text = format!("{sign}{whole}{sep}{frac}");
+        let from_text = Amount::<5>::parse(&text);
+
+        // `Decimal` only knows the dot, so normalise the separator the same way
+        // `parse` does before handing it over.
+        let normalised = text.replace(',', ".");
+        let Ok(d) = Decimal::from_str_exact(&normalised) else {
+            // Not a number to `Decimal` either — `parse` must refuse it too.
+            prop_assert!(
+                from_text.is_err(),
+                "parse accepted {text:?}, which Decimal rejects"
+            );
+            return Ok(());
+        };
+        let from_decimal = Amount::<5>::checked_from_decimal(d);
+
+        prop_assert_eq!(
+            from_text.is_ok(),
+            from_decimal.is_ok(),
+            "parse and checked_from_decimal disagree on {:?}: {:?} vs {:?}",
+            text, from_text, from_decimal
+        );
+        if let (Ok(a), Ok(b)) = (from_text, from_decimal) {
+            prop_assert_eq!(a, b, "same input, different value: {:?}", text);
+        }
+    }
+
     #[test]
     fn parse_rejects_precision_it_cannot_represent(
         whole in "[0-9]{1,8}",
@@ -744,5 +857,121 @@ proptest! {
             gross
         );
         prop_assert!(entry.validate().is_ok());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allocation preserves the per-position VAT attribution (BR-S-08)
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// An allocated share satisfies `verify_vat_attribution` whenever the document
+    /// it came from did — **BR-S-08** and **BR-CO-14**, per recipient.
+    ///
+    /// This is the property the 0.13.0 rewrite of `ProportionalAllocation` exists
+    /// to establish, and it needs a *multi-group* document to be interesting. With
+    /// one VAT group the old construction happened to agree; with two rates it
+    /// split the breakdown per group while correcting the positions in aggregate,
+    /// and the two landed a minor unit apart for roughly 45 % of recipients.
+    ///
+    /// A single-group generator would have passed against the old code, which is
+    /// exactly the way a property test can be strong and still prove nothing.
+    #[test]
+    fn allocation_preserves_br_s_08_on_a_multi_rate_document(
+        full in prop::collection::vec(1i64..50_000_000, 1..5),
+        reduced in prop::collection::vec(1i64..50_000_000, 1..5),
+        n in 2usize..8,
+        prepaid_raw in 0i64..1_000_000,
+    ) {
+        let position = |i: usize, raw: i64, tag: &str| {
+            LineItem::fixed(format!("{tag}-{i}"), Amount::<5>::from_raw_units(raw))
+                .tag(tag.to_string())
+                .build()
+                .unwrap()
+        };
+        let positions: Vec<LineItem> = full
+            .iter()
+            .enumerate()
+            .map(|(i, r)| position(i, *r, "full"))
+            .chain(reduced.iter().enumerate().map(|(i, r)| position(i, *r, "reduced")))
+            .collect();
+
+        let doc = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .positions(positions)
+            .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().with_tag("full").boxed())
+            .extra_tax(FixedRateTax::new("MwSt", dec!(0.07)).unwrap().with_tag("reduced").boxed())
+            .build()
+            .unwrap()
+            .with_prepaid(Amount::<5>::from_raw_units(prepaid_raw))
+            .unwrap();
+
+        // The source satisfies it, so every share must too.
+        doc.verify_vat_attribution().unwrap();
+
+        let parts = EqualAllocation::new(n).unwrap().allocate(&doc).unwrap();
+        prop_assert_eq!(parts.len(), n);
+
+        for (i, part) in parts.iter().enumerate() {
+            prop_assert!(part.validate().is_ok(), "recipient {} invalid: {:?}", i, part.validate());
+            prop_assert!(
+                part.verify_vat_attribution().is_ok(),
+                "recipient {} broke BR-S-08: {:?}",
+                i,
+                part.verify_vat_attribution()
+            );
+        }
+
+        // …and nothing leaks or is invented across the split.
+        let sum = |f: fn(&BillingDocument) -> Amount<5>| -> Amount<5> {
+            parts.iter().map(f).sum()
+        };
+        prop_assert_eq!(sum(|d| d.net_total()), doc.net_total());
+        prop_assert_eq!(sum(|d| d.tax_total()), doc.tax_total());
+        prop_assert_eq!(sum(|d| d.gross_total()), doc.gross_total());
+        prop_assert_eq!(sum(|d| d.prepaid()), doc.prepaid());
+        for (g, src) in doc.tax_breakdown().iter().enumerate() {
+            let base: Amount<5> = parts.iter().map(|d| d.tax_breakdown()[g].taxable_base).sum();
+            let tax: Amount<5> = parts.iter().map(|d| d.tax_breakdown()[g].tax_amount).sum();
+            prop_assert_eq!(base, src.taxable_base);
+            prop_assert_eq!(tax, src.tax_amount);
+        }
+    }
+
+    /// Every position is split exactly, not merely every total — which is what the
+    /// group-level guarantee above is built on.
+    #[test]
+    fn allocation_splits_each_position_exactly(
+        amounts in prop::collection::vec(-50_000_000i64..50_000_000, 1..8),
+        n in 2usize..8,
+    ) {
+        let positions: Vec<LineItem> = amounts
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                let amount = Amount::<5>::from_raw_units(*raw);
+                if *raw < 0 {
+                    LineItem::credit_fixed(format!("C{i}"), amount).build().unwrap()
+                } else {
+                    LineItem::fixed(format!("D{i}"), amount).build().unwrap()
+                }
+            })
+            .collect();
+        let doc = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .positions(positions)
+            .build()
+            .unwrap();
+
+        let parts = EqualAllocation::new(n).unwrap().allocate(&doc).unwrap();
+        for (p, source) in doc.net_positions().iter().enumerate() {
+            let rebuilt: Amount<5> = parts.iter().map(|d| d.net_positions()[p].net_amount).sum();
+            prop_assert_eq!(
+                rebuilt, source.net_amount,
+                "position {} does not reassemble from its shares", p
+            );
+        }
     }
 }

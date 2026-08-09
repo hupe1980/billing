@@ -1025,9 +1025,14 @@ fn merge_preserves_tax_totals() {
 #[test]
 fn minimum_charge_shortfall_correct() {
     let doc = doc_with_charge("200.00000");
-    let item = minimum_charge(&doc, Amount::parse("500.00000").unwrap(), "Min")
-        .unwrap()
-        .unwrap();
+    let item = minimum_charge(
+        &doc,
+        Amount::parse("500.00000").unwrap(),
+        "Min",
+        Currency::EUR,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(item.net_amount, Amount::parse("300.00000").unwrap());
     assert!(item.has_tag("minimum-charge"));
 }
@@ -1036,9 +1041,14 @@ fn minimum_charge_shortfall_correct() {
 fn minimum_charge_not_triggered_when_met() {
     let doc = doc_with_charge("500.00000");
     assert!(
-        minimum_charge(&doc, Amount::parse("500.00000").unwrap(), "Min")
-            .unwrap()
-            .is_none()
+        minimum_charge(
+            &doc,
+            Amount::parse("500.00000").unwrap(),
+            "Min",
+            Currency::EUR
+        )
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -1053,9 +1063,14 @@ fn minimum_charge_on_negative_net_triggers() {
     ];
     let doc =
         BillingDocument::from_positions(DocumentMeta::default(), pos, vec![], vec![]).unwrap();
-    let item = minimum_charge(&doc, Amount::parse("5.00000").unwrap(), "Min")
-        .unwrap()
-        .unwrap();
+    let item = minimum_charge(
+        &doc,
+        Amount::parse("5.00000").unwrap(),
+        "Min",
+        Currency::EUR,
+    )
+    .unwrap()
+    .unwrap();
     // shortfall = 5 - (-10) = 15
     assert_eq!(item.net_amount, Amount::parse("15.00000").unwrap());
 }
@@ -1063,9 +1078,14 @@ fn minimum_charge_on_negative_net_triggers() {
 #[test]
 fn minimum_charge_applied_and_doc_still_valid() {
     let doc = doc_with_charge("10.00000");
-    let shortfall = minimum_charge(&doc, Amount::parse("100.00000").unwrap(), "Min")
-        .unwrap()
-        .unwrap();
+    let shortfall = minimum_charge(
+        &doc,
+        Amount::parse("100.00000").unwrap(),
+        "Min",
+        Currency::EUR,
+    )
+    .unwrap()
+    .unwrap();
     let doc2 = doc.with_extra_position(shortfall).unwrap();
     assert_eq!(doc2.net_total(), Amount::parse("100.00000").unwrap());
     doc2.assert_valid();
@@ -1368,7 +1388,12 @@ fn all_modes_zero_qty_consistent() {
 fn minimum_charge_returns_result() {
     // Signature is now Result<Option<LineItem>, BillingError> — verify Ok path.
     let doc = doc_with_charge("10.00000");
-    let result = minimum_charge(&doc, Amount::parse("100.00000").unwrap(), "Min");
+    let result = minimum_charge(
+        &doc,
+        Amount::parse("100.00000").unwrap(),
+        "Min",
+        Currency::EUR,
+    );
     assert!(result.is_ok());
     let item = result.unwrap().unwrap();
     assert_eq!(item.net_amount, Amount::parse("90.00000").unwrap());
@@ -1377,7 +1402,12 @@ fn minimum_charge_returns_result() {
 #[test]
 fn minimum_charge_none_returns_ok_none() {
     let doc = doc_with_charge("500.00000");
-    let result = minimum_charge(&doc, Amount::parse("500.00000").unwrap(), "Min");
+    let result = minimum_charge(
+        &doc,
+        Amount::parse("500.00000").unwrap(),
+        "Min",
+        Currency::EUR,
+    );
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
@@ -2292,6 +2322,7 @@ fn minimum_charge_is_taxed_when_added_before_the_tax_layers() {
         &untaxed,
         Amount::parse("110.00000").unwrap(),
         "Minimum spend",
+        Currency::EUR,
     )
     .unwrap()
     {
@@ -2484,7 +2515,8 @@ fn full_pipeline_graduated_tou_minimum_allocation() {
         BillingDocument::from_positions(DocumentMeta::default(), items.clone(), vec![], vec![])
             .unwrap();
     let min = Amount::parse("400.00000").unwrap();
-    if let Some(shortfall) = minimum_charge(&net_only, min, "Minimum spend").unwrap() {
+    if let Some(shortfall) = minimum_charge(&net_only, min, "Minimum spend", Currency::EUR).unwrap()
+    {
         items.push(shortfall);
     }
 
@@ -2838,7 +2870,7 @@ fn unique_count_with_borrowed_str_key_no_allocation() {
         ApiCall { user_id: "alice" }, // duplicate
         ApiCall { user_id: "carol" },
     ];
-    let count = agg.aggregate(&events);
+    let count = agg.aggregate(&events).unwrap();
     assert_eq!(count, rust_decimal::Decimal::from(3u32)); // alice, bob, carol
 }
 
@@ -2872,7 +2904,7 @@ fn unique_count_with_u64_key() {
             value: 5.0,
         },
     ];
-    let count = agg.aggregate(&events);
+    let count = agg.aggregate(&events).unwrap();
     assert_eq!(count, rust_decimal::Decimal::from(3u32)); // 3 distinct tenants
 }
 
@@ -2881,7 +2913,7 @@ fn unique_count_empty_events_is_zero() {
     use billing::aggregation::{UniqueCountAggregator, UsageAggregator};
     struct Ev;
     let agg = UniqueCountAggregator::new(|_: &Ev| 0u32);
-    assert_eq!(agg.aggregate(&[]), rust_decimal::Decimal::ZERO);
+    assert_eq!(agg.aggregate(&[]).unwrap(), rust_decimal::Decimal::ZERO);
 }
 
 #[test]
@@ -2897,7 +2929,10 @@ fn unique_count_with_string_key_still_works() {
         Ev { id: "y".into() },
         Ev { id: "x".into() },
     ];
-    assert_eq!(agg.aggregate(&events), rust_decimal::Decimal::from(2u32));
+    assert_eq!(
+        agg.aggregate(&events).unwrap(),
+        rust_decimal::Decimal::from(2u32)
+    );
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3548,7 +3583,7 @@ fn minimum_charge_empty_description_returns_err() {
         vec![],
     )
     .unwrap();
-    let result = minimum_charge(&doc, Amount::parse("100.00000").unwrap(), "");
+    let result = minimum_charge(&doc, Amount::parse("100.00000").unwrap(), "", Currency::EUR);
     assert!(
         result.is_err(),
         "empty description must propagate Err, not panic"
@@ -3709,17 +3744,29 @@ fn document_meta_new_fields_round_trip() {
         period: Some(billing::Period::new("2026-07-01", "2026-07-31")),
         issue_date: Some("2026-08-01".into()),
         due_date: Some("2026-08-31".into()),
-        issuer_id: Some("9900123456789".into()), // BDEW MP-ID
-        recipient_id: Some("4012345678901".into()), // GLN of Netzbetreiber
-        notes: Some("EEG Einspeisevergütung §21 EEG 2023".into()),
+        // BT-29 with no ICD scheme: an MP-ID has no entry in BR-CL-10's list, so
+        // claiming one would be a fatal invention. See `PartyIdentifier`.
+        issuer_id: Some(billing::PartyIdentifier::new("9900123456789")),
+        // BT-46 as a GLN, said as a GLN — ICD 0088.
+        recipient_id: Some(billing::PartyIdentifier::scheme("0088", "4012345678901")),
+        notes: vec![billing::Note::coded(
+            "AAI",
+            "EEG Einspeisevergütung §21 EEG 2023",
+        )],
         ..Default::default()
     };
     assert_eq!(meta.period.as_ref().unwrap().from, "2026-07-01");
     assert_eq!(meta.period.as_ref().unwrap().to, "2026-07-31");
     assert_eq!(meta.issue_date.as_deref(), Some("2026-08-01"));
     assert_eq!(meta.due_date.as_deref(), Some("2026-08-31"));
-    assert_eq!(meta.issuer_id.as_deref(), Some("9900123456789"));
-    assert_eq!(meta.recipient_id.as_deref(), Some("4012345678901"));
+    let issuer = meta.issuer_id.as_ref().unwrap();
+    assert_eq!(issuer.value, "9900123456789");
+    assert_eq!(issuer.scheme, None);
+    let recipient = meta.recipient_id.as_ref().unwrap();
+    assert_eq!(recipient.value, "4012345678901");
+    assert_eq!(recipient.scheme.as_deref(), Some("0088"));
+    assert_eq!(meta.notes.len(), 1);
+    assert_eq!(meta.notes[0].subject_code.as_deref(), Some("AAI"));
 }
 
 #[test]

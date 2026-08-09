@@ -24,26 +24,44 @@ let parts = alloc.allocate(&doc)?;
 
 let sum: Amount<5> = parts.iter().map(|d| d.net_total()).sum();
 assert_eq!(sum, doc.net_total());          // exact — no drift
-for d in &parts { d.assert_valid(); }      // each is internally consistent
+for d in &parts {
+    d.assert_valid();                      // each is internally consistent
+    d.verify_vat_attribution()?;           // BR-S-08 survives the split
+}
 ```
 
 `EqualAllocation::new(n)` is the `1/n` case; it bypasses the sum-to-one check because
-`3 × 0.333…` cannot be exactly 1, and the remainder rule below absorbs the difference.
+`3 × 0.333…` cannot be exactly 1, and the largest-remainder step inside each position's
+split absorbs the difference.
 
-### Four guarantees
+### Five guarantees
 
 1. `Σ(net_total) == original.net_total` — exactly.
 2. `Σ(tax_total) == original.tax_total` — exactly.
 3. `Σ(gross_total) == original.gross_total` — exactly.
 4. Every recipient document passes `validate()`.
+5. Every recipient document passes `verify_vat_attribution()` — **BR-S-08** — if the
+   document it was split from did.
 
-(1) and (2) hold because the **last recipient receives the arithmetic remainder**
-rather than its own scaled share. (3) follows because each document's gross is
-*derived* as `net + tax` rather than rounded independently — rounding all three
-separately breaks `net + tax == gross` for shares that do not divide evenly, and used
-to produce three documents that each failed `validate()` by one unit of the last
-decimal place. (4) holds because a **penny correction** is applied to the last position
-of each section so the positions still sum to their section total.
+All five rest on one decision: **each position is split exactly**, so
+`Σ(recipients) == the original position` holds line by line and not merely in
+aggregate. Every total is then derived by summing a recipient's own positions, which
+makes (1)–(3) follow immediately, and each VAT group's taxable base is read off the
+very positions BR-S-08 checks it against, which gives (5). (3) additionally derives
+gross as `net + tax` rather than rounding it — rounding all three separately breaks
+`net + tax == gross` for shares that do not divide evenly.
+
+#### Why not split the totals and correct the positions?
+
+That is the obvious construction, it was the one used until 0.13.0, and it quietly
+broke BR-S-08. The breakdown was split per `(category, rate)` group while the
+positions were corrected in aggregate, so a group's BT-116 and the positions
+attributed to it could land a minor unit apart. On a two-rate document that happened
+for roughly **45 %** of recipients — every document internally exact, every one of
+them rejected by a validator.
+
+That is also why there is no "this came from an allocation, skip the check" flag:
+there is nothing left to skip.
 
 The VAT breakdown, BT-113, BT-114 and BT-111 are all split the same way. Dropping any
 of them would re-bill money the customer already handed over, or leave a recipient
@@ -118,6 +136,31 @@ shares summing to `1 − 5e-10` pass the check and leave a deficit of ~1e9 units
 the distribution step could never close — silently returning parts that sum to less
 than `total`, breaking the function's one guarantee. Tying the tolerance to what the
 distribution can actually absorb removes that.
+
+### …and a bare `Amount` by fractional shares
+
+`Amount::allocate` takes **integer** ratios and `Amount::distribute` splits evenly, so
+neither covers shares such as `[0.4, 0.35, 0.25]`. Compose `proportional_split` at the
+amount's own precision and the round trip is exact:
+
+```rust
+use billing::{Amount, proportional_split};
+use rust_decimal::dec;
+
+let total = Amount::<5>::parse("100.00000")?;
+let parts: Vec<Amount<5>> =
+    proportional_split(total.into_decimal(), &[dec!(0.4), dec!(0.35), dec!(0.25)], 5)?
+        .into_iter()
+        .map(Amount::<5>::checked_from_decimal)
+        .collect::<Result<_, _>>()?;
+
+assert_eq!(Amount::checked_sum(parts.into_iter())?, total);
+```
+
+Passing `scale = 5` is what makes the conversion total: every part then carries at most
+five decimals, so `checked_from_decimal` — which *refuses* excess precision rather than
+rounding it — always succeeds, and `Σ(parts) == total` carries straight through. A
+coarser scale is fine; a finer one fails loudly instead of silently re-rounding.
 
 ## Proration
 

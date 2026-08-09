@@ -964,6 +964,12 @@ impl LineItem {
             lac.validate()?;
         }
         check_allowance_nesting(self.allowance_charge.as_ref(), &self.line_allowances)?;
+        // BR-30: BT-135 shall be later than or equal to BT-134. Decidable whenever
+        // both endpoints are ISO 8601, which is the shape this crate documents for
+        // them — see `Period::validate`.
+        if let Some(period) = &self.period {
+            period.validate()?;
+        }
         Ok(())
     }
 
@@ -1570,6 +1576,10 @@ impl LineItemBuilder {
         // allowance exactly as they do to a document level one.
         for lac in &self.line_allowances {
             lac.validate()?;
+        }
+        // BR-30 — BT-135 on or after BT-134, where both are ISO 8601 dates.
+        if let Some(period) = &self.period {
+            period.validate()?;
         }
         // A stated `fixed_amount` wins over `quantity × unit_price`, so the price
         // part is only derived when there is no stated amount.

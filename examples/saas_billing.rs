@@ -134,7 +134,7 @@ fn main() {
         invoice_number: "SaaS-2026-07-001".into(),
         currency: Currency::EUR,
         period_label: "July 2026".into(),
-        notes: Some("Includes 350k API overage calls".into()),
+        notes: vec!["Includes 350k API overage calls".into()],
         ..Default::default()
     };
 

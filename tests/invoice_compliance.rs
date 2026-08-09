@@ -2621,27 +2621,99 @@ fn the_allowance_base_is_covered_by_the_amount_scale() {
     assert!(scaled.fits_amount_scale(2));
     scaled.assert_valid();
 
-    // … and a hand-built document whose base carries five decimals is reported,
-    // naming the field rather than only the amount.
-    let mut item = scaled.discount_positions()[0].clone();
-    item.allowance_charge = Some(billing::AllowanceCharge {
-        reason_code: None,
-        base_amount: Some(Amount::parse("356.80221").unwrap()),
-        percentage: Some(dec!(10)),
-    });
-    let violation = billing::BillingDocument::from_positions(
+    // … and a document whose base alone carries five decimals is reported, naming
+    // the field rather than only the amount.
+    //
+    // The state has to be reached through deserialisation, because it is not one
+    // the engine can construct: every amount here fits two decimals, and only BT-93
+    // does not. That is exactly the "assembled another way" case `validate()` and
+    // `amount_scale_violation` exist for — and `validate()` deliberately passes,
+    // since a five-decimal base breaks no totals identity. Only BR-DEC-02 sees it.
+    #[cfg(feature = "serde")]
+    {
+        let mut json: serde_json::Value = serde_json::to_value(&scaled).unwrap();
+        json["discount_positions"][0]["allowance_charge"]["base_amount"] =
+            serde_json::json!("356.80221");
+        let tampered: BillingDocument = serde_json::from_value(json).unwrap();
+        tampered.assert_valid(); // the totals are untouched
+
+        let violation = tampered.amount_scale_violation(2);
+        assert!(
+            violation
+                .as_ref()
+                .is_some_and(|(what, _)| what.contains("BT-93")),
+            "expected the base to be named, got {violation:?}"
+        );
+        assert!(!tampered.fits_amount_scale(2));
+    }
+}
+
+/// The bucket a position sits in decides which EN 16931 group it is emitted as:
+/// `net_positions` becomes an invoice line (BG-25), the other two become BG-20 /
+/// BG-21. So a net position carrying `allowance_charge` — which *is* the BG-20 /
+/// BG-21 detail — claims to be both, and no syntax can express that.
+///
+/// It is invisible in the totals, which is why it needs a check of its own: the
+/// amount lands in BT-106 instead of BT-107 / BT-108, so BT-109 still comes out
+/// right and only the decomposition a validator recomputes is wrong.
+#[test]
+fn an_invoice_line_cannot_carry_document_level_allowance_detail() {
+    use billing::AllowanceCharge;
+
+    let as_position = LineItem::credit_fixed("Rabatt", Amount::parse("50.00000").unwrap())
+        .allowance_charge(AllowanceCharge::coded("95"))
+        .build()
+        .unwrap();
+
+    // The position itself is lawful — it is a perfectly good BG-20.
+    as_position.validate().unwrap();
+
+    // Handing it to the engine as an invoice line is not.
+    let err = BillingDocument::from_positions(
         DocumentMeta::default(),
-        vec![item],
+        vec![
+            LineItem::fixed("Ware", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+            as_position,
+        ],
         vec![],
         vec![],
     )
-    .unwrap()
-    .amount_scale_violation(2);
+    .unwrap_err();
     assert!(
-        violation
-            .as_ref()
-            .is_some_and(|(what, _)| what.contains("BT-93")),
-        "expected the base to be named, got {violation:?}"
+        err.to_string().contains("BG-20/BG-21"),
+        "the error must name the group confusion, got: {err}"
+    );
+
+    // The same allowance supplied the right way round is fine, and lands in BT-107
+    // rather than BT-106.
+    let doc = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Ware", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            billing::FixedDiscount::new("Rabatt", Amount::parse("50.00000").unwrap())
+                .unwrap()
+                .with_reason_code("95")
+                .boxed(),
+        )
+        .build()
+        .unwrap();
+    assert_eq!(
+        doc.line_total().unwrap(),
+        Amount::parse("100.00000").unwrap()
+    );
+    assert_eq!(
+        doc.allowance_total().unwrap(),
+        Amount::parse("50.00000").unwrap()
+    );
+    assert_eq!(
+        doc.taxable_total().unwrap(),
+        Amount::parse("50.00000").unwrap()
     );
 }
 
@@ -3792,7 +3864,7 @@ fn payment_terms_change_nothing_but_the_header() {
     let rendered = with_terms.meta.payment_terms.as_ref().unwrap().to_string();
     assert_eq!(
         rendered,
-        "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=14#PROZENT=2.00#"
+        "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=14#PROZENT=2.00#\n"
     );
     assert_eq!(
         rendered.parse::<PaymentTerms>().unwrap(),

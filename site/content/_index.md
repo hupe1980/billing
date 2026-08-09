@@ -159,9 +159,10 @@ largest-remainder correction. No cent is created or lost.
 
 ### Self-validating documents
 
-`validate()` re-derives fourteen invariants from the positions, exactly and with no
-tolerance. Deserialisation runs it too, so untrusted JSON cannot introduce a document
-whose stored totals disagree with its own lines.
+`validate()` re-derives sixteen invariants from the positions, exactly and with no
+tolerance. Every constructor runs it, and so does deserialisation — so neither an
+awkward combination of layers nor untrusted JSON can produce a document that fails
+its own checks.
 
 </article>
 <article>

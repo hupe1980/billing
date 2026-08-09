@@ -39,7 +39,8 @@ fn main() {
 
     // Minimum charge: 5 m³ × EUR 0.80 = EUR 4.00 even on low-consumption months
     let min = Amount::parse("4.00000").unwrap();
-    if let Some(min_item) = minimum_charge(&doc, min, "Mindestmenge (5 m³)").unwrap() {
+    if let Some(min_item) = minimum_charge(&doc, min, "Mindestmenge (5 m³)", Currency::EUR).unwrap()
+    {
         doc = doc.with_extra_position(min_item).unwrap();
     }
 

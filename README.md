@@ -24,6 +24,15 @@ for UBL, CII, XRechnung and ZUGFeRD / Factur-X — see
 > **Every Rust example in this README is compiled and run as a doctest.**
 > If it appears here, it works against the current release.
 
+> **Every EN 16931 rule cited here is verified against the validation artefacts**,
+> not against prose or recollection, and both are pinned: CEN
+> [`eInvoicing-EN16931`](https://github.com/ConnectingEurope/eInvoicing-EN16931) at
+> tag `validation-1.3.16` (`BR-*`, `BR-CO-*`, `BR-CL-*`, `BR-DEC-*`) and
+> [`peppol-bis-invoice-3`](https://github.com/OpenPEPPOL/peppol-bis-invoice-3) at
+> `master` (`PEPPOL-EN16931-*`, `P01xx`). The target edition is
+> **EN 16931-1:2017+A1:2019** — the one every deployed CIUS implements. On
+> [EN 16931-1:2026](#the-2026-revision), see below.
+
 This README is the complete reference. The
 [documentation site](https://hupe1980.github.io/billing) is the same material
 organised as a guide, with search and cross-links — start there if you are reading
@@ -37,12 +46,14 @@ rather than looking something up.
 |-----------|-------------|
 | [`Amount<P>`](#-amountp--fixed-point-arithmetic) | Fixed-point monetary arithmetic with **compile-time precision**. `Amount<5>` = 5 dp, `Amount<2>` = 2 dp. |
 | [`Currency`](#-currency) | ISO 4217 code + minor units; used in labels and enforced when combining documents |
+| [`Currency::is_iso4217`](#two-boundary-questions-and-they-are-independent) | Whether BT-5 / BT-6 is a code EN 16931 admits — **BR-CL-03 / 04 / 05**, all fatal, and `XXX` passes |
 | [`RateSchedule`](#-rateschedule--four-pricing-modes) | Four modes: **graduated** / **volume** / **block** / **capacity** |
 | [`TimeOfUsePricing`](#-time-of-use-and-dynamic-pricing) | N named bands (peak / off-peak / …); caller supplies pre-aggregated consumption |
 | [`tags`](#-design-invariants) | The engine's reserved tag namespace, protected against caller collisions |
 | [`DynamicPricing`](#-time-of-use-and-dynamic-pricing) | Per-interval price sequence (spot, real-time) |
-| [`UsageAggregator<E>`](#-usage-aggregation) | 6 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM |
+| [`UsageAggregator<E>`](#-usage-aggregation) | 6 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM — **fallible**, because raw events are the least trusted input |
 | [`PricingModel`](#-implementing-pricingmodel) | The extension point: usage in, priced positions and layers out. **Not** a [`RateSchedule`](#pricingmodel-is-not-rateschedule) |
+| [`PricingModel::amount_scale`](#the-model-declares-the-precision-it-prices-for) | The model declares the interchange precision it prices for, so `bill` / `settle` produce an emittable document |
 | [`Billing<T, R>`](#-three-outcomes-billable-not-billable-error) | Three outcomes: billable, **not billable (with your reason)**, error |
 | [`TaxLayer`](#-tax-layers--compound-taxes) | Composable, **ordered** tax stack — each layer sees all prior layers in its base |
 | [`PerUnitLevy`](#-tax-layers--compound-taxes) | Per-unit excise duty / environmental levy, matched by unit label |
@@ -50,8 +61,9 @@ rather than looking something up.
 | [`PercentageCharge`](#-percentage-charge) | % of invoice total with min/max guard (platform fee, commission) |
 | [`AllocationRule`](#-allocation-across-n-recipients) | Exact proportional / equal split of a document — `Σ(parts) == total`, penny-corrected |
 | [`proportional_split()`](#raw-quantity-split-proportional_split) | Penny-correct Hamilton split of a raw `Decimal` quantity (kWh, capacity, …) |
-| [`BillingDocument`](#-billingdocument) | Self-validating document: fourteen invariants checked at build time |
+| [`BillingDocument`](#-billingdocument) | Self-validating document: fifteen invariants, checked at build time and re-checked on deserialisation |
 | [`BillingDocument::taxable_total`](#the-totals-chain--bt-106--bt-107--bt-108--bt-109) | **BT-109** via BR-CO-13 — `net_total` is *not* BT-109 once a levy exists |
+| [`BillingDocument::allowance_total`](#the-totals-chain--bt-106--bt-107--bt-108--bt-109) | **BT-107** via BR-CO-11 — the allowance sum as the *positive magnitude* every syntax emits |
 | [`TaxBreakdownEntry`](#-vat-breakdown-en-16931-bg-23) | Per-rate VAT breakdown (EN 16931 BG-23) — **legally required** on any invoice |
 | [`TaxCategory`](#-vat-breakdown-en-16931-bg-23) | UNCL 5305 VAT category — all ten BR-CL-17 permits (S / Z / E / AE / K / G / O / L / M / **B**) |
 | [`LineVat`](#per-position-vat-attribution) | Per-position VAT category + rate (BT-151/152, BT-95/96, BT-102/103) |
@@ -59,6 +71,7 @@ rather than looking something up.
 | [`LineAllowanceCharge`](#-line-allowances-and-charges-en-16931-bg-27--bg-28) | **BG-27 / BG-28** line allowance / charge (BT-136 … BT-145) — moves BT-131, not the document totals |
 | [`DocumentKind::is_credit_note`](#-credit-notes) | Which document element to emit — `BR-CL-01` polices two element-selected code lists |
 | [`DocumentKind::is_peppol_billing_code`](#the-type-code-is-not-interchangeable) | Whether Peppol BIS Billing accepts BT-3 — its lists are narrower than `BR-CL-01`'s |
+| [`DocumentKind::is_self_billed`](#the-type-code-is-not-interchangeable) | Whether the buyer issued the document — a different Peppol *profile*, not a variant invoice |
 | [`BillingDocument::vat_total`](#value-added-tax-vs-document-level-charges) | **BT-110** alone — separates VAT from document level charges (BG-21) |
 | [`BillingDocument::verify_vat_attribution`](#per-position-vat-attribution) | Checks the breakdown against the per-position attribution (**BR-S-08**) |
 | [`FixedRateTax::exempt`](#categories-and-exemptions) | Zero-tax layer with a validated category + mandatory exemption reason |
@@ -77,15 +90,17 @@ rather than looking something up.
 | [`DocumentKind`](#-advance-payments-and-final-invoices) | UNTDID 1001 document type code (BT-3) |
 | [`Amount::distribute`](#-splitting-money-exactly) | Split an amount N ways with no cent created or lost |
 | [`Amount::allocate`](#-splitting-money-exactly) | Split by integer ratios, largest-remainder, exact |
-| [`RateLookup`](https://docs.rs/billing/latest/billing/lookup/struct.RateLookup.html) | Capacity-based rate table — `at_most(kWp, rate)` + `fallback(rate)` |
+| [`RateLookup`](https://docs.rs/billing/latest/billing/lookup/struct.RateLookup.html) | Capacity-based rate table — `at_most(kWp, rate)` + `fallback(rate)`; an uncovered or negative parameter is an error, never the cheapest band |
 | [`DocumentMeta.labels`](https://docs.rs/billing/latest/billing/document/struct.DocumentMeta.html) | Key-value domain annotation bag (`malo_id`, `billing_year`, …) |
+| [`Note`](#-billingdocument) | **BG-1 INVOICE NOTE** — `0..n` notes, each with its UNCL 4451 subject code (BT-21 / BT-22) |
+| [`PartyIdentifier`](#-billingdocument) | **BT-29 / BT-46** — an identifier *and* its ISO 6523 ICD scheme, which `BR-CL-10` makes mandatory to state correctly |
 | [`LineItem::scaled`](#-proration-and-period-merging) | Scale a position, keeping `quantity × unit_price == net_amount` consistent |
 | `LineItem::credit_for_usage` | Symmetric credit counterpart of `for_usage` (feed-in, refunds) |
 | [`LineItem::flat_fee`](#a-flat-charge-is-still-an-invoice-line) | A standing charge as a **complete** EN 16931 line — satisfies BR-22 / BR-23 / BR-26, which `fixed` cannot |
 | [`UnitPrice::per`](#-price-details-en-16931-bg-29) | **BT-149 / BT-150** — "EUR 12,00 per 100 pieces", the divisor in `PEPPOL-EN16931-R120` |
 | [`UnitPrice::discounted`](#-price-details-en-16931-bg-29) | **BT-147 / BT-148** — gross price less a price discount, deriving BT-146 (`R046`) |
 | `UnitPrice::rounded` | Pin a derived unit price to a scale with an explicit strategy |
-| [`minimum_charge()`](#-billingdocument) | Minimum-spend shortfall helper |
+| [`minimum_charge()`](#minimum-charges-belong-before-the-tax-layers) | Minimum-spend shortfall, as a **complete** EN 16931 invoice line |
 | [`merge_period_documents()`](#-proration-and-period-merging) | Merge two half-period documents (tariff change mid-period) |
 | [`prorate()`](#-proration-and-period-merging) | Scale a fixed charge to a partial period |
 
@@ -162,6 +177,9 @@ use rust_decimal::dec;
 let price: Amount<5> = Amount::parse("0.03456")?;              // ✓ exactly 5 dp
 assert!(Amount::<5>::parse("0.034561").is_err());              // ✗ 6th digit is non-zero
 assert!(Amount::<5>::parse("0.034560").is_ok());               // ✓ trailing zero is lossless
+assert_eq!(Amount::<5>::parse("0,50000")?, Amount::parse("0.50000")?); // ✓ comma separator
+assert_eq!(Amount::<5>::parse(".5")?,      Amount::parse("0.50000")?); // ✓ omitted integer part
+assert!(Amount::<5>::parse(".").is_err());                     // ✗ a separator is not a number
 
 // Infallible ops panic on overflow; `checked_*` variants return Err.
 let a = Amount::<5>::from_int(100);
@@ -282,6 +300,38 @@ different thing from zero decimals, so the distinction is kept in the type.
 > **Minor units are not the smallest transactable amount.** CHF has two minor
 > units but its smallest coin is 5 Rappen. That is a payment-law rule, not a
 > currency property — see [cash rounding](#-cash-rounding-and-amount-due).
+
+### Two boundary questions, and they are independent
+
+`Currency::new` accepts any three ASCII letters and keeps doing so: this crate
+bills things that are not EN 16931 invoices, and a private clearing unit is a
+legitimate thing to denominate an internal document in. What it must not do is let
+such a code reach an *invoice* unremarked — **BR-CL-03 / BR-CL-04 / BR-CL-05** are
+fatal, and the rejection happens at an access point rather than at a boundary you
+control.
+
+So there are two questions, and neither answers the other:
+
+```rust
+use billing::Currency;
+
+// Is it a code EN 16931 admits? (BR-CL-04, fatal)
+assert!(Currency::EUR.is_iso4217());
+assert!(!Currency::new("XBT")?.is_iso4217());   // well-formed, constructible, fatal
+
+// Was a currency actually configured?
+assert!(Currency::XXX.is_unset());
+assert!(Currency::XXX.is_iso4217());            // …and XXX *is* in the list
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Ask both before you emit. This is the same split as
+[`DocumentKind::is_peppol_billing_code`](#the-type-code-is-not-interchangeable):
+model the value, expose the profile question as a predicate.
+
+The list is transcribed from the `contains(' AED AFN … ZWG ')` in BR-CL-03 of the
+pinned CEN artefact — 178 codes — so it answers the question a validator will
+actually ask, rather than ISO's registry in the abstract.
 
 ---
 
@@ -425,15 +475,25 @@ A document level **charge** — a per-unit levy, a commission — is produced by
 `TaxLayer` and therefore lives in `tax_positions`, even though EN 16931 counts it
 inside the taxable base. So `net_total` covers only the first two terms:
 
-| Accessor | EN 16931 |
-|---|---|
-| `line_total()` | **BT-106** |
-| `discount_total()` | **−BT-107** (EN 16931 states it as a positive magnitude) |
-| `charge_total()` | **BT-108** |
-| `net_total()` | BT-106 − BT-107 — *not a BT of its own* |
-| `taxable_total()` | **BT-109** |
-| `vat_total()` | **BT-110** |
-| `gross_total()` | **BT-112** |
+| Accessor | EN 16931 | Rule |
+|---|---|---|
+| `line_total()` | **BT-106** | BR-CO-10 |
+| `allowance_total()` | **BT-107** — the positive magnitude every syntax emits | BR-CO-11 |
+| `discount_total()` | −BT-107 — the same figure in the engine's own sign | — |
+| `charge_total()` | **BT-108** | BR-CO-12 |
+| `net_total()` | BT-106 − BT-107 — *not a BT of its own* | — |
+| `taxable_total()` | **BT-109** | BR-CO-13 |
+| `vat_total()` | **BT-110** | BR-CO-14 |
+| `gross_total()` | **BT-112** | BR-CO-15 |
+| `amount_due()` | **BT-115** | BR-CO-16 |
+
+> **Emit BT-107 with `allowance_total()`, not with `discount_total()`.**
+> `cbc:AllowanceTotalAmount` is unsigned in UBL and in CII, because BR-CO-13
+> *subtracts* it. This engine stores allowances as negative amounts so its totals
+> stay plain sums, so the two differ by a sign — and an invoice stating `-20.00`
+> where BR-CO-13 expects `20.00` fails by **twice** the allowance, with nothing in
+> the document to show it. The accessor is that negation, done once, under the
+> term's own name.
 
 ```rust
 use billing::prelude::*;
@@ -450,10 +510,17 @@ let doc = BillingDocument::builder()
     .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.boxed())
     .build()?;
 
-assert_eq!(doc.net_total(),      Amount::parse("300.00000")?);  // BT-106 − BT-107
-assert_eq!(doc.charge_total()?,  Amount::parse("20.50000")?);   // BT-108
-assert_eq!(doc.taxable_total()?, Amount::parse("320.50000")?);  // BT-109 — includes the levy
+assert_eq!(doc.line_total()?,      Amount::parse("300.00000")?);  // BT-106
+assert_eq!(doc.allowance_total()?, Amount::ZERO);                 // BT-107 — none here
+assert_eq!(doc.charge_total()?,    Amount::parse("20.50000")?);   // BT-108
+assert_eq!(doc.taxable_total()?,   Amount::parse("320.50000")?);  // BT-109 — includes the levy
+assert_eq!(doc.net_total(),        Amount::parse("300.00000")?);  // BT-106 − BT-107
 
+// BR-CO-13, spelled the way the standard spells it.
+assert_eq!(
+    doc.taxable_total()?,
+    doc.line_total()?.checked_sub(doc.allowance_total()?)?.checked_add(doc.charge_total()?)?,
+);
 // BR-CO-15 pairs BT-109 with BT-110 — not `net_total` with `tax_total`.
 assert_eq!(doc.taxable_total()?.checked_add(doc.vat_total()?)?, doc.gross_total());
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -541,10 +608,11 @@ when the document is assembled without VAT layers. A caller-declared value that
 layers covering one position, which taxes it twice and makes BR-S-08
 unsatisfiable for both groups.
 
-`verify_vat_attribution` is deliberately *not* part of `validate()`:
-`AllocationRule` cannot preserve it exactly, because it splits the positions and
-the breakdown with independent penny corrections. Run it on the document you are
-about to emit.
+`verify_vat_attribution` is deliberately *not* part of `validate()`, because it is
+not decidable for every document the engine can hold: one assembled without VAT
+layers has no attribution to check against and passes vacuously. Run it on the
+document you are about to emit — including one that came out of an
+`AllocationRule`, which since 0.13.0 preserves BR-S-08 whenever its source had it.
 
 It also **passes vacuously** on a document with no attributions at all, which is
 the right behaviour — this crate bills things that are not invoices — but it means
@@ -784,9 +852,9 @@ closes the gap with a micro-syntax inside that free text, made mandatory by
 ```
 
 Uppercase, no whitespace, `#` opening every segment and closing the line, exactly
-two decimals, one line per discount. `PaymentTerms` is that syntax as a type —
-`Display` writes it, `FromStr` reads it back, and neither can produce a form a
-validator rejects:
+two decimals, one line per discount, **and a newline after the last one**.
+`PaymentTerms` is that syntax as a type — `Display` writes it, `FromStr` reads it
+back, and neither can produce a form a validator rejects:
 
 ```rust
 use billing::prelude::*;
@@ -798,7 +866,8 @@ let terms = PaymentTerms::text("Zahlbar in 30 Tagen.")
 
 assert_eq!(
     terms.to_string(),
-    "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#",
+    // The trailing newline is the second half of BR-DE-18 — see below.
+    "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#\n",
 );
 assert_eq!(terms.to_string().parse::<PaymentTerms>()?, terms);
 
@@ -808,6 +877,34 @@ assert_eq!(terms.discount_within(15).map(|d| d.percent()), Some(dec!(2)));
 assert_eq!(terms.discount_within(30), None);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+#### The terminator is half the rule
+
+`BR-DE-18` is **two** assertions folded into one `satisfies`, and the second is
+easy to read past because it is not a separate `<assert>`. Verbatim from
+[`itplr-kosit/xrechnung-schematron`](https://github.com/itplr-kosit/xrechnung-schematron),
+`src/validation/schematron/ubl/XRechnung-UBL-validation.sch`:
+
+```xpath
+every $line in cac:PaymentTerms/cbc:Note[1]/tokenize(., '(\r?\n)')
+                 [starts-with(normalize-space(.), '#')]
+  satisfies matches(normalize-space($line), $XR-SKONTO-REGEX)
+        and matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
+```
+
+The second `matches` requires everything after the last `#…#` to begin with a
+newline. Without one, `tokenize(., '#.+#')[last()]` is the empty string and the
+assertion fails — **fatally**, on every German invoice offering Skonto. The rule's
+own prose says so directly (*"Am Ende einer vollständigen Skontoangabe muss ein
+XML-konformer Zeilenumbruch folgen"*), and KoSIT ships a fixture marked
+`schematron-invalid="xrcii:BR-DE-18"` titled *"Every skonto entry should end with a
+newline"*.
+
+Until 0.13.0 `Display` omitted it. It lives here rather than in a separate
+`to_bt20_xrechnung()` because the `#SKONTO#…#` micro-syntax **is** the German CIUS
+convention — there is no core EN 16931 form of it — so a rendering without the
+terminator is valid nowhere at all. A prose-only BT-20 is unchanged: the
+`every … satisfies` is vacuously true when no line starts with `#`.
 
 ### The discount is not a discount on the invoice
 
@@ -1530,22 +1627,22 @@ let vms = vec![VmEvent { vcpus: 4, uptime_fraction: dec!(0.5) }];
 
 // SUM: total bytes transferred
 assert_eq!(
-    SumAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events),
+    SumAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events)?,
     dec!(600)
 );
 
 // COUNT: number of API requests
-assert_eq!(CountAggregator.aggregate(&events), dec!(3));
+assert_eq!(CountAggregator.aggregate(&events)?, dec!(3));
 
 // UNIQUE_COUNT: unique active tenants. The key can be ANY Hash + Eq type.
 // A Copy key such as u64 is zero-allocation — no String per event.
 assert_eq!(
-    UniqueCountAggregator::new(|e: &ApiCall| e.tenant_id).aggregate(&events),
+    UniqueCountAggregator::new(|e: &ApiCall| e.tenant_id).aggregate(&events)?,
     dec!(2)
 );
 // An owned key works too, at the cost of one clone per event.
 assert_eq!(
-    UniqueCountAggregator::new(|e: &ApiCall| e.user_id.clone()).aggregate(&events),
+    UniqueCountAggregator::new(|e: &ApiCall| e.user_id.clone()).aggregate(&events)?,
     dec!(2)
 );
 // NOTE: the key type may not BORROW from the event — `|e| e.user_id.as_str()`
@@ -1555,13 +1652,13 @@ assert_eq!(
 
 // MAX: peak value → pair with RateSchedule::capacity()
 assert_eq!(
-    MaxAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events),
+    MaxAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events)?,
     dec!(300)
 );
 
 // LATEST: end-of-period snapshot (last element in slice order)
 assert_eq!(
-    LatestAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events),
+    LatestAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events)?,
     dec!(300)
 );
 
@@ -1570,9 +1667,18 @@ assert_eq!(
     WeightedSumAggregator::new(
         |e: &VmEvent| Decimal::from(e.vcpus),
         |e: &VmEvent| e.uptime_fraction,
-    ).aggregate(&vms),
+    ).aggregate(&vms)?,
     dec!(2.0)
 );
+
+// `aggregate` is fallible because this is the least trusted boundary in the
+// pipeline. `Decimal`'s `+` and `*` PANIC on overflow, so before 0.13.0 one
+// corrupt event aborted the whole batch run instead of reporting itself.
+assert!(SumAggregator::new(|_: &ApiCall| Decimal::MAX).aggregate(&events).is_err());
+// COUNT, UNIQUE_COUNT, MAX and LATEST select rather than accumulate, so they
+// never return Err — the uniform signature is what lets you write code that is
+// generic over `UsageAggregator`.
+# Ok::<(), billing::BillingError>(())
 ```
 
 ---
@@ -1706,6 +1812,57 @@ saved one `type Usage = ();` line and one ignored parameter, and cost a second
 vocabulary (`positions` versus `line_items`, `settle` versus `bill`) plus a coherence
 hazard the documentation had to warn about: implementing both traits for one type was
 a compile error. One trait is the better trade.
+
+### The model declares the precision it prices for
+
+A model knows which format its output is destined for; the call site often does
+not. `amount_scale` is where it says so, and `bill`, `try_bill`, `settle` and
+`BillingDocumentBuilder::pricing` all honour it:
+
+```rust
+use billing::prelude::*;
+use billing::FixedRateTax;
+use rust_decimal::dec;
+use std::convert::Infallible;
+
+struct MeteredPlan;
+
+impl PricingModel for MeteredPlan {
+    type Usage = ();
+    type Error = Infallible;
+    type NotBillable = Infallible;
+
+    fn positions(&self, _: &()) -> Result<Positions<Infallible>, Infallible> {
+        // 1234.567 kWh × 0.28901 EUR/kWh = 356.80221 — five decimals.
+        Ok(vec![LineItem::for_usage(
+            "Arbeit",
+            Quantity::new(dec!(1234.567), "kWh"),
+            UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+        ).build().unwrap()].into())
+    }
+
+    fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
+        vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()]
+    }
+
+    // This model prices for EN 16931, and says so.
+    fn amount_scale(&self) -> Option<AmountScale> { Some(AmountScale::EN16931) }
+}
+
+let doc = MeteredPlan.settle(DocumentMeta {
+    currency: Currency::EUR, ..Default::default()
+})?;
+
+assert_eq!(doc.net_total(), Amount::parse("356.80000")?);
+assert!(doc.fits_amount_scale(2));   // emittable, straight out of `settle`
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Without it, `bill` and `settle` could only ever assemble at the engine's five
+decimals, so the shortest path from a model to a document produced one that fails
+BR-DEC-23 — with no error anywhere. An explicit `amount_scale` on the builder still
+wins, so a caller can override the model's choice; forgetting to set one no longer
+silently produces an unemittable invoice.
 
 ---
 
@@ -2037,15 +2194,39 @@ assert_eq!(first.net_amount, Amount::parse("120.00000")?);
 // Equal 3-way split
 let _equal = EqualAllocation::new(3)?.allocate(&doc)?;
 
-// Penny correction guarantees:
+// Exactness guarantees:
 let sum: Amount<5> = tenant_docs.iter().map(|d| d.net_total()).sum();
 assert_eq!(sum, doc.net_total());            // ✓ exact, no drift
-for d in &tenant_docs { d.assert_valid(); }  // ✓ each doc is consistent
+for d in &tenant_docs {
+    d.assert_valid();                        // ✓ each doc is consistent
+    d.verify_vat_attribution()?;             // ✓ BR-S-08 survives the split
+}
 
 // Shares are validated: negative entries are rejected even when they sum to 1.0.
 assert!(ProportionalAllocation::new(vec![dec!(1.5), dec!(-0.5)]).is_err());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+#### Why every *position* is split, not every total
+
+Splitting the totals and correcting the positions to match is the obvious
+construction, and it quietly breaks **BR-S-08**. The VAT breakdown is split per
+`(category, rate)` group while the positions are corrected in aggregate, so a
+group's BT-116 and the positions attributed to it can land a minor unit apart. On a
+two-rate document that happened for roughly **45 %** of recipients — each document
+internally exact, each one rejected by a validator.
+
+Since 0.13.0 each position is split exactly instead (`Σ(recipients) == the original
+position`, line by line), and every total is derived by summing a recipient's own
+positions. Each group's taxable base is then read off the very positions BR-S-08
+checks it against, so:
+
+> **An allocated share satisfies `verify_vat_attribution` whenever the document it
+> came from did.**
+
+That is why there is no "this document came from an allocation, skip the check"
+escape hatch: there is nothing left to skip. A property test drives multi-rate
+documents through 2–7-way splits and asserts it.
 
 ### Raw quantity split (`proportional_split`)
 
@@ -2113,8 +2294,8 @@ The merged document keeps the **first** document's header; the second's is disca
 ## 📄 BillingDocument
 
 `BillingDocument` holds ordered positions and pre-computed totals.
-**Fourteen** invariants are enforced **exactly** (zero tolerance) at construction,
-and re-checked by `validate()` / `assert_valid()`:
+**Sixteen** invariants are enforced **exactly** (zero tolerance) at construction,
+and re-checked by `validate()` / `assert_valid()` and on deserialisation:
 
 | Check | Invariant |
 |-------|-----------|
@@ -2126,16 +2307,25 @@ and re-checked by `validate()` / `assert_valid()`:
 | 6–7 | `prepaid >= 0`; `rounding` matches the recorded cash-rounding rule |
 | 8–9 | `Σ(tax_breakdown)` is a component of `tax_total`; no discount position opposes the document's own direction |
 | 10 | `prepaid` equals `prepayment.total()` |
-| 11 | every position satisfies `LineItem::validate` |
+| 11 | every position satisfies `LineItem::validate`, and no invoice line carries document level allowance/charge detail (BG-20 / BG-21 on a BG-25) |
 | 12 | a document that charges VAT has a VAT breakdown, and a declared breakdown has a VAT position behind it (**BR-CO-18**) |
 | 13 | a "not subject to VAT" (`O`) breakdown group is the only group (**BR-O-11**) |
-| 14 | BT-6 differs from BT-5, and BT-111 shares BT-110's operational sign (`PEPPOL-EN16931-R005` / `R055`) |
+| 14 | a "split payment" (`B`) group does not coexist with a "standard rated" (`S`) one (**BR-B-02**) |
+| 15 | the invoicing period is ordered (**BR-29**) and every line period lies inside it (`PEPPOL-EN16931-R110` / `R111`) |
+| 16 | BT-6 differs from BT-5, and BT-111 shares BT-110's operational sign (`PEPPOL-EN16931-R005` / `R055`) |
+
+**"At construction" means the constructor runs `validate()`**, not merely that it
+computes the totals. Computing them establishes checks 1–4 and nothing else — 12, 13
+and 14 are properties of the VAT breakdown, and an ordinary pair of tagged tax layers
+can violate them. Until 0.13.0 `from_positions` skipped the check and could hand back
+a document that failed its own `assert_valid()`.
 
 Two identities are deliberately **outside** this list, because `AllocationRule`
 cannot preserve them — it splits the positions and the breakdown with independent
 penny corrections. Run them on the document you are about to emit:
-`verify_vat_attribution()` (**BR-S-08** and **BR-CO-14**) and
-`unattributed_positions()` (**BR-CO-04** / **BR-32** / **BR-37**).
+`verify_vat_attribution()` (**BR-S-08**, **BR-CO-14**, **BR-O-12/13/14** and the
+position half of **BR-B-02**) and `unattributed_positions()` (**BR-CO-04** /
+**BR-32** / **BR-37**).
 
 ```rust
 use billing::{BillingDocument, DocumentMeta, LineItem, Amount, Currency,
@@ -2180,8 +2370,8 @@ let mut positions = vec![LineItem::fixed("Verbrauch", Amount::parse("100.00000")
 // 1. Settle the minimum against the untaxed net.
 let net_only = BillingDocument::from_positions(
     DocumentMeta::default(), positions.clone(), vec![], vec![])?;
-if let Some(shortfall) =
-    minimum_charge(&net_only, Amount::parse("110.00000")?, "Mindestentgelt")?
+if let Some(shortfall) = minimum_charge(
+    &net_only, Amount::parse("110.00000")?, "Mindestentgelt", Currency::EUR)?
 {
     positions.push(shortfall);
 }
@@ -2194,8 +2384,17 @@ let doc = BillingDocument::from_positions(
 
 assert_eq!(doc.net_total(), Amount::parse("110.00000")?);
 assert_eq!(doc.tax_total(), Amount::parse("20.90000")?);   // 110 × 19%, not 100 × 19%
+
+// The shortfall is a *complete* invoice line: BR-22 / BR-23 / BR-26 want BT-129,
+// BT-130 and BT-146, and `minimum_charge` supplies all three (1 × the shortfall).
+let line = &doc.net_positions()[1];
+assert_eq!(line.quantity.as_ref().unwrap().code.as_deref(), Some(UNIT_CODE_ONE));
+assert_eq!(line.unit_price.as_ref().unwrap().unit, "EUR");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+That is why the currency is an argument: the generated BT-146 label is `"EUR"` /
+`"CHF"` / …, and a generated label cannot invent the currency.
 
 `with_extra_position` appends without re-running the tax layers, so it is refused
 on any document carrying a VAT breakdown.
@@ -2336,15 +2535,16 @@ handing off to [`en16931`](#the-layer-above-en16931), which models all of it:
 
 | Gap | What EN 16931 / XRechnung requires | Status here |
 |-----|-----------------------------------|-------------|
-| **Parties** | Seller and buyer name, postal address with country code, VAT identifier (BT-31), electronic address (BT-34 / BT-49) | `DocumentMeta` carries opaque `issuer_id` / `recipient_id` only |
+| **Parties** | Seller and buyer name, postal address with country code, VAT identifier (BT-31), electronic address (BT-34 / BT-49) | not modelled. `DocumentMeta` *does* carry BT-29 / BT-46 as [`PartyIdentifier`](#-billingdocument), with the ISO 6523 scheme **BR-CL-10** requires |
 | **Buyer reference** | BT-10 — the Leitweg-ID, mandatory for German B2G | put it in `meta.labels` |
-| **Dates** | BT-2 issue date, BT-9 due date as real dates | `Option<String>`, unparsed by design (no chrono dependency). `Period::is_ordered` checks BR-29 / BR-30 for ISO 8601 strings |
+| **Dates** | BT-2 issue date, BT-9 due date as real dates | `Option<String>`, unparsed by design (no chrono dependency). Period *ordering* is checked: **BR-29**, **BR-30** and `PEPPOL-EN16931-R110` / `R111` are enforced wherever the endpoints are zero-padded ISO 8601, and silently skipped otherwise |
 | **Payment means** | BG-16 — BT-81 payment means code, BT-84 IBAN, BT-83 remittance information | not modelled; these are settlement instructions, not amounts. BT-20 payment terms **are** modelled, including the BR-DE-18 Skonto syntax — see [Payment terms and Skonto](#-payment-terms-and-skonto-bt-20) |
 | **Line identifiers** | BT-126 per line | positions are ordered, not identified |
-| **Line terms on a flat charge** | BT-129 / BT-130 / BT-146 on *every* line (BR-22 / BR-23 / BR-26) | `LineItem::fixed` states an amount only — use `LineItem::flat_fee`, which supplies all three |
+| **Notes** | BG-1 — BT-21 subject code (UNCL 4451, **BR-CL-08**) and BT-22 text, `0..n` | modelled as `Vec<Note>`; `PEPPOL-EN16931-R002` caps them at one unless both parties are German, which the engine leaves to the layer that knows the countries |
+| **Line terms on a flat charge** | BT-129 / BT-130 / BT-146 on *every* line (BR-22 / BR-23 / BR-26) | `LineItem::fixed` states an amount only — use `LineItem::flat_fee`, which supplies all three. Every line the engine generates itself (`RateSchedule::apply_peak`, `minimum_charge`) already does |
 | **Code-list membership** | BT-98 ∈ UNCL 5189, BT-105 ∈ UNCL 7161, BT-121 ∈ CEF VATEX, BT-130 / BT-150 ∈ UN/ECE Rec 20/21 (BR-CL-19 / BR-CL-20 / BR-CL-22 / BR-CL-23), BT-3 ∈ UNTDID 1001 (BR-CL-01) | the fields exist and round-trip; the engine carries no copy of the lists and does not check membership |
 | **Suppressing the rate under `O`** | BR-O-05 / BR-O-06 / BR-O-07 — BT-152 / BT-96 / BT-103 must be *absent*, not zero | `rate` is a `Decimal` and stores `0`; `TaxCategory::states_rate()` tells the serialiser to omit the element |
-| **Currency** | BT-5 must be a real currency for the invoice to mean anything | `Currency::XXX` **passes** BR-CL-04 — it is a valid ISO 4217 code. Reject it yourself with `is_unset()`. BT-6 is checked: `VatAccountingCurrency` refuses `XXX` outright |
+| **Currency** | BT-5 ∈ ISO 4217 (BR-CL-04), and a *real* currency for the invoice to mean anything | two independent questions, two predicates: `is_iso4217()` answers BR-CL-04 (`XXX` **passes** it), `is_unset()` answers "was one configured". Ask both. BT-6 is checked for you: `VatAccountingCurrency` refuses `XXX` outright |
 
 Amounts, the whole totals chain (BT-106 / BT-107 / BT-108 / BT-109 / BT-110 /
 BT-112), the VAT breakdown (BG-23) with both exemption-reason forms (BT-120 /
@@ -2373,6 +2573,14 @@ touches arithmetic, this crate already computes: the early-payment discount abov
 and — for margin schemes and every tax-inclusive quote — the
 [gross split](#-tax-inclusive-gross-pricing). Where those numbers are *written*
 changes with the revision; what they are does not.
+
+**This crate targets the 2017 edition, and says so deliberately.** No validation
+artefact has been published for the 2026 one: the CEN repository's newest tag is
+still `validation-1.3.16`, which is the 2017 model. Since every rule cited in this
+crate is checked against that artefact rather than against prose, there is at
+present nothing to check a 2026 citation *against* — and a citation nobody can
+verify is exactly what the pinning exists to prevent. The rules will be re-derived
+against the new artefacts when they exist, not before.
 
 ### Why not in this crate
 
@@ -2467,21 +2675,22 @@ assert!(serde_json::from_str::<BillingDocument>(tampered_json).is_err());
 |-----------|-------------|
 | 🚫 No `f64` in monetary arithmetic | `Amount<P>` is `i64 × 10⁻ᴾ`; all intermediate ops use `rust_decimal` |
 | 🔒 Encapsulated representation | `Amount<P>`'s inner `i64` is private; `to_raw()` reads it and `from_raw_units()` reconstructs from it — both explicit, neither implicit |
-| 💥 Overflow is visible, never silent | `+`, `-`, `+=`, `-=`, `mul_qty`, `from_int`, `abs` **panic**; every `checked_*` variant returns `Err` and **never panics**, including on `Decimal`'s own overflow |
-| 📐 Rounding is always explicit | `RoundingStrategy` is a required parameter; no implicit `round()` anywhere |
+| 💥 Overflow is visible, never silent | `+`, `-`, `+=`, `-=`, `mul_qty`, `from_int`, `abs` **panic**; every `checked_*` variant returns `Err` and **never panics**, including on `Decimal`'s own overflow. `UsageAggregator::aggregate` is fallible too — raw events are the least trusted input in the pipeline |
+| 📐 Rounding is explicit wherever it is observable | `RoundingStrategy` is a required parameter on every reduction. The one default — `quantity × price` at the engine's 5 dp — cannot change an emitted digit, because `AmountScale` rounds each line once from the *exact* product rather than from that value |
 | ✋ No silent precision loss in `parse` | `Amount::<5>::parse("1.000011")` returns `Err` — the 6th digit cannot be represented |
 | 🔢 Precision is bounded at compile time | `Amount<19>` fails to compile with an explanatory const-eval message |
 | 📝 Non-empty descriptions enforced | `LineItem::build()` returns `Err` for empty or whitespace-only descriptions |
-| ✅ Documents are self-validating | `assert_valid()` checks 14 exact invariants (zero tolerance); `verify_vat_attribution` and `unattributed_positions` add the two an allocated document cannot preserve |
+| ✅ Documents are self-validating | Every constructor runs `validate()`'s 16 exact invariants (zero tolerance), and so does deserialisation; `verify_vat_attribution` and `unattributed_positions` add the two that need the per-position attribution |
 | 🔗 Compound taxes accumulate | Each tax layer sees all prior layers in its base |
-| ➗ Allocation is exact | `Σ(parts) == total` with per-document penny correction; scaled lines keep `quantity × price == net` |
+| ➗ Allocation is exact | every **position** is split exactly, so `Σ(parts) == total` holds line by line — and `verify_vat_attribution` (BR-S-08) survives the split |
 | 🏷️ Engine tag namespace is protected | Caller labels that would collide with a reserved tag (`tax`, `levy`, `discount`, …) are rejected — a band named `tax` would otherwise remove its own consumption from a levy base |
 | 🔇 No silent under-billing | Unknown ToU band names, uncovered quantities and non-monotonic schedules are all errors, not skips |
 | 🛡️ Invariants survive deserialisation | Validated types re-run their checks via `#[serde(try_from)]` |
-| 🧾 Invoices are lawful by construction | Per-rate VAT breakdown (EN 16931 BG-23) with the category rules enforced, not merely documented |
+| 🧾 Invoices are lawful by construction | Per-rate VAT breakdown (EN 16931 BG-23) with the category rules enforced, not merely documented — including the structural ones (`BR-CO-18`, `BR-O-11`, `BR-B-02`) that balance perfectly and still fail a validator |
 | 💵 Rounding concepts stay separate | Tax rounding, currency minor units and cash rounding are three independent settings — conflating them is the classic money bug |
 | 🪙 Money splits exactly | `distribute` / `allocate` / `proportional_split` never create or destroy a cent |
 | 🧹 Zero domain assumptions | No jurisdiction constants and no default currency or cash increment — the caller supplies both |
+| 🏗️ A position's bucket is its EN 16931 group | `net_positions` is BG-25, the other two are BG-20 / BG-21 — an invoice line carrying document level allowance detail is refused, because the amount would land in BT-106 instead of BT-107 with every total still balancing |
 | 🚷 No I/O, no async, no `unsafe` | `#![forbid(unsafe_code)]`; every `fn` is a pure `fn`, not `async fn` |
 
 ---
@@ -2498,6 +2707,7 @@ assert!(serde_json::from_str::<BillingDocument>(tampered_json).is_err());
 | `rusty-money` | Rust | 128-bit money with formatting, exchange and `allocate`. No pricing models, no tax layers, no document model — [`Amount::allocate`](#-splitting-money-exactly) covers the overlap |
 | `money2` | Rust | Currency exchange only; no billing engine |
 | `use-invoice` | Rust | Invoice vocabulary for same-currency totals; explicitly does *not* calculate tax or implement country rules |
+| `einvoice` | Rust | CII / UBL **serialisation** with UniFFI language bindings — the other half of the problem, not this one. It reads and writes the XML; it does not decide what the amounts are |
 
 Not a competitor but a **companion**, by the same author:
 [`en16931`](https://crates.io/crates/en16931) (semantic model + business rules) and
@@ -2534,10 +2744,18 @@ Four levels, each answering a question the one before it cannot:
 
 | Level | Question it answers |
 |-------|---------------------|
-| ~670 example-based tests | Does this input produce that output? |
+| ~760 example-based tests | Does this input produce that output? |
 | **Property tests** (`proptest`) | Do the algebraic laws hold for *every* input? Money is conserved by every split, rounding is idempotent and bounded, allocation and reversal preserve every total. |
 | Every README example as a doctest | Does the documentation still compile and still say something true? |
 | **Mutation testing** (`cargo-mutants`) | Would any test fail if the code were wrong? |
+
+> **`cargo test --all-targets` does not run doctests**
+> ([rust-lang/cargo#6669](https://github.com/rust-lang/cargo/issues/6669)), and
+> neither does `--lib --tests`. Every test invocation in this project's CI used one
+> of the two, so until 0.13.0 the third level above ran in nobody's pipeline — the
+> guarantee was real locally and unenforced remotely. `just test-doc` and a matching
+> CI step now run them explicitly, on stable, beta and the MSRV. It is worth checking
+> whether your own project has the same hole; the flag gives no warning.
 
 The fourth is the one that grades the other three. Coverage reports whether a line
 *ran*; mutation testing rewrites the line — flipping `<` to `<=`, replacing a

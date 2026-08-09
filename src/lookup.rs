@@ -102,9 +102,39 @@ impl RateLookup {
     /// ascending). Returns `Err` if no entry matches (i.e. no fallback was added
     /// and `parameter` exceeds all `upper_bound` values).
     ///
+    /// # A negative parameter is an error, not the cheapest band
+    ///
+    /// Every bound in the table is positive ([`RateLookupBuilder::build`] enforces
+    /// it), so a negative parameter is below all of them and a bare `<=` search
+    /// would return the **lowest** band — the cheapest rate — for what is a data
+    /// error: an installed capacity, a connected load or a peak demand cannot be
+    /// less than nothing. That is the silent-under-billing shape
+    /// [`crate::RateSchedule::apply_peak`] and [`crate::RateSchedule::split`]
+    /// already refuse, and the three now agree.
+    ///
+    /// ```rust
+    /// use billing::{Amount, RateLookup};
+    /// use rust_decimal::dec;
+    ///
+    /// let lookup = RateLookup::builder()
+    ///     .at_most(dec!(10), Amount::parse("0.00811")?)
+    ///     .fallback(Amount::parse("0.00556")?)
+    ///     .build()?;
+    ///
+    /// assert_eq!(lookup.rate_for(dec!(0))?, Amount::parse("0.00811")?); // zero is fine
+    /// assert!(lookup.rate_for(dec!(-1)).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
-    /// [`BillingError::InvalidInput`] when no matching entry is found.
+    /// [`BillingError::InvalidInput`] when `parameter` is negative, or when no
+    /// matching entry is found.
     pub fn rate_for(&self, parameter: Decimal) -> Result<Amount<5>, BillingError> {
+        if parameter < Decimal::ZERO {
+            return Err(BillingError::InvalidInput {
+                reason: format!("RateLookup parameter must be non-negative, got {parameter}"),
+            });
+        }
         self.entries
             .iter()
             .find(|e| parameter <= e.upper_bound)

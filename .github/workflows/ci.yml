@@ -61,6 +61,9 @@ jobs:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --all-features
+      # The README's examples must compile on the declared MSRV too — they are the
+      # first thing a new user runs. See the doctest note in the test matrix below.
+      - run: cargo test --doc --all-features
 
   # ── Test matrix ─────────────────────────────────────────────────────────────
   test:
@@ -92,6 +95,13 @@ jobs:
         run: cargo test --lib --tests --all-features
       - name: Test — no default features
         run: cargo test --all-targets --no-default-features
+      # Doctests need their own invocation: `--all-targets` silently EXCLUDES them
+      # (rust-lang/cargo#6669), and so does `--lib --tests`. Every step above uses
+      # one of the two, so until 0.13.0 nothing in CI ran them — while `src/lib.rs`
+      # ends with `#![doc = include_str!("../README.md")]` precisely so that every
+      # Rust example in the README is compiled and run, and the README promises it.
+      - name: Test — doctests (includes the whole README)
+        run: cargo test --doc --all-features
 
   # ── Security advisory scan ──────────────────────────────────────────────────
   audit:

@@ -364,6 +364,63 @@ pub trait PricingModel {
         vec![]
     }
 
+    /// The precision every amount in the resulting document is assembled at —
+    /// [`crate::BillingDocumentBuilder::amount_scale`], declared by the model.
+    ///
+    /// `None`, the default, keeps the engine's own five decimals.
+    ///
+    /// # Why the model is where this belongs
+    ///
+    /// The scale is a property of the **format the document will be emitted in**,
+    /// and the model is the piece that knows it: a model that prices for XRechnung
+    /// returns [`crate::AmountScale::EN16931`], one that prices for an internal
+    /// ledger returns `None`. Leaving it to the call site meant
+    /// [`bill`](Self::bill) and [`settle`](Self::settle) could only ever produce
+    /// five-decimal documents, so the shortest path from a model to an *emittable*
+    /// invoice bypassed them — and a caller who forgot got a document that fails
+    /// BR-DEC-23 with no error anywhere.
+    ///
+    /// Rounding cannot be applied afterwards; see
+    /// [`crate::AmountScale`] for why.
+    ///
+    /// ```rust
+    /// use billing::{Amount, AmountScale, Currency, DocumentMeta, LineItem,
+    ///               PricingModel, Positions, Quantity, UnitPrice};
+    /// use rust_decimal::dec;
+    /// use std::convert::Infallible;
+    ///
+    /// struct MeteredPlan;
+    ///
+    /// impl PricingModel for MeteredPlan {
+    ///     type Usage = ();
+    ///     type Error = Infallible;
+    ///     type NotBillable = Infallible;
+    ///
+    ///     fn positions(&self, _: &()) -> Result<Positions<Infallible>, Infallible> {
+    ///         // 1234.567 kWh x 0.28901 EUR/kWh = 356.80221 — five decimals.
+    ///         Ok(vec![LineItem::for_usage(
+    ///             "Arbeit",
+    ///             Quantity::new(dec!(1234.567), "kWh"),
+    ///             UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+    ///         ).build().unwrap()].into())
+    ///     }
+    ///
+    ///     // This model prices for EN 16931, and says so.
+    ///     fn amount_scale(&self) -> Option<AmountScale> { Some(AmountScale::EN16931) }
+    /// }
+    ///
+    /// let doc = MeteredPlan.settle(DocumentMeta {
+    ///     currency: Currency::EUR, ..Default::default()
+    /// })?;
+    ///
+    /// assert_eq!(doc.net_total(), Amount::parse("356.80000")?);
+    /// assert!(doc.fits_amount_scale(2));  // emittable, straight out of `settle`
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    fn amount_scale(&self) -> Option<crate::amount::AmountScale> {
+        None
+    }
+
     /// Compute a [`BillingDocument`] from usage data.
     ///
     /// Available only when `NotBillable = `[`Infallible`] — a model that can

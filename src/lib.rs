@@ -31,6 +31,34 @@
 //! | [`proportional_split`] | Penny-correct Hamilton split of a raw `Decimal` quantity |
 //! | [`RateLookup`] | Parameter-keyed rate table (installed capacity → rate) |
 //!
+//! ## Which EN 16931, and checked against what
+//!
+//! There are now two editions, and they are not compatible. This crate targets
+//! **EN 16931-1:2017+A1:2019** — the edition every deployed CIUS implements today.
+//!
+//! Every rule cited anywhere in this crate is verified against the *validation
+//! artefacts*, not against prose or recollection, and both are pinned:
+//!
+//! | Source | Pinned at | Supplies |
+//! |---|---|---|
+//! | `ConnectingEurope/eInvoicing-EN16931` | tag `validation-1.3.16` | `BR-*`, `BR-CO-*`, `BR-CL-*`, `BR-DEC-*` |
+//! | `OpenPEPPOL/peppol-bis-invoice-3` | `master` | `PEPPOL-EN16931-*`, the `P01xx` profile rules |
+//!
+//! Where the two disagree with a plain reading of the standard, the artefact wins,
+//! because it is what a validator runs — and where an artefact's own expression of
+//! a rule would reject an arithmetically correct document, this crate says so and
+//! declines (see [`TaxBreakdownEntry::validate`](crate::TaxBreakdownEntry::validate)
+//! on BR-CO-17's zero-rate branch).
+//!
+//! **EN 16931-1:2026**, approved by CEN in October 2025 and published in March 2026,
+//! is a deliberate break: new business terms, changed validation rules, reworked UBL
+//! and CII bindings. No validation artefact has been published for it yet — the CEN
+//! repository's newest tag is still `validation-1.3.16` — so there is nothing to
+//! check citations against, and nothing here claims to implement it. What the
+//! revision moves is mostly *where numbers are written*, which lands in a
+//! serialisation layer; the arithmetic it needs, this crate already computes. See
+//! the README's *2026 revision* section.
+//!
 //! ## Design invariants
 //!
 //! - **No `f64` in monetary arithmetic** — [`Amount<P>`] is `i64 × 10⁻ᴾ`.
@@ -38,17 +66,38 @@
 //! - **Overflow is visible** — `+`, `-` and `mul_qty` panic; every `checked_*`
 //!   variant returns `Err` and never panics, including on `Decimal`'s own
 //!   overflow (whose operators panic rather than saturating).
-//! - **Rounding is always explicit** — [`RoundingStrategy`] is a required parameter.
-//!   The `Decimal` → [`Amount`] conversion therefore *refuses* excess precision
+//! - **Rounding is explicit wherever it is observable** — [`RoundingStrategy`] is a
+//!   required parameter on every operation that reduces precision. The
+//!   `Decimal` → [`Amount`] conversion therefore *refuses* excess precision
 //!   ([`Amount::checked_from_decimal`]) rather than rounding it silently, and agrees
 //!   with [`Amount::parse`] on exactly what is representable;
 //!   [`Amount::from_decimal_rounded`] is the opt-in that rounds.
+//!
+//!   There is exactly one default, and it is deliberate: `quantity × price` and
+//!   `total ÷ quantity` ([`Amount::mul_qty`], [`Amount::checked_mul_qty`],
+//!   [`Amount::checked_div`], and so [`LineItemBuilder::build`]) land on the
+//!   engine's own five decimals with `MidpointAwayFromZero`. That figure is an
+//!   *intermediate*, not an emitted amount: [`AmountScale`] rounds each line once
+//!   from the **exact** product rather than from the stored five-decimal value, so
+//!   on a document assembled at an interchange scale the choice cannot change a
+//!   single emitted digit. Where a derived price is itself the output, name the
+//!   strategy with [`UnitPrice::rounded`].
 //! - **Comparisons are total** — [`Amount::within_tolerance_ppm`] returns `bool`, so
 //!   a tolerance check can never degrade into a spurious finding via `unwrap_or`.
 //! - **"Nothing to bill" is not an error and not an empty list** — [`Billing`]
 //!   carries the domain's own reason, and models that always bill opt out at the
 //!   type level with `NotBillable = Infallible`.
-//! - **No implicit currency** — [`Currency`] defaults to ISO 4217 `XXX`, never `EUR`.
+//! - **No implicit currency, and no way to lose an explicit one** — [`Currency`]
+//!   defaults to ISO 4217 `XXX`, never `EUR`, and
+//!   [`BillingDocumentBuilder::currency`] is order-independent, so a later
+//!   [`meta`](BillingDocumentBuilder::meta) cannot silently discard it.
+//!   [`Currency::is_iso4217`] answers BR-CL-04 separately from
+//!   [`Currency::is_unset`], because `XXX` passes the former.
+//! - **Every position the engine generates is emittable as an invoice line** —
+//!   BR-22, BR-23 and BR-26 make BT-129, BT-130 and BT-146 mandatory on *every*
+//!   line, and none of them changes an amount, so nothing in the totals would
+//!   notice their absence. [`RateSchedule::apply_peak`] and [`minimum_charge`]
+//!   therefore build through [`LineItem::flat_fee`], not [`LineItem::fixed`].
 //! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
 //!   [`BillingDocument::assert_valid`] panics on failure (convenient for tests).
 //! - **Allocation is exact** — [`ProportionalAllocation`] guarantees
@@ -73,7 +122,9 @@
 //! - **Precision reduction happens at the leaves** — [`AmountScale`] rounds every
 //!   position and layer output *before* the totals are summed, so an interchange
 //!   format's decimal limit and its totals identities hold at once. Rounding a
-//!   finished document satisfies neither.
+//!   finished document satisfies neither. The model states the target precision
+//!   with [`PricingModel::amount_scale`], so [`bill`](PricingModel::bill) and
+//!   [`settle`](PricingModel::settle) produce a document that already fits it.
 //!
 //! ## README
 //!
@@ -116,7 +167,7 @@ pub use aggregation::{
 pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
 pub use amount::{Amount, AmountScale, RoundingStrategy};
 pub use currency::Currency;
-pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta};
+pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta, Note, PartyIdentifier};
 pub use error::{BillingError, ParseAmountError};
 pub use line_item::{
     AllowanceCharge, AllowanceKind, LineAllowanceCharge, LineItem, LineItemBuilder, Sign,
@@ -243,12 +294,12 @@ pub mod prelude {
         BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
         Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EarlyPaymentDiscount,
         EqualAllocation, FixedDiscount, FixedRateTax, LatestAggregator, LineAllowanceCharge,
-        LineItem, LineVat, MaxAggregator, ParseAmountError, PaymentTerms, PerUnitLevy,
-        PercentageCharge, PercentageDiscount, Period, Positions, Prepayment, PricingModel,
-        ProportionalAllocation, Quantity, RateBand, RateLookup, RateLookupBuilder, RateSchedule,
-        RoundingStrategy, Sign, SumAggregator, TaxBreakdownEntry, TaxCategory, TaxLayer, TimeBand,
-        TimeOfUsePricing, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice, UsageAggregator,
-        VatAccountingCurrency, WeightedSumAggregator, merge_period_documents, minimum_charge,
-        proportional_split, prorate, prorate_amount, residual_breakdown,
+        LineItem, LineVat, MaxAggregator, Note, ParseAmountError, PartyIdentifier, PaymentTerms,
+        PerUnitLevy, PercentageCharge, PercentageDiscount, Period, Positions, Prepayment,
+        PricingModel, ProportionalAllocation, Quantity, RateBand, RateLookup, RateLookupBuilder,
+        RateSchedule, RoundingStrategy, Sign, SumAggregator, TaxBreakdownEntry, TaxCategory,
+        TaxLayer, TimeBand, TimeOfUsePricing, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice,
+        UsageAggregator, VatAccountingCurrency, WeightedSumAggregator, merge_period_documents,
+        minimum_charge, proportional_split, prorate, prorate_amount, residual_breakdown,
     };
 }

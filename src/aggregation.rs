@@ -5,6 +5,16 @@
 //! [`UsageAggregator`] trait.
 use rust_decimal::Decimal;
 
+use crate::error::BillingError;
+
+/// The overflow every accumulating aggregator reports instead of panicking.
+fn overflow() -> BillingError {
+    BillingError::MonetaryOverflow {
+        precision: 5,
+        input_value: None,
+    }
+}
+
 // ── UsageAggregator trait ─────────────────────────────────────────────────────
 
 /// Aggregate a slice of raw usage events to a single scalar quantity.
@@ -13,9 +23,35 @@ use rust_decimal::Decimal;
 /// `RateSchedule` or `DynamicPricing` for billing.
 ///
 /// 6 built-in types: `SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST`, `WEIGHTED_SUM`.
+///
+/// # Why this returns `Result`
+///
+/// This trait sits at the **least trusted boundary in the whole pipeline**: raw
+/// usage events, straight from a meter, a log or an API. `Decimal`'s `+`, `*` and
+/// `Sum` *panic* on overflow rather than saturating, so an accumulating aggregator
+/// over a slice containing one corrupt magnitude aborts the process — and a batch
+/// run dies on a single malformed record, which is the failure mode this crate has
+/// spent three releases removing everywhere else.
+///
+/// Until 0.13.0 `aggregate` returned a bare `Decimal` and had nowhere to report it.
+/// Every `checked_*` method in this crate is total for the same reason
+/// ([`crate::Amount::checked_sum`] says so explicitly: *"prefer this over `.sum()`
+/// in any code path that could receive attacker-controlled or unbounded values"*),
+/// and usage events are that path.
+///
+/// Four of the six built-ins — `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST` — cannot
+/// fail: they select or count rather than accumulate. They still return `Result`,
+/// because a caller writing generic code over `UsageAggregator` needs one
+/// signature, and because an implementation that *starts* accumulating should not
+/// become a breaking change for its callers.
 pub trait UsageAggregator<E> {
     /// Aggregate a slice of events into a single [`Decimal`] quantity.
-    fn aggregate(&self, events: &[E]) -> Decimal;
+    ///
+    /// # Errors
+    /// [`BillingError::MonetaryOverflow`] if the accumulation leaves `Decimal`'s
+    /// representable range. Implementations that only select or count never
+    /// return `Err`.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError>;
 }
 
 // ── SumAggregator ─────────────────────────────────────────────────────────────
@@ -31,14 +67,16 @@ pub trait UsageAggregator<E> {
 ///
 /// struct ApiEvent { bytes: u64 }
 /// let agg = SumAggregator::new(|e: &ApiEvent| Decimal::from(e.bytes));
-/// let total = agg.aggregate(&[ApiEvent { bytes: 100 }, ApiEvent { bytes: 200 }]);
+/// let total = agg.aggregate(&[ApiEvent { bytes: 100 }, ApiEvent { bytes: 200 }])?;
 /// assert_eq!(total, Decimal::from(300u32));
+///
+/// // A corrupt magnitude is reported, not a process abort.
+/// let huge = |_: &ApiEvent| Decimal::MAX;
+/// assert!(SumAggregator::new(huge)
+///     .aggregate(&[ApiEvent { bytes: 1 }, ApiEvent { bytes: 1 }])
+///     .is_err());
+/// # Ok::<(), billing::BillingError>(())
 /// ```
-/// # Panics
-/// `Decimal`'s `Sum` panics on overflow. Aggregating values whose total exceeds
-/// `Decimal`'s 96-bit mantissa (~7.9e28) aborts rather than returning an error —
-/// the [`UsageAggregator`] trait returns a bare `Decimal`, so there is no error
-/// channel. Pre-filter untrusted event streams if that bound is reachable.
 #[derive(Clone, Copy)]
 pub struct SumAggregator<E, F: Fn(&E) -> Decimal> {
     value_fn: F,
@@ -56,8 +94,12 @@ impl<E, F: Fn(&E) -> Decimal> SumAggregator<E, F> {
 }
 
 impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for SumAggregator<E, F> {
-    fn aggregate(&self, events: &[E]) -> Decimal {
-        events.iter().map(|e| (self.value_fn)(e)).sum()
+    /// `checked_add` throughout: `Decimal`'s `Sum` panics on overflow, which would
+    /// take a batch run down on one corrupt event.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
+        events.iter().try_fold(Decimal::ZERO, |acc, e| {
+            acc.checked_add((self.value_fn)(e)).ok_or_else(overflow)
+        })
     }
 }
 
@@ -70,8 +112,9 @@ impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for SumAggregator<E, F> {
 pub struct CountAggregator;
 
 impl<E> UsageAggregator<E> for CountAggregator {
-    fn aggregate(&self, events: &[E]) -> Decimal {
-        Decimal::from(events.len())
+    /// Infallible: `usize::MAX` is ~1.8 × 10¹⁹, far inside `Decimal`'s range.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
+        Ok(Decimal::from(events.len()))
     }
 }
 
@@ -98,8 +141,9 @@ impl<E> UsageAggregator<E> for CountAggregator {
 ///     ApiCall { user_id: "alice" },
 ///     ApiCall { user_id: "bob" },
 ///     ApiCall { user_id: "alice" }, // duplicate
-/// ]);
+/// ])?;
 /// assert_eq!(count, rust_decimal::Decimal::from(2u32));
+/// # Ok::<(), billing::BillingError>(())
 /// ```
 #[derive(Clone, Copy)]
 pub struct UniqueCountAggregator<E, K, F>
@@ -130,10 +174,11 @@ where
     K: std::hash::Hash + Eq,
     F: Fn(&E) -> K,
 {
-    fn aggregate(&self, events: &[E]) -> Decimal {
+    /// Infallible: a count of distinct keys is bounded by `events.len()`.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
         let unique: std::collections::HashSet<K> =
             events.iter().map(|e| (self.key_fn)(e)).collect();
-        Decimal::from(unique.len())
+        Ok(Decimal::from(unique.len()))
     }
 }
 
@@ -160,12 +205,13 @@ impl<E, F: Fn(&E) -> Decimal> MaxAggregator<E, F> {
 }
 
 impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for MaxAggregator<E, F> {
-    fn aggregate(&self, events: &[E]) -> Decimal {
-        events
+    /// Infallible: selecting an extremum computes nothing.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
+        Ok(events
             .iter()
             .map(|e| (self.value_fn)(e))
             .max_by(|a, b| a.cmp(b))
-            .unwrap_or(Decimal::ZERO)
+            .unwrap_or(Decimal::ZERO))
     }
 }
 
@@ -191,11 +237,13 @@ impl<E, F: Fn(&E) -> Decimal> LatestAggregator<E, F> {
 }
 
 impl<E, F: Fn(&E) -> Decimal> UsageAggregator<E> for LatestAggregator<E, F> {
-    fn aggregate(&self, events: &[E]) -> Decimal {
-        events
+    /// Infallible: reading the last element computes nothing. An empty period is
+    /// zero — there is no "current storage GB" to read — rather than an error.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
+        Ok(events
             .last()
             .map(|e| (self.value_fn)(e))
-            .unwrap_or(Decimal::ZERO)
+            .unwrap_or(Decimal::ZERO))
     }
 }
 
@@ -233,11 +281,16 @@ impl<E, F: Fn(&E) -> Decimal, G: Fn(&E) -> Decimal> WeightedSumAggregator<E, F, 
 impl<E, F: Fn(&E) -> Decimal, G: Fn(&E) -> Decimal> UsageAggregator<E>
     for WeightedSumAggregator<E, F, G>
 {
-    fn aggregate(&self, events: &[E]) -> Decimal {
-        events
-            .iter()
-            .map(|e| (self.value_fn)(e) * (self.duration_fn)(e))
-            .sum()
+    /// `checked_mul` **and** `checked_add`: this is the aggregator most likely to
+    /// overflow, because it multiplies before it accumulates — a duration handed
+    /// over in seconds rather than as a fraction is a factor of ~2.6 million.
+    fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError> {
+        events.iter().try_fold(Decimal::ZERO, |acc, e| {
+            let weighted = (self.value_fn)(e)
+                .checked_mul((self.duration_fn)(e))
+                .ok_or_else(overflow)?;
+            acc.checked_add(weighted).ok_or_else(overflow)
+        })
     }
 }
 
@@ -264,7 +317,7 @@ mod tests {
             },
         ];
         let agg = SumAggregator::new(|e: &Event| Decimal::from(e.value));
-        assert_eq!(agg.aggregate(&events), dec!(300));
+        assert_eq!(agg.aggregate(&events).unwrap(), dec!(300));
     }
 
     #[test]
@@ -279,7 +332,7 @@ mod tests {
                 user: "b".into(),
             },
         ];
-        assert_eq!(CountAggregator.aggregate(&events), dec!(2));
+        assert_eq!(CountAggregator.aggregate(&events).unwrap(), dec!(2));
     }
 
     #[test]
@@ -299,7 +352,7 @@ mod tests {
             }, // duplicate
         ];
         let agg = UniqueCountAggregator::new(|e: &Event| e.user.clone());
-        assert_eq!(agg.aggregate(&events), dec!(2));
+        assert_eq!(agg.aggregate(&events).unwrap(), dec!(2));
     }
 
     #[test]
@@ -319,7 +372,7 @@ mod tests {
             },
         ];
         let agg = MaxAggregator::new(|e: &Event| Decimal::from(e.value));
-        assert_eq!(agg.aggregate(&events), dec!(50));
+        assert_eq!(agg.aggregate(&events).unwrap(), dec!(50));
     }
 
     #[test]
@@ -340,11 +393,58 @@ mod tests {
             },
         ];
         let agg = LatestAggregator::new(|e: &Event| Decimal::from(e.value));
-        assert_eq!(agg.aggregate(&events), dec!(10));
+        assert_eq!(agg.aggregate(&events).unwrap(), dec!(10));
 
         // Snapshot billing over an empty period is zero, not a panic: there is no
         // "current storage GB" to read, and an error channel does not exist here.
-        assert_eq!(agg.aggregate(&[]), Decimal::ZERO);
+        assert_eq!(agg.aggregate(&[]).unwrap(), Decimal::ZERO);
+    }
+
+    /// The trait sits at the least trusted boundary in the pipeline, so the two
+    /// aggregators that *accumulate* must report an out-of-range total rather than
+    /// abort the process. `Decimal`'s `Sum` and `Mul` both panic on overflow, so
+    /// before 0.13.0 a single corrupt event took the whole batch run with it — and
+    /// no test could observe that, because there was no error to observe.
+    #[test]
+    fn an_accumulating_aggregator_reports_overflow_instead_of_panicking() {
+        struct Raw(Decimal);
+
+        // Two events each carrying Decimal::MAX overflow on the first add.
+        let sum = SumAggregator::new(|e: &Raw| e.0);
+        assert!(
+            sum.aggregate(&[Raw(Decimal::MAX), Raw(Decimal::MAX)])
+                .is_err()
+        );
+        // …and the ordinary case still answers.
+        assert_eq!(
+            sum.aggregate(&[Raw(dec!(1.5)), Raw(dec!(2.5))]).unwrap(),
+            dec!(4)
+        );
+
+        // WeightedSum overflows in the *multiplication*, which is the easier of the
+        // two to reach: a duration passed in seconds rather than as a fraction is a
+        // factor of ~2.6 million.
+        let weighted = WeightedSumAggregator::new(|e: &Raw| e.0, |_: &Raw| Decimal::MAX);
+        assert!(weighted.aggregate(&[Raw(Decimal::MAX)]).is_err());
+        assert_eq!(
+            WeightedSumAggregator::new(|e: &Raw| e.0, |_: &Raw| dec!(0.5))
+                .aggregate(&[Raw(dec!(4))])
+                .unwrap(),
+            dec!(2)
+        );
+
+        // The four selecting aggregators cannot fail, even on the same input.
+        assert!(
+            MaxAggregator::new(|e: &Raw| e.0)
+                .aggregate(&[Raw(Decimal::MAX), Raw(Decimal::MAX)])
+                .is_ok()
+        );
+        assert!(
+            LatestAggregator::new(|e: &Raw| e.0)
+                .aggregate(&[Raw(Decimal::MAX)])
+                .is_ok()
+        );
+        assert!(CountAggregator.aggregate(&[Raw(Decimal::MAX)]).is_ok());
     }
 
     #[test]
@@ -366,6 +466,6 @@ mod tests {
         ];
         let agg = WeightedSumAggregator::new(|v: &Vm| Decimal::from(v.vcpus), |v: &Vm| v.fraction);
         // 4 × 0.5 + 2 × 1.0 = 4.0 CPU-hours
-        assert_eq!(agg.aggregate(&vms), dec!(4));
+        assert_eq!(agg.aggregate(&vms).unwrap(), dec!(4));
     }
 }

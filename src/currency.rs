@@ -114,6 +114,75 @@ impl Currency {
         *self == Self::XXX
     }
 
+    /// Every alphabetic code EN 16931 admits, in ascending order.
+    ///
+    /// Transcribed verbatim from the `contains(' AED AFN … ZWG ')` list in
+    /// **BR-CL-03** of `ubl/schematron/codelist/EN16931-UBL-codes.sch`
+    /// (`ConnectingEurope/eInvoicing-EN16931`, tag `validation-1.3.16`) — the same
+    /// list BR-CL-04 and BR-CL-05 apply to BT-5 and BT-6. Sorted so
+    /// [`is_iso4217`](Self::is_iso4217) can binary-search it.
+    const ISO_4217: [&'static [u8; 3]; 178] = [
+        b"AED", b"AFN", b"ALL", b"AMD", b"AOA", b"ARS", b"AUD", b"AWG", b"AZN", b"BAM", b"BBD",
+        b"BDT", b"BHD", b"BIF", b"BMD", b"BND", b"BOB", b"BOV", b"BRL", b"BSD", b"BTN", b"BWP",
+        b"BYN", b"BZD", b"CAD", b"CDF", b"CHE", b"CHF", b"CHW", b"CLF", b"CLP", b"CNH", b"CNY",
+        b"COP", b"COU", b"CRC", b"CUP", b"CVE", b"CZK", b"DJF", b"DKK", b"DOP", b"DZD", b"EGP",
+        b"ERN", b"ETB", b"EUR", b"FJD", b"FKP", b"GBP", b"GEL", b"GHS", b"GIP", b"GMD", b"GNF",
+        b"GTQ", b"GYD", b"HKD", b"HNL", b"HTG", b"HUF", b"IDR", b"ILS", b"INR", b"IQD", b"IRR",
+        b"ISK", b"JMD", b"JOD", b"JPY", b"KES", b"KGS", b"KHR", b"KMF", b"KPW", b"KRW", b"KWD",
+        b"KYD", b"KZT", b"LAK", b"LBP", b"LKR", b"LRD", b"LSL", b"LYD", b"MAD", b"MDL", b"MGA",
+        b"MKD", b"MMK", b"MNT", b"MOP", b"MRU", b"MUR", b"MVR", b"MWK", b"MXN", b"MXV", b"MYR",
+        b"MZN", b"NAD", b"NGN", b"NIO", b"NOK", b"NPR", b"NZD", b"OMR", b"PAB", b"PEN", b"PGK",
+        b"PHP", b"PKR", b"PLN", b"PYG", b"QAR", b"RON", b"RSD", b"RUB", b"RWF", b"SAR", b"SBD",
+        b"SCR", b"SDG", b"SEK", b"SGD", b"SHP", b"SLE", b"SOS", b"SRD", b"SSP", b"STD", b"SVC",
+        b"SYP", b"SZL", b"THB", b"TJS", b"TMT", b"TND", b"TOP", b"TRY", b"TTD", b"TWD", b"TZS",
+        b"UAH", b"UGX", b"USD", b"USN", b"UYI", b"UYU", b"UYW", b"UZS", b"VED", b"VES", b"VND",
+        b"VUV", b"WST", b"XAF", b"XAG", b"XAU", b"XBA", b"XBB", b"XBC", b"XBD", b"XCD", b"XCG",
+        b"XDR", b"XOF", b"XPD", b"XPF", b"XPT", b"XSU", b"XTS", b"XUA", b"XXX", b"YER", b"ZAR",
+        b"ZMW", b"ZWG",
+    ];
+
+    /// Whether this code is in the ISO 4217 alphabetic list EN 16931 admits —
+    /// rules **BR-CL-03**, **BR-CL-04** and **BR-CL-05**, all *fatal*.
+    ///
+    /// # Why membership is a separate question from construction
+    ///
+    /// [`Currency::new`] accepts any three ASCII letters, and deliberately keeps
+    /// doing so: this crate bills things that are not EN 16931 invoices, and a
+    /// private clearing unit or an unlisted code is a legitimate thing to denominate
+    /// an internal document in. What it must not do is let such a code reach an
+    /// invoice **silently**, because BR-CL-04 rejects it at the access point rather
+    /// than at the boundary you control.
+    ///
+    /// This is the same split as [`crate::DocumentKind::is_peppol_billing_code`]:
+    /// model the value, and expose the profile question as a predicate the consumer
+    /// asks before it emits. Ask both, together with
+    /// [`is_unset`](Self::is_unset) — `XXX` is *in* the list, so membership alone
+    /// does not mean a currency was configured.
+    ///
+    /// ```rust
+    /// use billing::Currency;
+    ///
+    /// assert!(Currency::EUR.is_iso4217());
+    /// assert!(Currency::new("KWD").unwrap().is_iso4217());
+    /// // Well-formed, constructible, and fatal under BR-CL-04.
+    /// assert!(!Currency::new("XBT").unwrap().is_iso4217());
+    /// // `XXX` passes BR-CL-04 and still means "no currency was configured".
+    /// assert!(Currency::XXX.is_iso4217() && Currency::XXX.is_unset());
+    /// ```
+    ///
+    /// # Freshness
+    ///
+    /// The list is transcribed from the pinned CEN validation artefact
+    /// (`validation-1.3.16`), not from ISO's registry directly, so it answers the
+    /// question a validator will actually ask. It moves roughly annually; a code
+    /// added to ISO after that tag reports `false` here until the artefact and this
+    /// crate catch up, which is the safe direction — a false negative is a check you
+    /// look at, a false positive is a rejected invoice.
+    #[must_use]
+    pub fn is_iso4217(&self) -> bool {
+        Self::ISO_4217.binary_search(&&self.0).is_ok()
+    }
+
     /// The ISO 4217 **minor unit** exponent: the number of decimal places the
     /// currency is conventionally written with.
     ///
@@ -122,8 +191,10 @@ impl Currency {
     /// itself. These have no fractional subdivision, which is **not** the same as
     /// having zero decimals, so the distinction is preserved in the type.
     ///
-    /// Codes outside ISO's registry fall back to `Some(2)`, the overwhelmingly
-    /// common case, since [`Currency::new`] accepts any well-formed code.
+    /// Codes outside the list — the ones [`is_iso4217`](Self::is_iso4217) reports
+    /// `false` for — fall back to `Some(2)`, the overwhelmingly common case, since
+    /// [`Currency::new`] accepts any well-formed code. Ask `is_iso4217` first if
+    /// you need to know whether the answer is a fact or a default.
     ///
     /// # This is not the smallest transactable amount
     ///
@@ -313,6 +384,45 @@ mod tests {
             format!("{:?}", Currency::new("chf").unwrap()),
             "Currency(CHF)"
         );
+    }
+
+    /// `is_iso4217` binary-searches `ISO_4217`, so an out-of-order entry would make
+    /// it answer `false` for a real currency — a false rejection with no other
+    /// symptom. The length pins the transcription against the artefact.
+    #[test]
+    fn the_iso_4217_table_is_sorted_and_complete() {
+        assert_eq!(
+            Currency::ISO_4217.len(),
+            178,
+            "BR-CL-03 (validation-1.3.16) lists 178 alphabetic codes"
+        );
+        assert!(
+            Currency::ISO_4217.windows(2).all(|w| w[0] < w[1]),
+            "ISO_4217 must be strictly ascending for binary_search"
+        );
+        // Every entry finds itself.
+        for code in Currency::ISO_4217 {
+            let c = Currency::new(std::str::from_utf8(code).unwrap()).unwrap();
+            assert!(c.is_iso4217(), "{c} must be in the list");
+        }
+    }
+
+    #[test]
+    fn membership_is_decided_independently_of_construction() {
+        // Well-formed but not a currency EN 16931 admits — BR-CL-04 is fatal on it.
+        for bad in ["XBT", "ZZZ", "DEM", "FRF", "ABC"] {
+            let c = Currency::new(bad).unwrap();
+            assert!(!c.is_iso4217(), "{bad} must not be in the list");
+            // …and it is still constructible, because this crate bills things that
+            // are not EN 16931 invoices.
+            assert_eq!(c.code(), bad);
+        }
+        // Lowercase input normalises before the lookup.
+        assert!(Currency::new("eur").unwrap().is_iso4217());
+        // The two boundary questions are independent: XXX is listed *and* unset.
+        assert!(Currency::XXX.is_iso4217());
+        assert!(Currency::XXX.is_unset());
+        assert!(!Currency::EUR.is_unset());
     }
 
     #[test]

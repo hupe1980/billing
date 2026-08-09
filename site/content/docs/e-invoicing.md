@@ -60,6 +60,49 @@ Every position, every discount- and tax-layer output, every VAT breakdown entry,
 line allowance and every stated basis is reduced *before* any total is computed. Each
 total is then a sum of already-reduced values and lands on the same precision exactly.
 
+### Let the model say it, not every call site
+
+The precision is a property of the **format the document will be emitted in**, and a
+`PricingModel` is the piece that knows it. Declare it once and `bill`, `try_bill`,
+`settle`, `try_settle` and `BillingDocumentBuilder::pricing` all honour it:
+
+```rust
+use billing::prelude::*;
+use rust_decimal::dec;
+use std::convert::Infallible;
+
+struct MeteredPlan;
+
+impl PricingModel for MeteredPlan {
+    type Usage = ();
+    type Error = Infallible;
+    type NotBillable = Infallible;
+
+    fn positions(&self, _: &()) -> Result<Positions<Infallible>, Infallible> {
+        Ok(vec![LineItem::for_usage(
+            "Arbeit",
+            Quantity::new(dec!(1234.567), "kWh"),
+            UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+        ).build().unwrap()].into())
+    }
+
+    // This model prices for EN 16931, and says so.
+    fn amount_scale(&self) -> Option<AmountScale> { Some(AmountScale::EN16931) }
+}
+
+let doc = MeteredPlan.settle(DocumentMeta {
+    currency: Currency::EUR, ..Default::default()
+})?;
+
+assert_eq!(doc.net_total(), Amount::parse("356.80000")?);
+assert!(doc.fits_amount_scale(2));   // emittable, straight out of `settle`
+```
+
+Because rounding cannot be applied afterwards, a model with no scale declared could
+only ever produce five-decimal documents — so the shortest path from a model to a
+document was also the one that produced an invoice failing `BR-DEC-23`, with no error
+anywhere. An explicit `amount_scale` on the builder still wins over the model's.
+
 ### Rounded once, from the exact value
 
 Where a leaf is *derived*, the reduction rounds the exact value once rather than
@@ -113,14 +156,15 @@ off to [`en16931`](#the-layer-above):
 
 | Gap | What the standard requires | Status here |
 |---|---|---|
-| **Parties** | seller and buyer name, postal address with country code, VAT identifier (BT-31), electronic address (BT-34 / BT-49) | `DocumentMeta` carries opaque `issuer_id` / `recipient_id` only |
+| **Parties** | seller and buyer name, postal address with country code, VAT identifier (BT-31), electronic address (BT-34 / BT-49) | not modelled. `DocumentMeta` does carry BT-29 / BT-46 as `PartyIdentifier`, with the ISO 6523 scheme `BR-CL-10` requires |
 | **Buyer reference** | BT-10 — the Leitweg-ID, mandatory for German B2G | put it in `meta.labels` |
-| **Dates** | BT-2 issue date, BT-9 due date as real dates | `Option<String>`, unparsed by design (no date dependency). `Period::is_ordered` checks `BR-29` / `BR-30` for ISO 8601 strings |
+| **Dates** | BT-2 issue date, BT-9 due date as real dates | `Option<String>`, unparsed by design (no date dependency). Period *ordering* is checked: `BR-29`, `BR-30` and `PEPPOL-EN16931-R110` / `R111` are enforced wherever the endpoints are zero-padded ISO 8601, and silently skipped otherwise |
 | **Payment means** | BG-16 — BT-81 payment means code, BT-84 IBAN | not modelled; these are settlement instructions, not amounts. BT-20 payment terms **are** modelled, including the `BR-DE-18` Skonto syntax |
 | **Line identifiers** | BT-126 per line | positions are ordered, not identified |
+| **Notes** | BG-1 — BT-21 subject code (UNCL 4451, `BR-CL-08`) and BT-22 text, `0..n` | modelled as `Vec<Note>`; `PEPPOL-EN16931-R002` caps them at one unless both parties are German, which the engine leaves to the layer that knows the countries |
 | **Code-list membership** | BT-98 ∈ UNCL 5189, BT-105 ∈ UNCL 7161, BT-121 ∈ CEF VATEX, BT-130 / BT-150 ∈ UN/ECE Rec 20/21, BT-3 ∈ UNTDID 1001 | the fields exist and round-trip; the engine carries no copy of the lists and does not check membership |
 | **Suppressing the rate under `O`** | `BR-O-05` / `06` / `07` — BT-152 / BT-96 / BT-103 must be *absent*, not zero | `rate` is a `Decimal` storing `0`; `TaxCategory::states_rate()` tells the serialiser to omit the element |
-| **Currency** | BT-5 must be a real currency for the invoice to mean anything | `Currency::XXX` **passes** `BR-CL-04` — it is a valid ISO 4217 code. Reject it yourself with `is_unset()` |
+| **Currency** | BT-5 ∈ ISO 4217 (`BR-CL-04`), and a *real* currency for the invoice to mean anything | two independent questions, two predicates: `is_iso4217()` answers `BR-CL-04` (`XXX` **passes** it), `is_unset()` answers "was one configured". Ask both |
 
 What **is** modelled: amounts, the whole totals chain, the VAT breakdown with both
 exemption-reason forms, per-position VAT attribution, the whole of BG-29 price details,

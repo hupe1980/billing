@@ -376,7 +376,8 @@ impl<const P: u8> Amount<P> {
 
     /// Parse a decimal string into `Amount<P>`.
     ///
-    /// Accepts `.` and `,` as decimal separators.  Returns `Err` when:
+    /// Accepts `.` and `,` as decimal separators, and an omitted integer part
+    /// (`".5"`). Returns `Err` when:
     /// - the string is empty or non-numeric,
     /// - the value would overflow `i64`, or
     /// - the string carries **non-zero digits beyond `P`** decimal places
@@ -392,6 +393,14 @@ impl<const P: u8> Amount<P> {
     /// assert!(Amount::<5>::parse("0.123456").is_err());
     /// // Trailing zeros beyond precision → Ok
     /// assert!(Amount::<5>::parse("0.100000").is_ok());
+    /// // An omitted integer part is zero, as it is for `Decimal` and for a
+    /// // trailing separator.
+    /// assert_eq!(Amount::<5>::parse(".5").unwrap(), Amount::parse("0.50000").unwrap());
+    /// assert_eq!(Amount::<5>::parse("-,5").unwrap(), Amount::parse("-0.50000").unwrap());
+    /// assert_eq!(Amount::<5>::parse("5.").unwrap(), Amount::parse("5.00000").unwrap());
+    /// // …but a separator with nothing on either side is not a number.
+    /// assert!(Amount::<5>::parse(".").is_err());
+    /// assert!(Amount::<5>::parse("-.").is_err());
     /// ```
     pub fn parse(s: &str) -> Result<Self, ParseAmountError> {
         let err = || ParseAmountError {
@@ -435,7 +444,21 @@ impl<const P: u8> Amount<P> {
         // |i64::MIN| / SCALE is handled correctly.  For P=0 and Amount::<0>::MIN,
         // the whole string is "9223372036854775808" which overflows i64 but fits
         // in i128 and is valid after negation (= i64::MIN).
-        let whole: i128 = whole_str.parse().map_err(|_| err())?;
+        //
+        // An omitted integer part is zero: `".5"` and `"-.5"` are what a CSV export,
+        // a JSON payload or a hand-typed price routinely carries, `Decimal::from_str`
+        // accepts them, and rejecting them here would make `parse` and
+        // `checked_from_decimal` disagree about the same value — the one thing this
+        // pair is documented to never do. `"."` and a bare sign are still errors,
+        // because the fractional part must then be non-empty.
+        let whole: i128 = if whole_str.is_empty() {
+            if frac_str.is_empty() {
+                return Err(err());
+            }
+            0
+        } else {
+            whole_str.parse().map_err(|_| err())?
+        };
 
         // Reject non-zero digits beyond P decimal places.
         if frac_str.len() > P as usize {
@@ -1636,6 +1659,43 @@ mod tests {
             Amount::<2>::parse("49.990").unwrap(),
             Amount::<2>::parse("49.99").unwrap()
         );
+    }
+
+    /// `parse` and `checked_from_decimal` are documented to agree on exactly what
+    /// is representable. `Decimal::from_str` accepts an omitted integer part, so a
+    /// `parse` that rejected `".5"` broke that agreement for the shape a CSV export
+    /// and a hand-typed price most often take.
+    #[test]
+    fn an_omitted_integer_part_is_zero_but_a_bare_separator_is_not_a_number() {
+        assert_eq!(
+            Amount::<5>::parse(".5").unwrap(),
+            Amount::<5>::parse("0.5").unwrap()
+        );
+        assert_eq!(
+            Amount::<5>::parse("-.5").unwrap(),
+            Amount::<5>::parse("-0.5").unwrap()
+        );
+        assert_eq!(
+            Amount::<5>::parse("+.05").unwrap(),
+            Amount::<5>::parse("0.05").unwrap()
+        );
+        // The comma separator takes the same route.
+        assert_eq!(
+            Amount::<5>::parse(",5").unwrap(),
+            Amount::<5>::parse("0.5").unwrap()
+        );
+        // The `Decimal` path agrees, which is the point.
+        assert_eq!(
+            Amount::<5>::parse(".5").unwrap(),
+            Amount::<5>::checked_from_decimal(Decimal::from_str_exact(".5").unwrap()).unwrap()
+        );
+        // Excess precision is still refused, integer part or not.
+        assert!(Amount::<5>::parse(".123456").is_err());
+
+        // Nothing on either side of the separator is not a number.
+        for bad in [".", "-.", "+.", ",", "-,"] {
+            assert!(Amount::<5>::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

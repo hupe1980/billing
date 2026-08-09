@@ -10,14 +10,14 @@ weight = 130
 |---|---|
 | No `f64` in monetary arithmetic | `Amount<P>` is `i64 × 10⁻ᴾ`; every intermediate uses `rust_decimal` |
 | Encapsulated representation | the inner `i64` is private; `to_raw()` reads it and `from_raw_units()` reconstructs — both explicit, neither implicit |
-| Overflow is visible, never silent | infallible ops **panic**; every `checked_*` returns `Err` and never panics, including on `Decimal`'s own panicking operators |
-| Rounding is always explicit | `RoundingStrategy` is a required parameter; there is no implicit `round()` anywhere |
+| Overflow is visible, never silent | infallible ops **panic**; every `checked_*` returns `Err` and never panics, including on `Decimal`'s own panicking operators. `UsageAggregator::aggregate` is fallible too — raw usage events are the least trusted input there is |
+| Rounding is explicit wherever it is observable | `RoundingStrategy` is a required parameter on every reduction. The one default — `quantity × price` at the engine's five decimals — cannot change an emitted digit, because `AmountScale` rounds each line once from the *exact* product instead |
 | No silent precision loss | `parse` and `checked_from_decimal` refuse excess precision identically; `from_decimal_rounded` is the opt-in |
 | Precision is bounded at compile time | `Amount<19>` fails to compile, with an explanatory const-eval message |
 | A gross price is split, never multiplied | `extract_tax` applies `r/(1+r)`; `net_of_tax` takes the remainder, so the pair reconstructs the quoted price exactly |
 | A conditional discount is not a discount | payment terms change no total and no breakdown |
 | A layer never reverses its own direction | both percentage layers refuse a negative rate **and** clamp a negative base |
-| Documents are self-validating | fourteen exact invariants, re-run on deserialisation |
+| Documents are self-validating | sixteen exact invariants, run by every constructor and again on deserialisation |
 | Allocation is exact | `Σ(parts) == total`, with per-document penny correction |
 | Money splits exactly | `distribute` / `allocate` / `proportional_split` never create or destroy a unit |
 | Value added tax is distinguishable from a charge | marked from the layer's own `breakdown()` return value, so it is total rather than heuristic |
@@ -26,6 +26,7 @@ weight = 130
 | The engine tag namespace is protected | caller labels that would collide with a reserved tag are rejected |
 | No silent under-billing | unknown band names, uncovered quantities and non-monotonic schedules are errors, not skips |
 | Zero domain assumptions | no jurisdiction constants, no default currency, no default cash increment |
+| A position's bucket is its EN 16931 group | `net_positions` is BG-25; the other two are BG-20 / BG-21. An invoice line carrying document level allowance detail is refused — the amount would land in BT-106 instead of BT-107 with every total still balancing |
 | No I/O, no async, no `unsafe` | `#![forbid(unsafe_code)]`; every `fn` is a pure `fn` |
 
 ## How correctness is actually checked

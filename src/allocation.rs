@@ -18,84 +18,82 @@ pub trait AllocationRule {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Scale `positions` by `share`, then apply a **penny correction** to the last
-/// item so that `Σ(result) == target` exactly.
+/// Split one amount across `shares` so the parts sum back to it **exactly**.
 ///
-/// Quantities are scaled alongside amounts (see [`LineItem::scaled`]) so each
-/// allocated line stays internally consistent.  The single corrected line may
-/// differ from `quantity × unit_price` by at most a few units of the last decimal
-/// place — that residue is inherent to exact-sum allocation and is why the
-/// correction is concentrated on one line rather than smeared across all of them.
-fn scale_with_target(
-    positions: &[LineItem],
-    share: Decimal,
-    target: Amount<5>,
-) -> Result<Vec<LineItem>, BillingError> {
-    if positions.is_empty() {
-        return Ok(vec![]);
-    }
-    let mut items: Vec<LineItem> = positions
-        .iter()
-        .map(|p| p.scaled(share, RoundingStrategy::MidpointAwayFromZero))
-        .collect::<Result<Vec<_>, BillingError>>()?;
-    let sum = Amount::checked_sum(items.iter().map(|p| p.net_amount))?;
-    if sum != target {
-        let correction = target.checked_sub(sum)?;
-        if let Some(last) = items.last_mut() {
-            last.net_amount = last.net_amount.checked_add(correction)?;
-            // The correction can push a line across zero (a tiny credit becoming a
-            // small debit), which would leave `Sign::Credit` on a positive amount —
-            // a state `LineItem::validate` rejects.
-            last.normalize_sign();
-            // The corrected amount is no longer `base x percentage`, so the stated
-            // basis would be a claim PEPPOL-EN16931-R040 disproves. Drop it and keep
-            // the reason code; no basis is always valid.
-            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
-        }
-    }
-    Ok(items)
+/// This is the primitive the whole allocation is built on, and the reason it is
+/// per-*amount* rather than per-total is what makes EN 16931's **BR-S-08** survive
+/// the split — see [`ProportionalAllocation`].
+///
+/// [`proportional_split`] is defined on non-negative totals, so a credit is split
+/// by magnitude and negated afterwards. Negating an exact partition of `|v|` is an
+/// exact partition of `v`, so the guarantee is unaffected by sign.
+fn split_amount(value: Amount<5>, shares: &[Decimal]) -> Result<Vec<Amount<5>>, BillingError> {
+    let negative = value.is_negative();
+    let magnitude = value.checked_abs()?;
+    proportional_split(magnitude.into_decimal(), shares, 5)?
+        .into_iter()
+        .map(|part| {
+            // `proportional_split` at scale 5 returns at most five decimals, so this
+            // conversion is exact and cannot round — see its own documentation.
+            let amount = Amount::<5>::checked_from_decimal(part)?;
+            if negative {
+                amount.checked_neg()
+            } else {
+                Ok(amount)
+            }
+        })
+        .collect()
 }
 
-/// Scale `net_positions` and `discount_positions` together, applying the penny
-/// correction to the combined `net_total` (since both contribute to `net_total`).
+/// Split every position across the recipients, returning `[recipient][position]`.
 ///
-/// The correction is applied to the last discount item if present, otherwise to
-/// the last net position.
-fn scale_combined_net(
-    net_positions: &[LineItem],
-    discount_positions: &[LineItem],
-    share: Decimal,
-    target_net_total: Amount<5>,
-) -> Result<(Vec<LineItem>, Vec<LineItem>), BillingError> {
-    let mut scaled_net: Vec<LineItem> = net_positions
-        .iter()
-        .map(|p| p.scaled(share, RoundingStrategy::MidpointAwayFromZero))
-        .collect::<Result<Vec<_>, BillingError>>()?;
-    let mut scaled_disc: Vec<LineItem> = discount_positions
-        .iter()
-        .map(|p| p.scaled(share, RoundingStrategy::MidpointAwayFromZero))
-        .collect::<Result<Vec<_>, BillingError>>()?;
-
-    // Penny correction: ensure Σ(net) + Σ(discounts) == target_net_total.
-    let combined_sum =
-        Amount::checked_sum(scaled_net.iter().chain(&scaled_disc).map(|p| p.net_amount))?;
-    if combined_sum != target_net_total {
-        let correction = target_net_total.checked_sub(combined_sum)?;
-        // Prefer correcting the last discount item (credits are typically smaller).
-        // `normalize_sign` guards the case where the correction pushes the line
-        // across zero — see `scale_with_target`.
-        if let Some(last) = scaled_disc.last_mut() {
-            last.net_amount = last.net_amount.checked_add(correction)?;
-            last.normalize_sign();
-            // See `scale_with_target`: the basis no longer reproduces the amount.
-            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
-        } else if let Some(last) = scaled_net.last_mut() {
-            last.net_amount = last.net_amount.checked_add(correction)?;
-            last.normalize_sign();
-            last.allowance_charge = last.allowance_charge.take().map(|a| a.without_basis());
+/// Each position is split **exactly** with [`split_amount`], so
+/// `Σ(recipients) == the original position` holds line by line rather than only in
+/// aggregate. Every total is then derived by summing a recipient's own positions,
+/// which is what makes both the cross-recipient sums and BR-S-08 exact at once.
+///
+/// The structural parts — quantity, BG-27 / BG-28 line allowances, and the
+/// BT-93 / BT-100 basis — are scaled by the share via [`LineItem::scaled`], and
+/// only the amount comes from the exact split. They can therefore differ from
+/// `share × amount` by at most one unit in the last place (10⁻⁵), which is three
+/// orders of magnitude inside the ±0.02 that `PEPPOL-EN16931-R040` and
+/// `PEPPOL-EN16931-R120` allow.
+fn split_positions(
+    positions: &[LineItem],
+    shares: &[Decimal],
+) -> Result<Vec<Vec<LineItem>>, BillingError> {
+    let mut out: Vec<Vec<LineItem>> = vec![Vec::with_capacity(positions.len()); shares.len()];
+    for position in positions {
+        let parts = split_amount(position.net_amount, shares)?;
+        for (recipient, amount) in parts.into_iter().enumerate() {
+            let mut item =
+                position.scaled(shares[recipient], RoundingStrategy::MidpointAwayFromZero)?;
+            item.net_amount = amount;
+            // The split can push a line across zero (a tiny credit becoming a small
+            // debit), which would leave `Sign::Credit` on a positive amount — a
+            // state `LineItem::validate` rejects.
+            item.normalize_sign();
+            out[recipient].push(item);
         }
     }
-    Ok((scaled_net, scaled_disc))
+    Ok(out)
+}
+
+/// The sum of the positions attributed to `key`, over the buckets **BR-S-08**
+/// names: invoice lines, document level charges and document level allowances.
+///
+/// Positions tagged [`crate::tags::VAT`] are excluded — they *are* the BG-23 the
+/// identity is checked against.
+fn attributed_sum(
+    doc: &BillingDocument,
+    key: &(crate::TaxCategory, Decimal),
+) -> Result<Amount<5>, BillingError> {
+    Amount::checked_sum(
+        doc.all_positions()
+            .filter(|p| !p.has_tag(crate::tags::VAT))
+            .filter(|p| p.vat.is_some_and(|v| v.group_key() == *key))
+            .map(|p| p.net_amount),
+    )
 }
 
 // ── ProportionalAllocation ────────────────────────────────────────────────────
@@ -104,19 +102,47 @@ fn scale_combined_net(
 ///
 /// `shares` must sum to `1.0 ± 1e-9`.
 ///
-/// ## Arithmetic correctness guarantees
+/// ## Correctness guarantees
 ///
 /// 1. `Σ(net_total)   == original.net_total`   — exact, no drift.
 /// 2. `Σ(tax_total)   == original.tax_total`   — exact.
 /// 3. `Σ(gross_total) == original.gross_total` — exact.
 /// 4. Each recipient's [`BillingDocument::assert_valid`] passes.
+/// 5. Each recipient's
+///    [`verify_vat_attribution`](BillingDocument::verify_vat_attribution) passes —
+///    EN 16931 **BR-S-08** — whenever the document being split satisfied it.
 ///
-/// (1) and (2) hold because the **last recipient receives the arithmetic
-/// remainder** (`total − Σ(others)`).  (3) follows because each document's
-/// `gross_total` is *derived* as `net + tax` rather than rounded independently —
-/// rounding all three separately breaks `net + tax == gross` for shares that do
-/// not divide evenly.  (4) holds because a **penny correction** is applied to the
-/// last item of each section so that `Σ(positions) == section_total`.
+/// All five rest on one decision: **every position is split exactly**, so
+/// `Σ(recipients) == the original position` holds line by line rather than only in
+/// aggregate. Every total is then a sum of that recipient's own
+/// positions, which gives (1)–(3) immediately; (3) additionally *derives* gross as
+/// `net + tax` rather than rounding it, because rounding all three separately
+/// breaks `net + tax == gross` for shares that do not divide evenly. Each VAT
+/// group's taxable base is read off the very positions BR-S-08 checks it against,
+/// which gives (5).
+///
+/// ## Why not split the totals and correct the positions?
+///
+/// That is the obvious construction — scale each position by the share, then apply
+/// one penny correction per recipient so the positions sum to a separately-computed
+/// total — and it was used until 0.13.0. It keeps (1)–(4) and quietly breaks (5):
+/// the VAT breakdown is split per `(category, rate)` group while the positions are
+/// corrected in aggregate, so a group's BT-116 and the positions attributed to it
+/// land a minor unit apart. On a two-rate document that happened for roughly **45 %**
+/// of recipients — each document internally exact, each one rejected by a validator.
+///
+/// The one case that cannot be fixed is the one that was already broken: where the
+/// *source* document does not satisfy BR-S-08 for a group — because it carries a
+/// breakdown with no attributed positions behind it — the group's base falls back to
+/// a proportional split, and the share is no worse than what it came from.
+///
+/// ## What is not preserved
+///
+/// [`crate::AmountScale`] **cannot** survive a split: `100.00` three ways is
+/// `33.333…`, and there is no two-decimal answer. Allocation keeps the sum exact at
+/// the cost of precision, which is the right trade for money — but an allocated
+/// document must be re-assembled at invoice precision before it is billed onward.
+/// [`BillingDocument::fits_amount_scale`] is how you find out.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "ProportionalAllocationRepr"))]
 #[derive(Debug, Clone)]
@@ -238,116 +264,123 @@ impl AllocationRule for ProportionalAllocation {
             });
         }
         let n = self.shares.len();
+        let shares = &self.shares[..];
         let mut docs = Vec::with_capacity(n);
 
-        let mut net_remaining = doc.net_total();
-        let mut tax_remaining = doc.tax_total();
-        // Prepaid (BT-113) and rounding (BT-114) must be split too. Dropping them
-        // would re-bill money the customer has already handed over: the recipients'
-        // amounts due would sum to the gross rather than to the original amount due.
-        let mut prepaid_remaining = doc.prepaid();
-        let mut rounding_remaining = doc.rounding();
-        // BT-111 is a VAT total and splits exactly as BT-110 does. Dropping it
-        // would leave every recipient's document naming a VAT accounting currency
-        // with nothing in it — or, worse, silently omitting a figure BR-53 makes
-        // mandatory once BT-6 is present.
-        let mut accounting_remaining = doc.vat_accounting_currency().map(|a| a.vat_total());
-        // The VAT breakdown must be split alongside the totals: an allocated
-        // document without its per-rate breakdown is not a lawful invoice. Each
-        // entry is tracked separately so the last recipient absorbs the remainder
-        // of each group, keeping Σ(recipient bases) and Σ(recipient tax) exact.
-        let mut breakdown_remaining: Vec<(Amount<5>, Amount<5>)> = doc
+        // Every position is split EXACTLY, line by line, before any total exists.
+        //
+        // The previous construction scaled each position by the share and then
+        // applied one penny correction per recipient to hit a separately-computed
+        // `net_total`. That kept the cross-recipient sums exact and broke EN 16931
+        // **BR-S-08**: the VAT breakdown was split per group while the positions
+        // were corrected in aggregate, so a group's BT-116 and the positions
+        // attributed to it could land a minor unit apart. On a two-rate document
+        // that happened for roughly 45 % of recipients.
+        //
+        // Splitting each position exactly removes the aggregate correction
+        // entirely: every total below is now a *sum of that recipient's own
+        // positions*, so `Σ(recipients) == the original` follows from
+        // `Σ(recipients) == the original` holding for each position, and each
+        // group's taxable base can be derived from the very positions BR-S-08
+        // checks it against.
+        let net_parts = split_positions(doc.net_positions(), shares)?;
+        let discount_parts = split_positions(doc.discount_positions(), shares)?;
+        let tax_parts = split_positions(doc.tax_positions(), shares)?;
+
+        // The settlement scalars are not positions, so they are split with the same
+        // primitive directly. Dropping them would re-bill money the customer has
+        // already handed over, and BT-111 is mandatory once BT-6 is present (BR-53).
+        let prepaid_parts = split_amount(doc.prepaid(), shares)?;
+        let rounding_parts = split_amount(doc.rounding(), shares)?;
+        let accounting_parts = match doc.vat_accounting_currency() {
+            None => None,
+            Some(acct) => Some(split_amount(acct.vat_total(), shares)?),
+        };
+
+        // For each VAT breakdown group, decide once whether its base can be
+        // *derived* from the split positions — which is what makes BR-S-08 exact —
+        // or must fall back to splitting the stored figure.
+        //
+        // Deriving is only sound where the source document already satisfies
+        // BR-S-08 for that group. Where it does not — a document assembled without
+        // VAT attribution, or one whose breakdown was set by hand — deriving would
+        // silently rewrite the base to zero. The fallback keeps the old behaviour,
+        // which is exactly as good as the input deserved: an allocated share now
+        // satisfies `verify_vat_attribution` **iff the document it came from did**.
+        let derivable: Vec<bool> = doc
             .tax_breakdown()
             .iter()
-            .map(|e| (e.taxable_base, e.tax_amount))
-            .collect();
+            .map(|e| Ok(attributed_sum(doc, &e.group_key())? == e.taxable_base))
+            .collect::<Result<Vec<_>, BillingError>>()?;
+        let mut base_remaining: Vec<Amount<5>> =
+            doc.tax_breakdown().iter().map(|e| e.taxable_base).collect();
+        // The tax amounts keep the group-wise split: BR-CO-14 (`BT-110 = Σ BT-117`)
+        // holds under it, and re-deriving them from positions is not possible —
+        // a VAT position carries no link back to the group it belongs to.
+        let tax_parts_by_group: Vec<Vec<Amount<5>>> = doc
+            .tax_breakdown()
+            .iter()
+            .map(|e| split_amount(e.tax_amount, shares))
+            .collect::<Result<Vec<_>, BillingError>>()?;
 
         for (i, share) in self.shares.iter().enumerate() {
             let is_last = i == n - 1;
+            let net_positions = net_parts[i].clone();
+            let discount_positions = discount_parts[i].clone();
+            let tax_positions = tax_parts[i].clone();
 
-            let (net_total, tax_total) = if is_last {
-                (net_remaining, tax_remaining)
-            } else {
-                let net = doc.net_total().checked_mul_qty(*share)?;
-                let tax = doc.tax_total().checked_mul_qty(*share)?;
-                net_remaining = net_remaining.checked_sub(net)?;
-                tax_remaining = tax_remaining.checked_sub(tax)?;
-                (net, tax)
-            };
+            // Every total is a sum of this recipient's own positions.
+            let net_total = Amount::checked_sum(
+                net_positions
+                    .iter()
+                    .chain(&discount_positions)
+                    .map(|p| p.net_amount),
+            )?;
+            let tax_total = Amount::checked_sum(tax_positions.iter().map(|p| p.net_amount))?;
+            // `gross` is DERIVED, never rounded independently: rounding net, tax and
+            // gross separately breaks `net + tax == gross` whenever the share does
+            // not divide evenly, because `round(n·s) + round(t·s) != round((n+t)·s)`.
+            let gross_total = net_total.checked_add(tax_total)?;
 
-            let (prepaid, rounding) = if is_last {
-                (prepaid_remaining, rounding_remaining)
-            } else {
-                let p = doc.prepaid().checked_mul_qty(*share)?;
-                let r = doc.rounding().checked_mul_qty(*share)?;
-                prepaid_remaining = prepaid_remaining.checked_sub(p)?;
-                rounding_remaining = rounding_remaining.checked_sub(r)?;
-                (p, r)
-            };
+            let prepaid = prepaid_parts[i];
+            let rounding = rounding_parts[i];
+            let vat_accounting_currency = doc.vat_accounting_currency().map(|acct| {
+                acct.with_vat_total(accounting_parts.as_ref().expect("set together")[i])
+            });
 
-            let vat_accounting_currency = match doc.vat_accounting_currency() {
-                None => None,
-                Some(acct) => {
-                    let part = if is_last {
-                        accounting_remaining.unwrap_or(Amount::ZERO)
-                    } else {
-                        let p = acct.vat_total().checked_mul_qty(*share)?;
-                        if let Some(rem) = accounting_remaining.as_mut() {
-                            *rem = rem.checked_sub(p)?;
-                        }
-                        p
-                    };
-                    Some(acct.with_vat_total(part))
-                }
-            };
-
-            // Split each VAT breakdown group the same way as the totals.
             let mut breakdown = Vec::with_capacity(doc.tax_breakdown().len());
-            for (i_entry, src) in doc.tax_breakdown().iter().enumerate() {
-                let (base, tax) = if is_last {
-                    breakdown_remaining[i_entry]
+            for (g, src) in doc.tax_breakdown().iter().enumerate() {
+                let key = src.group_key();
+                let taxable_base = if derivable[g] {
+                    // BR-S-08, by construction: the base *is* the sum of the
+                    // positions this recipient carries in the group.
+                    let derived = Amount::checked_sum(
+                        net_positions
+                            .iter()
+                            .chain(&discount_positions)
+                            .chain(&tax_positions)
+                            .filter(|p| !p.has_tag(crate::tags::VAT))
+                            .filter(|p| p.vat.is_some_and(|v| v.group_key() == key))
+                            .map(|p| p.net_amount),
+                    )?;
+                    base_remaining[g] = base_remaining[g].checked_sub(derived)?;
+                    derived
+                } else if is_last {
+                    base_remaining[g]
                 } else {
-                    let base = src.taxable_base.checked_mul_qty(*share)?;
-                    let tax = src.tax_amount.checked_mul_qty(*share)?;
-                    breakdown_remaining[i_entry].0 =
-                        breakdown_remaining[i_entry].0.checked_sub(base)?;
-                    breakdown_remaining[i_entry].1 =
-                        breakdown_remaining[i_entry].1.checked_sub(tax)?;
-                    (base, tax)
+                    let part = src.taxable_base.checked_mul_qty(*share)?;
+                    base_remaining[g] = base_remaining[g].checked_sub(part)?;
+                    part
                 };
                 breakdown.push(TaxBreakdownEntry {
                     category: src.category,
                     rate: src.rate,
-                    taxable_base: base,
-                    tax_amount: tax,
+                    taxable_base,
+                    tax_amount: tax_parts_by_group[g][i],
                     exemption_reason: src.exemption_reason.clone(),
                     exemption_reason_code: src.exemption_reason_code.clone(),
                 });
             }
-
-            // `gross` is DERIVED, never rounded independently.
-            //
-            // Rounding net, tax and gross separately breaks invariant 3
-            // (`net + tax == gross`) whenever the share does not divide evenly,
-            // because `round(n·s) + round(t·s) != round((n+t)·s)`. Splitting
-            // 100.00 + 19% MwSt three ways used to produce three documents that
-            // all failed `validate()` by one unit of the last decimal place.
-            //
-            // Deriving it keeps each document internally consistent, and the
-            // cross-document sum still holds exactly:
-            //   Σgross = Σnet + Σtax = doc.net_total + doc.tax_total = doc.gross_total
-            // (the last recipient absorbs the net and tax remainders).
-            let gross_total = net_total.checked_add(tax_total)?;
-
-            // Scale all three position sections with penny correction so each
-            // document passes assert_valid().
-            let (net_positions, discount_positions) = scale_combined_net(
-                doc.net_positions(),
-                doc.discount_positions(),
-                *share,
-                net_total,
-            )?;
-            let tax_positions = scale_with_target(doc.tax_positions(), *share, tax_total)?;
 
             docs.push(BillingDocument::from_raw(crate::document::DocumentParts {
                 // Clone the whole header and override only the invoice number, so
@@ -484,6 +517,36 @@ impl AllocationRule for EqualAllocation {
 /// - Any domain where a raw `Decimal` quantity must be split proportionally without drift.
 ///
 /// For monetary document splits, use [`ProportionalAllocation`] instead.
+///
+/// # Splitting a bare [`Amount`] by fractional shares
+///
+/// [`Amount::allocate`] takes **integer** ratios and [`Amount::distribute`] splits
+/// evenly, so neither covers fractional shares such as `[0.4, 0.35, 0.25]`. Compose
+/// this function at the amount's own precision, and the round trip is exact:
+///
+/// ```rust
+/// use billing::{Amount, proportional_split};
+/// use rust_decimal::dec;
+///
+/// let total = Amount::<5>::parse("100.00000")?;
+/// let parts: Vec<Amount<5>> =
+///     proportional_split(total.into_decimal(), &[dec!(0.4), dec!(0.35), dec!(0.25)], 5)?
+///         .into_iter()
+///         .map(Amount::<5>::checked_from_decimal)
+///         .collect::<Result<_, _>>()?;
+///
+/// assert_eq!(parts, [
+///     Amount::parse("40.00000")?, Amount::parse("35.00000")?, Amount::parse("25.00000")?,
+/// ]);
+/// assert_eq!(Amount::checked_sum(parts.into_iter())?, total);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// Passing `scale = 5` is what makes the conversion total: every part then carries at
+/// most five decimals, so [`Amount::checked_from_decimal`] — which *refuses* excess
+/// precision rather than rounding it — always succeeds, and the guarantee above
+/// (`Σ(parts) == total`) carries straight through it. A coarser `scale` is fine too;
+/// a finer one is not, and fails loudly rather than silently re-rounding.
 ///
 /// # Example
 ///

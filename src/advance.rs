@@ -217,6 +217,52 @@ impl DocumentKind {
         matches!(self, Self::CreditNote)
     }
 
+    /// Whether the buyer, not the seller, issued this document — **self-billing**.
+    ///
+    /// True for [`SelfBilledInvoice`](Self::SelfBilledInvoice) (`389`) alone.
+    ///
+    /// # Why a predicate rather than `== DocumentKind::SelfBilledInvoice`
+    ///
+    /// For the same reason [`is_credit_note`](Self::is_credit_note) is one: the
+    /// question is *semantic* and the code is its rendering, so a comparison against
+    /// `389` at a call site goes stale the moment the modelled set grows. UNTDID
+    /// 1001 has more than one self-billing code (`389` is the general one; `261`
+    /// *Self billed credit note* sits on the credit-note list), and this crate models
+    /// the subset both XRechnung and Peppol accept.
+    ///
+    /// # What it changes
+    ///
+    /// Self-billing is not a variation on an invoice — it is a **different Peppol
+    /// profile**, with its own `CustomizationID`. `PEPPOL-EN16931-P0100` does not
+    /// admit `389`, so emitting it under the Billing customization is *fatal*:
+    /// [`is_peppol_billing_code`](Self::is_peppol_billing_code) already reports that,
+    /// and this says *why*.
+    ///
+    /// It also changes who must carry which identifiers, and XRechnung's `BR-DE-17`
+    /// does list `389` among its recommended codes — so the two profiles disagree,
+    /// which is exactly why the crate answers the question and takes no position on
+    /// the consequence.
+    ///
+    /// ```rust
+    /// use billing::DocumentKind;
+    ///
+    /// assert!(DocumentKind::SelfBilledInvoice.is_self_billed());
+    /// assert!(!DocumentKind::CommercialInvoice.is_self_billed());
+    ///
+    /// // The one kind that is lawful EN 16931 and fatal under Peppol *Billing* is
+    /// // exactly the self-billed one.
+    /// let outside: Vec<_> = DocumentKind::ALL
+    ///     .into_iter()
+    ///     .filter(|k| !k.is_peppol_billing_code())
+    ///     .collect();
+    /// assert_eq!(outside, vec![DocumentKind::SelfBilledInvoice]);
+    /// assert!(outside.iter().all(DocumentKind::is_self_billed));
+    /// ```
+    #[must_use]
+    pub fn is_self_billed(&self) -> bool {
+        matches!(self, Self::SelfBilledInvoice)
+    }
+
     /// Whether Peppol BIS Billing 3.0 accepts this code — `PEPPOL-EN16931-P0100`
     /// (invoice) and `P0101` (credit note), both **fatal**.
     ///

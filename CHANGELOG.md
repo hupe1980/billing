@@ -26,8 +26,504 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.12.0"`) if you need to schedule migrations yourself;
-`"0.12"` will pick up `0.12.x` patch fixes only.
+Pin exactly (`billing = "=0.13.0"`) if you need to schedule migrations yourself;
+`"0.13"` will pick up `0.13.x` patch fixes only.
+
+## [0.13.0]
+
+Fourteen defects that the arithmetic could not see, and four things the engine could not
+say. Several of the last group came from an [`en16931`](https://github.com/hupe1980/en16931)
+adapter review; every claim in it was re-derived from the CEN, Peppol and KoSIT
+artefacts before it was acted on, and one of its own citations did not survive that
+(see `PartyIdentifier` on ICD `0293`).
+
+Every release so far has been checked by asking *"do the totals add up?"* — and every
+one of them did. This one came from asking a different question: **which fields does
+an EN 16931 rule make mandatory that no total depends on?** There turn out to be
+several, and the engine was getting them wrong on documents that balanced, validated,
+serialised and rendered without a murmur.
+
+- A shortfall produced by `minimum_charge` was an invoice line missing **BT-129,
+  BT-130 and BT-146** — three fatal rules, on a position the engine generated itself.
+- A document level allowance handed to `.positions(…)` was emitted as an invoice
+  line, putting its amount in **BT-106** instead of **BT-107** — every total still
+  correct, the decomposition a validator recomputes wrong.
+- `BillingDocumentBuilder::currency` wrote into the header, so a later `.meta(…)`
+  discarded it and the document carried `XXX`. Nothing failed; the currency was just
+  wrong on every line.
+- `Currency::new` accepted any three ASCII letters, and there was no way to ask
+  whether the result was a code EN 16931 admits. `BR-CL-04` is fatal and is checked
+  at an access point, not at a boundary the caller controls.
+- A `PricingModel` knew which format it priced for and had nowhere to say so, so
+  `bill()` and `settle()` could only ever assemble at five decimals — the shortest
+  path from a model to a document produced one that fails `BR-DEC-23`.
+- `from_positions` promised a document that "satisfies every invariant by
+  construction" and never ran `validate()`, so two ordinary tax layers were enough to
+  get back a document that failed its own `assert_valid()`.
+- `UsageAggregator::aggregate` returned a bare `Decimal` at the point where raw usage
+  events enter the system, and `Decimal`'s `+` and `*` panic on overflow. One corrupt
+  record took down the batch run.
+- **BR-B-02** was documented as "jurisdictional … stays with the caller" alongside
+  BR-B-01. Only BR-B-01 is: the other is decidable from the categories on the
+  document, exactly like BR-O-11, which the engine has always checked.
+- **BT-107** was the only member of the totals chain with no accessor of its own —
+  reachable only as `discount_total()`, which carries the opposite sign to the one
+  every syntax emits.
+- `PaymentTerms::Display` rendered **BT-20** without the newline `BR-DE-18` requires,
+  so every German invoice offering Skonto was rejected — and the module's own
+  documentation claimed the opposite.
+- `ProportionalAllocation` broke **BR-S-08** for 45 % of recipients on a two-rate
+  document, while every total remained exact.
+- `Period::is_ordered()` existed, was correct, and was called by nothing — while
+  **BR-29**, **BR-30**, `PEPPOL-EN16931-R110` and `R111` all turn on it.
+
+As in 0.12.0, every rule cited here was re-derived from the pinned CEN and Peppol
+Schematron (`ConnectingEurope/eInvoicing-EN16931` @ `validation-1.3.16`,
+`OpenPEPPOL/peppol-bis-invoice-3` @ `master`) rather than from recollection. Two
+findings were dropped in the process: a proposed "rate rounds to zero" branch of
+`BR-CO-17` was implemented only for a rate of *exactly* zero, because the
+Schematron's `round(BT-119)` — read literally — also rejects a lawful 0.4 % supply,
+and this crate does not refuse arithmetically correct documents to imitate an
+artefact quirk.
+
+### Fixed — **BR-DE-18**: BT-20 was rendered in a form KoSIT rejects
+
+`PaymentTerms: Display` omitted the newline that must follow the last `#SKONTO#…#`
+segment, so **every XRechnung carrying an early-payment discount was rejected** —
+`flag="fatal"`.
+
+The rule is two assertions folded into one `satisfies`, and the second is easy to
+read past because it is not a separate `<assert>`. Verbatim from
+`itplr-kosit/xrechnung-schematron` @ `master`,
+`src/validation/schematron/ubl/XRechnung-UBL-validation.sch`:
+
+```xpath
+every $line in cac:PaymentTerms/cbc:Note[1]/tokenize(., '(\r?\n)')
+                 [starts-with(normalize-space(.), '#')]
+  satisfies matches(normalize-space($line), $XR-SKONTO-REGEX)
+        and matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
+```
+
+`#.+#` is greedy and `.` does not match a newline, so on an unterminated field
+`tokenize(., '#.+#')[last()]` is the empty string and the second `matches` is false.
+Confirmed three ways before the fix: the rule's own prose (*"Am Ende einer
+vollständigen Skontoangabe muss ein XML-konformer Zeilenumbruch folgen"*), a KoSIT
+fixture marked `schematron-invalid="xrcii:BR-DE-18"` and titled *"Every skonto entry
+should end with a newline"*, and by evaluating the expression above against a real
+XPath 2.0 engine for every shape this crate renders.
+
+The terminator lives in `Display` rather than in a separate `to_bt20_xrechnung()`
+because the `#SKONTO#…#` micro-syntax **is** the German CIUS convention — there is no
+core EN 16931 form of it — so a rendering without the terminator is valid nowhere at
+all. A prose-only BT-20 is unchanged: the `every … satisfies` is vacuously true when
+no line starts with `#`, so a newline there would be noise.
+
+`FromStr` already accepted the terminated form, so the round trip is unaffected.
+
+Two documentation claims went with it: `PaymentTerms` said `Display` renders the
+field *"exactly as it goes on the wire"*, and `EarlyPaymentDiscount::from_str` said
+*"a validator enforcing BR-DE-18 will reject what this refuses"* — true of what
+`from_str` refuses, and not of what `Display` emitted.
+
+*Reported against 0.12.0 from the [`en16931`](https://github.com/hupe1980/en16931)
+adapter, with the XPath already traced. Thank you.*
+
+### Fixed — allocation now preserves **BR-S-08**
+
+`ProportionalAllocation` scaled each position by the share and applied one penny
+correction per recipient to hit a separately-computed `net_total`, while splitting
+the VAT breakdown per `(category, rate)` group. The two corrections were independent,
+so a group's BT-116 and the positions attributed to it landed a minor unit apart.
+
+Measured before the change, over 13 424 recipient documents from two-rate sources:
+**6 087 — 45 % — failed `verify_vat_attribution`**, every one of them on the taxable
+base and none on BR-CO-14. Each document was internally exact and passed
+`validate()`; each would have been rejected by a validator. After the change, 0 of
+24 634.
+
+The fix is to split **every position exactly** — `Σ(recipients) == the original
+position`, line by line — and derive every total by summing a recipient's own
+positions. Each group's taxable base is then read off the very positions BR-S-08
+checks it against. Where the *source* document does not satisfy BR-S-08 for a group
+(a breakdown with no attributed positions behind it), that group falls back to a
+proportional split, so an allocated share is never worse than what it came from:
+
+> **An allocated share satisfies `verify_vat_attribution` whenever the document it
+> came from did.**
+
+The review asked for an `is_allocated_share()` predicate so a consumer could
+*suppress* the check. That is the wrong shape — a flag saying "this document is
+known to fail a fatal rule" institutionalises the defect and pushes the decision onto
+a caller three layers from the split, who cannot know. Fixing the split removes the
+question instead, and the escape hatch it was meant to justify can be deleted rather
+than automated.
+
+`AmountScale` still does not survive allocation and cannot: `100.00` three ways is
+`33.333…`.
+
+### Added — `Note` (**BG-1**) and `PartyIdentifier` (**BT-29 / BT-46**)
+
+Two `DocumentMeta` fields could not express the terms they stood for.
+
+`notes` was `Option<String>`: one note, uncoded. BG-1 INVOICE NOTE is `0..n`, and each
+occurrence carries **BT-21** (note subject code) beside **BT-22** (the text) —
+`BR-CL-08`, *fatal*: *"Invoiced note subject code shall be coded using UNCL4451"*. A
+note's purpose is not inferable from its wording, and downstream systems route on the
+code. Multiplicity is real too: `PEPPOL-EN16931-R002` caps document-level notes at
+one *unless both parties are German*, which only makes sense if more than one is
+otherwise lawful.
+
+`issuer_id` / `recipient_id` were `Option<String>` described as "MP-ID, GLN, BDEW
+code, or free-form". EN 16931 types BT-29 and BT-46 as `Identifier`s with an optional
+scheme, and `BR-CL-10` — *fatal* — restricts that scheme to the ISO 6523 ICD list. A
+bare string cannot say which registry an identifier belongs to, and a consumer that
+guesses produces an invoice that validates while identifying the wrong one.
+
+```rust
+notes: vec!["Lieferung ab Werk.".into(), Note::coded("AAI", "Es gelten unsere AGB.")],
+issuer_id: Some(PartyIdentifier::scheme("0088", "4012345000009")),  // a GLN, said so
+recipient_id: Some(PartyIdentifier::new("KND-4711")),               // no registry
+```
+
+Neither code list is embedded, for the same reason UNCL 5189, UNCL 7161, VATEX and
+UN/ECE Rec 20 are not. **One trap is worth naming**, because the review fell into it:
+the ICD list in `validation-1.3.16` runs `0002` … `0248`, and `0293` — commonly cited
+for BDEW — **is not in it**. An identifier assigned an ICD after that revision fails
+`BR-CL-10` even though it looks perfectly well formed. Check the scheme against the
+artefact your target profile actually runs. The rule admits exactly one non-numeric
+value, `SEPA`, and only under `cac:AccountingSupplierParty` or `cac:PayeeParty`.
+
+### Changed — breaking — the period rules are now checked
+
+`Period::is_ordered()` shipped in 0.12.0 and was called by **nothing but its own
+tests**. Four fatal rules turn on exactly the comparison it performs:
+
+| Rule | Requires |
+|---|---|
+| **BR-29** | BT-74 ≥ BT-73 — the invoicing period is ordered |
+| **BR-30** | BT-135 ≥ BT-134 — a line period is ordered |
+| `PEPPOL-EN16931-R110` | line period **start** ≥ invoice period start |
+| `PEPPOL-EN16931-R111` | line period **end** ≤ invoice period end |
+
+All four are properties of dates the engine already holds, so they are checked rather
+than deferred — the same argument that puts BR-B-02 and BR-O-11 inside `validate()`.
+BR-30 is enforced by `LineItemBuilder::build` and `LineItem::validate`; BR-29 and the
+two Peppol containment rules are check 15 of `BillingDocument::validate`. `Period`
+gains `within()` and `validate()`.
+
+The crate stays date-**type**-agnostic. The comparison only runs where every endpoint
+is a zero-padded ISO 8601 date — the one shape a lexicographic compare orders the way
+a calendar does — and says nothing at all otherwise, exactly as `is_ordered` already
+did. A confident `false` on `"1.6.2026"` would be worse than no answer.
+
+### Changed — `RateLookup::rate_for` refuses a negative parameter
+
+Every bound in a lookup table is positive, so a negative parameter was below all of
+them and the `<=` search returned the **lowest** band — the *cheapest* rate — for
+what is a data error: an installed capacity or a peak demand cannot be less than
+nothing. `RateSchedule::split` and `RateSchedule::apply_peak` have always refused it;
+the three rate tables now agree, and "no silent under-billing" holds across all of
+them rather than two.
+
+### Added — `DocumentKind::is_self_billed`
+
+Joins `is_credit_note` and `is_peppol_billing_code`: the semantics as a predicate,
+with the code as its rendering. Self-billing is a different Peppol *profile* with its
+own `CustomizationID`, not a variant invoice — which is why `389` is absent from
+`PEPPOL-EN16931-P0100` while XRechnung's `BR-DE-17` lists it. Comparing against `389`
+at a call site goes stale; UNTDID 1001 has more than one self-billing code.
+
+### Fixed — the primary constructor did not run its own validator
+
+`BillingDocument`'s type documentation promised that a document from
+`from_positions` *"satisfies every invariant by construction"*. Computing the totals
+makes checks 1–4 true and nothing else. Checks 12, 13 and 14 — **BR-CO-18**,
+**BR-O-11** and **BR-B-02** — are properties of the *VAT breakdown*, and an ordinary
+pair of tagged tax layers reaches them:
+
+```rust
+// Both layers are individually lawful. The document was not, and was returned anyway.
+.extra_tax(FixedRateTax::exempt("Nicht steuerbar", TaxCategory::OutOfScope, "…")?
+    .with_tag("outside").boxed())
+.extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.with_tag("taxed").boxed())
+```
+
+`from_positions` handed that back happily, and `assert_valid()` on the result
+panicked. `merge_period_documents` and `AllocationRule` have re-checked their outputs
+since 0.11.0 for exactly this reason; the constructor now does too, so the promise is
+true and the failure arrives where the mistake is.
+
+The extra pass is one traversal of a document that was just assembled. Nothing in the
+existing suite relied on getting an invalid document back — the whole thing stayed
+green when the check was added.
+
+### Changed — breaking — an invoice line may not carry BG-20 / BG-21 detail
+
+The bucket a position sits in decides which EN 16931 group it is emitted as:
+`net_positions` becomes an invoice line (**BG-25**), `discount_positions` and
+`tax_positions` become document level allowances and charges (**BG-20** / **BG-21**).
+`LineItem::allowance_charge` *is* the BG-20 / BG-21 detail — its own documentation
+says it is `None` on an ordinary invoice line — so a position carrying one and handed
+to `.positions(…)` claims to be both, which no syntax can express.
+
+Nothing noticed, because nothing in the totals could: the amount landed in BT-106
+instead of BT-107 / BT-108, so BT-109 still came out right and only the
+*decomposition* a validator recomputes — BR-CO-10, BR-CO-11, BR-CO-12 — was wrong.
+This is the document level twin of the BG-20-plus-BG-27 nesting `LineItem::validate`
+has always refused.
+
+Check 11 now covers it. Supply a document level allowance as a `DiscountLayer`
+(`FixedDiscount`, `PercentageDiscount`) and a charge as a `TaxLayer`
+(`PercentageCharge`, `PerUnitLevy`), which is what puts them in the right bucket.
+
+### Added — `BillingDocument::allowance_total`, EN 16931 **BT-107**
+
+BT-107 was the only member of the totals chain with no accessor under its own name.
+BT-106, BT-108, BT-109, BT-110, BT-112, BT-113, BT-114 and BT-115 all had one; the
+sum of document level allowances was reachable only as `discount_total()`, which is
+the same figure with the **opposite sign**.
+
+That sign is not cosmetic. `cbc:AllowanceTotalAmount` is unsigned in UBL and in CII,
+because **BR-CO-11** defines BT-107 as a magnitude and **BR-CO-13** *subtracts* it.
+This engine stores allowances as negative amounts so its totals stay plain sums, so a
+consumer had to remember to negate — and an invoice stating `-20.00` where BR-CO-13
+expects `20.00` fails by **twice** the allowance, with nothing in the document to show
+it.
+
+`allowance_total()` is that negation, done once, under the term's own name. The chain
+now reads BT-106 … BT-115 with no gap and no sign conversion left to the caller.
+
+### Changed — breaking — `BR-B-02` is now checked
+
+`TaxCategory::SplitPayment` described both of its rules as *"jurisdictional rather
+than arithmetic, and stay with the caller"*. Only one of them is:
+
+| Rule | Needs | Verdict |
+|---|---|---|
+| **BR-B-01** — shall be a domestic Italian invoice | the parties' countries | genuinely out of scope; this crate never sees them |
+| **BR-B-02** — `B` shall not appear alongside `S` | the categories present | **the engine owns this entirely** |
+
+BR-B-02 is structurally identical to **BR-O-11**, which `validate()` has always
+checked — including the crate's own justification for checking it: *"because
+`merge_period_documents` can otherwise manufacture the combination out of two
+individually lawful documents."* That argument applies verbatim, and merging an
+Italian split-payment document with a standard-rated one is exactly how you get there.
+
+It is now check 14 (breakdown level, in `validate`) and a matching clause in
+`verify_vat_attribution` (position level), mirroring how BR-O-11 and BR-O-12/13/14
+divide — the rule's Schematron reads BT-151, BT-95 and BT-102 as well as BT-118, so a
+document whose breakdown carries only `B` can still violate it through an attributed
+line.
+
+`validate()` therefore now documents and runs **fifteen** invariants, in the order it
+lists them.
+
+### Changed — breaking — `UsageAggregator::aggregate` returns `Result`
+
+```rust
+fn aggregate(&self, events: &[E]) -> Decimal;                      // before
+fn aggregate(&self, events: &[E]) -> Result<Decimal, BillingError>; // after
+```
+
+This trait sits at the **least trusted boundary in the pipeline**: raw usage events,
+straight from a meter, a log or an API. `Decimal`'s `+`, `*` and `Sum` *panic* on
+overflow rather than saturating, so `SumAggregator` and `WeightedSumAggregator` over a
+slice containing one corrupt magnitude aborted the process — a batch run dying on a
+single malformed record, which is the failure mode section 1 of
+`tests/audit_regressions.rs` exists to prevent and that every `checked_*` method in
+this crate was written to remove. `Amount::checked_sum` says so in as many words:
+*"prefer this over `.sum()` in any code path that could receive attacker-controlled or
+unbounded values."* Usage events **are** that path, and it was the one place with no
+error channel to report on.
+
+`WeightedSumAggregator` is the likelier of the two, because it multiplies before it
+accumulates: a duration handed over in seconds rather than as a fraction is a factor
+of ~2.6 million.
+
+Four of the six built-ins — `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST` — select or count
+rather than accumulate and can never fail. They return `Result` anyway: a caller
+writing code generic over `UsageAggregator` needs one signature, and an implementation
+that later *starts* accumulating should not become a breaking change for its callers.
+
+Migration is `?` or `.unwrap()` at each call site; nothing else changes.
+
+### Changed — breaking
+
+| Old | New |
+|---|---|
+| `minimum_charge(&doc, minimum, description)` | `minimum_charge(&doc, minimum, description, currency)` |
+
+`minimum_charge` built its shortfall with `LineItem::fixed`, which states BT-131 and
+nothing else. A shortfall is an ordinary invoice line (BG-25), so **BR-22** (BT-129
+invoiced quantity), **BR-23** (BT-130 unit code) and **BR-26** (BT-146 item net price)
+all apply to it — three *fatal* rules, none of which changes an amount, which is
+exactly why no total ever noticed.
+
+It now builds through `LineItem::flat_fee`: one unit of `UNIT_CODE_ONE` (`C62`) at a
+price equal to the whole shortfall. `1 × shortfall` is exactly `shortfall`, so
+`PEPPOL-EN16931-R120` holds trivially and nothing is rounded that was not rounded
+before. `RateSchedule::apply_peak` was moved to the same construction in 0.11.0;
+`minimum_charge` was the one generated line left behind.
+
+The currency is an argument because the generated BT-146 label is `"EUR"` / `"CHF"` /
+…, and a generated label cannot invent the currency. Pass `Currency::XXX` where it
+genuinely does not matter — it renders as `XXX`, which reads as the bug it is.
+
+```rust
+// before
+minimum_charge(&doc, min, "Mindestentgelt")?
+// after
+minimum_charge(&doc, min, "Mindestentgelt", Currency::EUR)?
+```
+
+### Fixed — ⚠️ silent — `BillingDocumentBuilder::currency` is order-independent
+
+`.currency(EUR).meta(header)` produced a document denominated in `XXX`. The setter
+wrote straight into `meta`, and `.meta()` replaces the whole header, so the euro was
+discarded by a method-ordering accident: no error, no failing total, `validate()`
+green, and the wrong currency on every rendered line and every generated unit-price
+label. The previous release *documented* the hazard and pinned it with a test; a
+document that quietly claims "no currency involved" is not a hazard worth documenting.
+
+The builder now records the currency separately and applies it when the document is
+built, so both orders agree. An explicit `.currency()` still wins over
+`meta.currency`; a header currency with no explicit call still applies.
+
+**This will not fail your build.** If you relied on `.meta()` resetting an
+earlier `.currency()` — which no correct code does — the currency now survives.
+
+### Added — `Currency::is_iso4217`
+
+`Currency::new` accepts any three ASCII letters, and deliberately keeps doing so: this
+crate bills things that are not EN 16931 invoices, and a private clearing unit is a
+legitimate thing to denominate an internal document in. What it must not do is let
+such a code reach an *invoice* unremarked, because **BR-CL-03 / BR-CL-04 / BR-CL-05**
+are fatal and are enforced downstream.
+
+There are now two independent questions, and neither answers the other:
+
+```rust
+assert!(Currency::EUR.is_iso4217());
+assert!(!Currency::new("XBT")?.is_iso4217());  // well-formed, constructible, fatal
+assert!(Currency::XXX.is_iso4217());           // XXX *is* in the list …
+assert!(Currency::XXX.is_unset());             // … and still means "unconfigured"
+```
+
+The 178-code list is transcribed verbatim from the `contains(' AED AFN … ZWG ')` in
+BR-CL-03 of the pinned CEN artefact, not from ISO's registry in the abstract, so it
+answers the question a validator will actually ask. It also makes `minor_units`
+honest: the fall-back to `Some(2)` is now a documented default for codes
+`is_iso4217()` rejects, rather than an unmarked guess.
+
+This is the same split as `DocumentKind::is_peppol_billing_code`: model the value,
+expose the profile question as a predicate the consumer asks before it emits.
+
+### Added — `PricingModel::amount_scale`
+
+A model knows which format its output is destined for; the call site often does not.
+`amount_scale` is where it says so, and `bill`, `try_bill`, `settle`, `try_settle`
+and `BillingDocumentBuilder::pricing` / `try_pricing` all honour it.
+
+```rust
+impl PricingModel for MeteredPlan {
+    // …
+    fn amount_scale(&self) -> Option<AmountScale> { Some(AmountScale::EN16931) }
+}
+
+let doc = MeteredPlan.settle(meta)?;
+assert!(doc.fits_amount_scale(2));   // emittable, straight out of `settle`
+```
+
+Precision reduction has to happen while a document is assembled — rounding a finished
+one breaks BR-CO-10 and BR-CO-15, which is the whole argument for `AmountScale`. So
+without this hook `bill` and `settle` could only produce five-decimal documents, and
+the shortest path from a model to a document was also the one that produced an
+unemittable invoice. An explicit `amount_scale` on the builder still wins, so a
+caller can override the model's choice.
+
+Default `None`, so existing implementations are unaffected.
+
+### Changed — `Amount::parse` accepts an omitted integer part
+
+`".5"`, `"-.5"` and `"+,05"` now parse as `0.5`, `-0.5` and `0.05`. A separator with
+nothing on either side (`"."`, `"-,"`) is still an error.
+
+`Amount::parse` and `Amount::checked_from_decimal` are documented to agree on exactly
+what is representable, and `Decimal::from_str` has always accepted this shape — so the
+same value was refused as text and accepted as a `Decimal`, for the form a CSV export
+and a hand-typed price most often take. `"5."` was already accepted; the two ends of
+the number now behave alike.
+
+### Changed — `TaxBreakdownEntry::validate` tightens BR-CO-17 at a zero rate
+
+The CEN Schematron for BR-CO-17 is two branches, and only the second was implemented.
+At a rate of zero the rule demands `round(BT-117) = 0` — i.e. `|BT-117| < 0.5`, not
+the `< 1.00` slack that applies elsewhere. The branch is reachable: `L`, `M` and `B`
+may carry a zero rate (BR-AF-05, BR-AG-05, and no BR-B-05 at all) while still levying
+tax in general, so `TaxCategory::carries_tax` does not force BT-117 to zero for them.
+
+Applied at a rate of **exactly** zero, not at "a percentage that rounds to zero".
+Read literally the Schematron's `round(BT-119)` also selects every rate below 0.5 %
+and would then demand no tax on a lawful 0.4 % supply; where the two readings differ,
+this crate declines to reject a document that is arithmetically correct.
+
+### Changed — `BillingDocument::validate` runs its checks in the documented order
+
+The fourteen invariants were listed 1 … 14 and executed 1, 2, 3, 5, 8, 9, 11, 10, 6,
+7, 4, 12, 13, 14. Same set, same result, and nothing to reconstruct when reading it.
+
+### Performance — `fits_amount_scale` no longer allocates on the happy path
+
+`amount_scale_violation` built a `Vec<(String, Amount<5>)>` naming *every* leaf —
+one `String` per position, per line allowance and per breakdown entry — before
+looking for a violation, and `fits_amount_scale` called it to answer a `bool`. The
+scan is now lazy: the label is formatted only for the amount that actually fails. On
+a thousand-line document that is roughly three thousand allocations saved per call,
+and it is called once per emit.
+
+Behaviour, including the order in which leaves are checked and therefore *which*
+violation is reported first, is unchanged.
+
+### Fixed — the doctests ran in nobody's CI
+
+`src/lib.rs` ends with `#![doc = include_str!("../README.md")]` specifically so that
+every Rust example in the README is compiled and run, and the README says so in a
+blockquote near the top. The mechanism worked; nothing was running it.
+
+`cargo test --all-targets` silently **excludes** doctests
+([rust-lang/cargo#6669](https://github.com/rust-lang/cargo/issues/6669)), and so
+does `--lib --tests`. Every one of the five test invocations in `.github/workflows/ci.yml`
+and both in the `justfile` used one of those two forms, so the level of the testing
+pyramid whose entire job is preventing documentation rot was enforced only by
+whoever happened to type `cargo test` by hand.
+
+Added: a `just test-doc` recipe (wired into `just ci`) and an explicit
+`cargo test --doc --all-features` step in the test matrix and the MSRV job. 168
+doctests, including the README as one unit, now run on stable, beta and 1.85.
+
+Worth checking in your own project: the flag gives no warning and the test count
+simply comes out lower.
+
+### Migration
+
+| Old | New | Why |
+|---|---|---|
+| BT-20 without a trailing newline | `PaymentTerms::to_string()` supplies it | ⚠️ silent — `BR-DE-18` is *fatal* and rejected every Skonto invoice |
+| `is_allocated_share()` to skip BR-S-08 | nothing — allocation preserves it | the escape hatch the review asked for is no longer needed |
+| `notes: Option<String>` | `notes: Vec<Note>` | BG-1 is `0..n` and each note carries BT-21 (`BR-CL-08`) |
+| `issuer_id: Option<String>` | `issuer_id: Option<PartyIdentifier>` | BT-29 / BT-46 need their ISO 6523 scheme (`BR-CL-10`) |
+| `kind == DocumentKind::SelfBilledInvoice` | `kind.is_self_billed()` | the code is the rendering, not the question |
+| a backwards or out-of-range `Period` | now returns `Err` | BR-29 / BR-30 / `R110` / `R111` are fatal and decidable for ISO 8601 dates |
+| `rate_for(negative)` returning the lowest band | now returns `Err` | ⚠️ silent — it was the *cheapest* rate, for a value that cannot exist |
+| `minimum_charge(&doc, min, desc)` | `minimum_charge(&doc, min, desc, currency)` | the shortfall is now a complete invoice line (BR-22 / BR-23 / BR-26) and its BT-146 label needs a currency |
+| `agg.aggregate(&events)` | `agg.aggregate(&events)?` | raw events are the least trusted input; overflow is reported instead of aborting the run |
+| `-doc.discount_total()` for BT-107 | `doc.allowance_total()?` | BT-107 is unsigned in every syntax; the negation is now done once, under the term's own name |
+| `.currency(c).meta(m)` losing `c` | `.currency(c).meta(m)` keeps `c` | ⚠️ silent — the setter is order-independent |
+| `Currency::new(x).is_ok()` as a BT-5 check | `Currency::new(x)?.is_iso4217()` | well-formedness is not membership; BR-CL-04 is fatal |
+| `builder.amount_scale(s).pricing(m, u)` | unchanged, or `PricingModel::amount_scale` on the model | the model can now declare it once instead of every call site |
+| a `B` document that also carried `S` | now refused at construction | BR-B-02 is decidable from the categories present, so it is checked rather than deferred |
+| `from_positions` returning an invalid document | now returns `Err` | the constructor runs `validate()`, so its documented promise is true |
+| a BG-20 allowance passed in `.positions(…)` | `.extra_discount(FixedDiscount::new(…)?.boxed())` | the bucket decides the EN 16931 group; an invoice line cannot also be a document level allowance |
 
 ## [0.12.0]
 

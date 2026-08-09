@@ -41,7 +41,8 @@ let terms = PaymentTerms::text("Zahlbar in 30 Tagen.")
 
 assert_eq!(
     terms.to_string(),
-    "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#",
+    // The trailing newline is the second half of BR-DE-18 — see below.
+    "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#\n",
 );
 assert_eq!(terms.to_string().parse::<PaymentTerms>()?, terms);
 

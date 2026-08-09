@@ -31,8 +31,25 @@ test *ARGS:
     cargo test {{ ARGS }}
 
 # Run tests with all features enabled.
+#
+# `--all-targets` does NOT include doctests — see `test-doc`, which is a separate
+# recipe for exactly that reason.
 test-all:
     RUSTFLAGS="-D warnings" cargo test --all-targets --all-features
+
+# Run the doctests — including the whole README.
+#
+# This needs its own recipe because `cargo test --all-targets` silently *excludes*
+# doctests (rust-lang/cargo#6669), and so does `--lib --tests`. Every test
+# invocation in this file and in `.github/workflows/ci.yml` used one of those two,
+# so until 0.13.0 the doctests ran in nobody's CI.
+#
+# That is not a cosmetic gap. `src/lib.rs` ends with `#![doc = include_str!("../README.md")]`
+# specifically so that every Rust example in the README is compiled and run, and
+# the README says so in a blockquote near the top. The guarantee is only real if
+# something runs them.
+test-doc:
+    RUSTFLAGS="-D warnings" cargo test --doc --all-features
 
 # Run tests with no default features.
 test-no-features:
@@ -357,14 +374,15 @@ semver:
 
 # Run every gate that CI runs: format → lint → docs → tests → examples.
 #
-# Deliberately excludes the mutation sweep. CI mutates only a pull request's own
-# diff (minutes); the full sweep is `just mutants-gate` and takes tens of them, so
-# it belongs before a release rather than in this loop.
-ci: fmt-check lint doc-build test-all test-no-features test-msrv bench-check examples site-check site-verify
+# Deliberately excludes mutation testing, which is not wired into CI at all — a
+# sweep is ~1 000 mutants and tens of minutes, which on the pull-request path is a
+# queue rather than a gate. `just mutants-diff` is the quick pre-push check;
+# `just mutants-gate` is the full sweep, run before a release.
+ci: fmt-check lint doc-build test-all test-doc test-no-features test-msrv bench-check examples site-check site-verify
     @echo ""
     @echo "✓ All CI gates passed locally"
-    @echo "  Full mutation sweep: nightly in CI (.github/workflows/mutants.yml),"
-    @echo "  or locally with: just mutants-gate"
+    @echo "  Pre-push:       just mutants-diff   (only the lines you changed)"
+    @echo "  Before release: just mutants-gate   (whole crate, tens of minutes)"
 
 # Verify benchmarks still compile (they are not run in CI — too slow and noisy).
 bench-check:

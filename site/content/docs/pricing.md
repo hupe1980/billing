@@ -133,11 +133,16 @@ let eeg = RateLookup::builder()
     .build()?;
 
 assert_eq!(eeg.rate_for(dec!(25))?, Amount::parse("0.00679")?);
+
+// A negative parameter is a data error, not the cheapest band: every bound is
+// positive, so a bare `<=` search would have returned the *lowest* rate.
+assert!(eeg.rate_for(dec!(-1)).is_err());
 ```
 
-Entries are sorted at build time, duplicate bounds are rejected as unreachable, and a
+Entries are sorted at build time, duplicate bounds are rejected as unreachable, a
 parameter above every bound with no `fallback` is an error rather than a silent
-fall-through to the last entry.
+fall-through to the last entry, and a negative parameter is refused — the same
+"no silent under-billing" rule `RateSchedule::split` and `apply_peak` follow.
 
 ## Usage aggregation
 
@@ -146,19 +151,32 @@ Six aggregators reduce a slice of raw events to the scalar a schedule prices:
 so they work on your event type without a trait impl.
 
 ```rust
-use billing::aggregation::{MaxAggregator, UsageAggregator};
+use billing::aggregation::{MaxAggregator, SumAggregator, UsageAggregator};
 use rust_decimal::Decimal;
 
 struct Sample { seats: u32 }
 let peak = MaxAggregator::new(|s: &Sample| Decimal::from(s.seats));
 assert_eq!(
-    peak.aggregate(&[Sample { seats: 10 }, Sample { seats: 50 }, Sample { seats: 30 }]),
+    peak.aggregate(&[Sample { seats: 10 }, Sample { seats: 50 }, Sample { seats: 30 }])?,
     Decimal::from(50u32)
 );
+
+// `aggregate` is fallible: this is the least trusted boundary in the pipeline, and
+// `Decimal`'s `+` and `*` PANIC on overflow rather than saturating. An aggregator
+// that accumulates therefore reports a corrupt magnitude instead of taking the
+// batch run down with it.
+assert!(SumAggregator::new(|_: &Sample| Decimal::MAX)
+    .aggregate(&[Sample { seats: 1 }, Sample { seats: 1 }])
+    .is_err());
 ```
 
 `MAX` pairs with `RateSchedule::capacity()`; `WEIGHTED_SUM` is the CPU-hours shape,
-where each resource contributes `value × fraction_of_period`.
+where each resource contributes `value × fraction_of_period` — and is the one most
+able to overflow, because it multiplies before it accumulates.
+
+`COUNT`, `UNIQUE_COUNT`, `MAX` and `LATEST` select or count rather than accumulate,
+so they never return `Err`. They share the signature anyway, because that is what
+lets you write code generic over `UsageAggregator`.
 
 ## The `PricingModel` trait
 

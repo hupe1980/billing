@@ -57,7 +57,8 @@
 //! // …and how it goes into BT-20.
 //! assert_eq!(
 //!     terms.to_string(),
-//!     "Zahlbar innerhalb 30 Tagen ohne Abzug.\n#SKONTO#TAGE=10#PROZENT=2.00#",
+//!     // The trailing newline is required by BR-DE-18 — see `PaymentTerms`'s `Display`.
+//!     "Zahlbar innerhalb 30 Tagen ohne Abzug.\n#SKONTO#TAGE=10#PROZENT=2.00#\n",
 //! );
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -285,6 +286,12 @@ impl FromStr for EarlyPaymentDiscount {
     /// validator enforcing BR-DE-18 will reject what this refuses. Accepting a
     /// sloppy form here would let it round-trip into an invoice that fails.
     ///
+    /// This parses **one segment**, so it is deliberately silent about the trailing
+    /// newline BR-DE-18 also requires: that terminates the *field*, not the segment,
+    /// and belongs to [`PaymentTerms`]'s own [`Display`](std::fmt::Display). The two
+    /// claims used to be an uncomfortable pair — `from_str` refused nothing a
+    /// validator accepts, while `Display` emitted a field every validator rejected.
+    ///
     /// ```rust
     /// use billing::EarlyPaymentDiscount;
     /// use rust_decimal::dec;
@@ -351,9 +358,10 @@ impl FromStr for EarlyPaymentDiscount {
 /// EN 16931 **BT-20** — free-text payment terms, plus any structured early-payment
 /// discounts embedded in them.
 ///
-/// Round-trips: [`Display`](std::fmt::Display) renders the field exactly as it goes
-/// on the wire, and [`FromStr`] recovers both halves from a field written by anyone
-/// else.
+/// Round-trips: [`Display`](std::fmt::Display) renders the field as it goes on the
+/// wire — including the trailing newline `BR-DE-18` requires after a Skonto entry,
+/// which is a *fatal* rule and was missing until 0.13.0 — and [`FromStr`] recovers
+/// both halves from a field written by anyone else.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PaymentTerms {
@@ -437,7 +445,42 @@ impl PaymentTerms {
 }
 
 impl fmt::Display for PaymentTerms {
-    /// The BT-20 field: the prose first, then one `#SKONTO#…#` line per discount.
+    /// The BT-20 field: the prose first, then one `#SKONTO#…#` line per discount,
+    /// and — when there is at least one discount — a **trailing newline**.
+    ///
+    /// # The terminator is part of the syntax, not decoration
+    ///
+    /// `BR-DE-18` is two assertions folded into one `satisfies`, and the second is
+    /// easy to read past because it is not a separate `<assert>`. Verbatim from
+    /// `itplr-kosit/xrechnung-schematron`,
+    /// `src/validation/schematron/ubl/XRechnung-UBL-validation.sch`:
+    ///
+    /// ```xpath
+    /// every $line in cac:PaymentTerms/cbc:Note[1]/tokenize(., '(\r?\n)')
+    ///                  [starts-with(normalize-space(.), '#')]
+    ///   satisfies matches(normalize-space($line), $XR-SKONTO-REGEX)
+    ///         and matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
+    /// ```
+    ///
+    /// The second `matches` requires everything after the last `#…#` to begin with
+    /// a newline. Without one, `tokenize(., '#.+#')[last()]` is the empty string and
+    /// the assertion fails — **fatally**. The rule's own prose says so directly:
+    /// *"Am Ende einer vollständigen Skontoangabe muss ein XML-konformer
+    /// Zeilenumbruch folgen."* KoSIT ships an instance marked
+    /// `schematron-invalid="xrcii:BR-DE-18"` titled *"Every skonto entry should end
+    /// with a newline"* for precisely this shape.
+    ///
+    /// Until 0.13.0 this impl omitted it, so every XRechnung carrying a Skonto was
+    /// rejected. The terminator belongs here rather than in a separate
+    /// `to_bt20_xrechnung()` because the `#SKONTO#…#` micro-syntax **is** the German
+    /// CIUS convention — there is no core EN 16931 form of it — so a rendering that
+    /// omits the terminator is valid nowhere at all.
+    ///
+    /// A prose-only BT-20 is unchanged: the `every … satisfies` is vacuously true
+    /// when no line starts with `#`, so a trailing newline there would be noise.
+    ///
+    /// [`FromStr`] accepts the terminated form and recovers an equal value, so the
+    /// round trip is unaffected.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         if let Some(text) = &self.text {
@@ -450,6 +493,9 @@ impl fmt::Display for PaymentTerms {
             }
             write!(f, "{d}")?;
             first = false;
+        }
+        if !self.discounts.is_empty() {
+            f.write_str("\n")?;
         }
         Ok(())
     }
@@ -605,16 +651,17 @@ mod tests {
             .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap())
             .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
         let rendered = terms.to_string();
+        // The trailing newline is BR-DE-18's second assertion — see `Display`.
         assert_eq!(
             rendered,
-            "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#"
+            "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#\n"
         );
         assert_eq!(rendered.parse::<PaymentTerms>().unwrap(), terms);
 
         // Segments only — no prose line survives, and the field starts with `#`.
         let bare =
             PaymentTerms::default().with_discount(EarlyPaymentDiscount::new(7, dec!(1.5)).unwrap());
-        assert_eq!(bare.to_string(), "#SKONTO#TAGE=7#PROZENT=1.50#");
+        assert_eq!(bare.to_string(), "#SKONTO#TAGE=7#PROZENT=1.50#\n");
         assert_eq!(bare.to_string().parse::<PaymentTerms>().unwrap(), bare);
         assert!(!bare.is_empty());
         assert!(PaymentTerms::default().is_empty());
@@ -636,7 +683,7 @@ mod tests {
 
         let with_segment =
             PaymentTerms::text("  ").with_discount(EarlyPaymentDiscount::new(7, dec!(2)).unwrap());
-        assert_eq!(with_segment.to_string(), "#SKONTO#TAGE=7#PROZENT=2.00#");
+        assert_eq!(with_segment.to_string(), "#SKONTO#TAGE=7#PROZENT=2.00#\n");
         assert_eq!(
             with_segment.to_string().parse::<PaymentTerms>().unwrap(),
             with_segment

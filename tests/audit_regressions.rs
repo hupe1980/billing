@@ -2037,3 +2037,834 @@ fn no_public_path_produces_a_document_that_fails_its_own_validation() {
         .is_err()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. The 0.13.0 audit — three silent defects the totals could not see
+//
+// Every one of these produced a document that balanced, validated and rendered.
+// What each got wrong was a field no arithmetic check looks at, which is why
+// none of them surfaced as a failing total.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `.currency()` used to write straight into `meta`, so a later `.meta()` — which
+/// replaces the whole header — discarded it. The document then carried
+/// `Currency::XXX`: ISO 4217 for "no currency involved", accepted by BR-CL-04, and
+/// printed on every line of the rendered invoice.
+///
+/// Nothing failed. The totals were right, `validate()` passed, and the only symptom
+/// was a wrong currency.
+#[test]
+fn the_builder_currency_is_order_independent() {
+    let positions = || {
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ]
+    };
+    let header = || DocumentMeta {
+        invoice_number: "R-1".into(),
+        ..Default::default()
+    };
+
+    let after = BillingDocument::builder()
+        .meta(header())
+        .currency(Currency::EUR)
+        .positions(positions())
+        .build()
+        .unwrap();
+    let before = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .meta(header())
+        .positions(positions())
+        .build()
+        .unwrap();
+
+    assert_eq!(after.currency(), Currency::EUR);
+    assert_eq!(
+        before.currency(),
+        Currency::EUR,
+        "`.currency()` before `.meta()` used to be silently discarded"
+    );
+    assert!(!before.currency().is_unset());
+}
+
+/// `minimum_charge` used to return `LineItem::fixed`, which states BT-131 and
+/// nothing else. A shortfall is an ordinary invoice line (BG-25), so BR-22, BR-23
+/// and BR-26 all apply to it — three *fatal* rules, on a position the engine itself
+/// produced, none of which changes an amount.
+#[test]
+fn a_minimum_charge_shortfall_is_a_complete_invoice_line() {
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Verbrauch", Amount::parse("40.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let shortfall = minimum_charge(
+        &doc,
+        Amount::parse("100.00000").unwrap(),
+        "Mindestentgelt",
+        Currency::EUR,
+    )
+    .unwrap()
+    .expect("40 is below the 100 minimum");
+
+    assert_eq!(shortfall.net_amount, Amount::parse("60.00000").unwrap());
+    // BR-22 / BR-23 / BR-26 — the three terms `LineItem::fixed` leaves unstated.
+    let qty = shortfall.quantity.as_ref().expect("BT-129");
+    assert_eq!(qty.value, dec!(1));
+    assert_eq!(qty.code.as_deref(), Some(UNIT_CODE_ONE)); // BT-130
+    assert_eq!(
+        shortfall.unit_price.as_ref().expect("BT-146").value,
+        dec!(60)
+    );
+    // The label follows the currency it was given, not a hardcoded "EUR".
+    assert_eq!(shortfall.unit_price.as_ref().unwrap().unit, "EUR");
+
+    // …and 1 × 60.00 is exactly 60.00, so PEPPOL-EN16931-R120 holds with nothing
+    // rounded and the document still assembles at the interchange scale.
+    let full = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Verbrauch", Amount::parse("40.00000").unwrap())
+                .build()
+                .unwrap(),
+            shortfall,
+        ])
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+    assert_eq!(full.net_total(), Amount::parse("100.00000").unwrap());
+    assert!(full.fits_amount_scale(2));
+    full.assert_valid();
+    full.verify_vat_attribution().unwrap();
+}
+
+/// A `PricingModel` knows which format it prices for, but `bill()` and `settle()`
+/// had nowhere to say so — they always assembled at the engine's five decimals. The
+/// shortest path from a model to a document therefore produced one that fails
+/// BR-DEC-23, with no error anywhere.
+#[test]
+fn a_pricing_model_can_declare_the_interchange_scale_it_prices_for() {
+    struct Metered;
+
+    impl PricingModel for Metered {
+        type Usage = ();
+        type Error = std::convert::Infallible;
+        type NotBillable = std::convert::Infallible;
+
+        fn positions(&self, _: &()) -> Result<Positions<Self::NotBillable>, Self::Error> {
+            Ok(vec![
+                LineItem::for_usage(
+                    "Arbeit",
+                    Quantity::new(dec!(1234.567), "kWh"),
+                    UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+                )
+                .build()
+                .unwrap(),
+            ]
+            .into())
+        }
+
+        fn tax_layers(&self) -> Vec<Box<dyn TaxLayer>> {
+            vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()]
+        }
+
+        fn amount_scale(&self) -> Option<AmountScale> {
+            Some(AmountScale::EN16931)
+        }
+    }
+
+    let meta = DocumentMeta {
+        currency: Currency::EUR,
+        ..Default::default()
+    };
+    let doc = Metered.settle(meta.clone()).unwrap();
+
+    // 1234.567 × 0.28901 = 356.80221 — reduced once, at the leaf.
+    assert_eq!(doc.net_total(), Amount::parse("356.80000").unwrap());
+    assert_eq!(doc.tax_total(), Amount::parse("67.79000").unwrap());
+    assert!(doc.fits_amount_scale(2), "settle() must honour the model");
+    doc.assert_valid();
+    doc.verify_vat_attribution().unwrap();
+
+    // An explicit scale on the builder still wins over the model's.
+    let finer = BillingDocument::builder()
+        .meta(meta)
+        .amount_scale(AmountScale::new(3, RoundingStrategy::MidpointAwayFromZero).unwrap())
+        .pricing(&Metered, &())
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(finer.net_total(), Amount::parse("356.80200").unwrap());
+}
+
+/// `Currency::new` accepts any three ASCII letters — deliberately, since this crate
+/// bills things that are not EN 16931 invoices. What it must not do is let such a
+/// code reach an invoice unremarked: BR-CL-04 is fatal on BT-5, and the rejection
+/// happens at the access point rather than at a boundary the caller controls.
+#[test]
+fn a_well_formed_currency_is_not_necessarily_one_en16931_admits() {
+    let doc = BillingDocument::builder()
+        .currency(Currency::new("XBT").unwrap())
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap();
+
+    // The document is arithmetically perfect …
+    doc.assert_valid();
+    // … and its BT-5 is fatal under BR-CL-04, which only this predicate can say.
+    assert!(!doc.currency().is_iso4217());
+    assert!(
+        !doc.currency().is_unset(),
+        "it is set — just not to a real code"
+    );
+
+    // The two boundary questions are independent: `XXX` is *in* the ISO list.
+    assert!(Currency::XXX.is_iso4217());
+    assert!(Currency::XXX.is_unset());
+    assert!(Currency::EUR.is_iso4217() && !Currency::EUR.is_unset());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. The 0.13.0 audit, second pass — a rule the engine declined to check, a
+//     term with no name, and the last unguarded panic on the untrusted path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// BR-B-02 forbids "split payment" (`B`) and "standard rated" (`S`) in one
+/// document. The crate described both `B` rules as "jurisdictional … and stay with
+/// the caller", but only BR-B-01 ("shall be a domestic Italian invoice") actually
+/// needs anything the engine cannot see. BR-B-02 is a property of the categories
+/// present — decidable here, and structurally identical to BR-O-11, which
+/// `validate()` has always checked.
+///
+/// It matters because `merge_period_documents` can manufacture the forbidden
+/// combination out of two individually lawful documents, which is the same argument
+/// the crate already makes for checking BR-O-11.
+#[test]
+fn split_payment_and_standard_rated_cannot_share_a_document() {
+    let italian = |tag: &str, category: TaxCategory, rate: Decimal| {
+        let layer = if category == TaxCategory::SplitPayment {
+            FixedRateTax::new("Scissione dei pagamenti", rate)
+                .unwrap()
+                .with_category(TaxCategory::SplitPayment)
+        } else {
+            FixedRateTax::new("IVA", rate).unwrap()
+        };
+        BillingDocument::builder()
+            .currency(Currency::EUR)
+            .positions(vec![
+                LineItem::fixed("Fornitura", Amount::parse("1000.00000").unwrap())
+                    .tag(tag)
+                    .build()
+                    .unwrap(),
+            ])
+            .extra_tax(layer.with_tag(tag).boxed())
+            .build()
+            .unwrap()
+    };
+
+    // Each half is lawful on its own.
+    let split = italian("b", TaxCategory::SplitPayment, dec!(0.22));
+    let standard = italian("s", TaxCategory::Standard, dec!(0.22));
+    split.assert_valid();
+    standard.assert_valid();
+
+    // Merging them produces the combination BR-B-02 forbids, and the merge refuses.
+    let err = merge_period_documents(split, standard).unwrap_err();
+    assert!(
+        err.to_string().contains("BR-B-02"),
+        "merge must name the rule it refused on, got: {err}"
+    );
+
+    // The same document built directly is refused too — by `validate`, not only by
+    // the merge path.
+    let mixed = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Fornitura", Amount::parse("1000.00000").unwrap())
+                .tag("b")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Servizio", Amount::parse("500.00000").unwrap())
+                .tag("s")
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::new("Scissione", dec!(0.22))
+                .unwrap()
+                .with_category(TaxCategory::SplitPayment)
+                .with_tag("b")
+                .boxed(),
+        )
+        .extra_tax(
+            FixedRateTax::new("IVA", dec!(0.22))
+                .unwrap()
+                .with_tag("s")
+                .boxed(),
+        )
+        .build();
+    let err = mixed.unwrap_err();
+    assert!(err.to_string().contains("BR-B-02"), "got: {err}");
+
+    // A `B`-only document is fine, and so is an `S`-only one.
+    italian("b", TaxCategory::SplitPayment, dec!(0.22)).assert_valid();
+    italian("s", TaxCategory::Standard, dec!(0.22)).assert_valid();
+
+    // The hand-attributed shape — categories set with `.vat(..)` and no VAT layer
+    // at all, so there is no breakdown for check 14 to look at — is caught too, by
+    // `verify_vat_attribution`: an attributed group with no breakdown entry behind
+    // it. This is why BR-B-02 needs no position-level clause of its own; the
+    // attribution can never be a superset of the breakdown.
+    let hand_attributed = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Fornitura", Amount::parse("1000.00000").unwrap())
+                .vat(LineVat::new(TaxCategory::SplitPayment, dec!(0.22)).unwrap())
+                .build()
+                .unwrap(),
+            LineItem::fixed("Servizio", Amount::parse("500.00000").unwrap())
+                .vat(LineVat::new(TaxCategory::Standard, dec!(0.22)).unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    // It balances and validates — the breakdown is empty, so check 14 sees nothing.
+    hand_attributed.assert_valid();
+    // …and the attribution check refuses it before it can be emitted.
+    let err = hand_attributed.verify_vat_attribution().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("VAT breakdown entry for that group"),
+        "got: {err}"
+    );
+}
+
+/// BT-107 was the only member of the EN 16931 totals chain with no accessor under
+/// its own name: BT-106, BT-108, BT-109, BT-110, BT-112, BT-113, BT-114 and BT-115
+/// all had one, while the sum of document level allowances was reachable only as
+/// `discount_total()` — the same figure with the *opposite sign*.
+///
+/// That is the sign a consumer must flip to emit `cbc:AllowanceTotalAmount`, which
+/// is unsigned in both UBL and CII. Forgetting to flip it fails BR-CO-13 by twice
+/// the allowance, and nothing in the document itself can show it.
+#[test]
+fn bt107_is_available_as_the_positive_magnitude_the_standard_states() {
+    let doc = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![
+            LineItem::fixed("Leistung", Amount::parse("1000.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .extra_discount(
+            PercentageDiscount::new("Treuerabatt", dec!(0.02))
+                .unwrap()
+                .boxed(),
+        )
+        .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed())
+        .build()
+        .unwrap();
+
+    let bt106 = doc.line_total().unwrap();
+    let bt107 = doc.allowance_total().unwrap();
+    let bt108 = doc.charge_total().unwrap();
+    let bt109 = doc.taxable_total().unwrap();
+
+    assert_eq!(bt106, Amount::parse("1000.00000").unwrap());
+    assert_eq!(bt107, Amount::parse("20.00000").unwrap());
+    assert!(bt107.is_positive(), "BT-107 is stated as a magnitude");
+    assert_eq!(bt107, doc.discount_total().checked_neg().unwrap());
+
+    // BR-CO-13, spelled the way the standard spells it: BT-109 = BT-106 − BT-107 + BT-108.
+    assert_eq!(
+        bt109,
+        bt106
+            .checked_sub(bt107)
+            .unwrap()
+            .checked_add(bt108)
+            .unwrap()
+    );
+
+    // …and BR-CO-15 closes the chain.
+    assert_eq!(
+        doc.gross_total(),
+        bt109.checked_add(doc.vat_total().unwrap()).unwrap()
+    );
+    doc.verify_vat_attribution().unwrap();
+
+    // With no allowances at all it is zero, not absent.
+    let plain = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Leistung", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(plain.allowance_total().unwrap(), Amount::ZERO);
+}
+
+/// `UsageAggregator::aggregate` returned a bare `Decimal`, and `Decimal`'s `+`,
+/// `*` and `Sum` panic on overflow. The trait consumes raw usage events — the least
+/// trusted input in the pipeline — so one corrupt magnitude aborted the process,
+/// which is precisely the failure mode section 1 of this file exists to prevent.
+#[test]
+fn an_aggregator_reports_a_corrupt_event_instead_of_aborting_the_run() {
+    use billing::aggregation::{
+        CountAggregator, LatestAggregator, MaxAggregator, SumAggregator, UniqueCountAggregator,
+        UsageAggregator, WeightedSumAggregator,
+    };
+
+    struct Reading(Decimal);
+
+    let corrupt = [Reading(Decimal::MAX), Reading(Decimal::MAX)];
+
+    // The two accumulating aggregators report; they do not panic.
+    assert!(
+        SumAggregator::new(|r: &Reading| r.0)
+            .aggregate(&corrupt)
+            .is_err()
+    );
+    assert!(
+        WeightedSumAggregator::new(|r: &Reading| r.0, |_: &Reading| Decimal::MAX)
+            .aggregate(&corrupt)
+            .is_err()
+    );
+
+    // The four selecting ones cannot fail, on the same input.
+    assert!(
+        MaxAggregator::new(|r: &Reading| r.0)
+            .aggregate(&corrupt)
+            .is_ok()
+    );
+    assert!(
+        LatestAggregator::new(|r: &Reading| r.0)
+            .aggregate(&corrupt)
+            .is_ok()
+    );
+    assert!(CountAggregator.aggregate(&corrupt).is_ok());
+    assert!(
+        UniqueCountAggregator::new(|r: &Reading| r.0.to_string())
+            .aggregate(&corrupt)
+            .is_ok()
+    );
+
+    // Ordinary input still answers, so the guard is not a blanket refusal.
+    assert_eq!(
+        SumAggregator::new(|r: &Reading| r.0)
+            .aggregate(&[Reading(dec!(1.25)), Reading(dec!(2.75))])
+            .unwrap(),
+        dec!(4)
+    );
+}
+
+/// `BillingDocument`'s type documentation promises that a document from
+/// `from_positions` "satisfies every invariant by construction". Computing the
+/// totals makes checks 1–4 true and nothing else: BR-CO-18, BR-O-11 and BR-B-02
+/// are properties of the *breakdown*, reachable with an ordinary combination of
+/// layers, and `assemble` never ran `validate()`.
+///
+/// So the primary constructor handed back documents that failed their own
+/// `assert_valid()`. `merge_period_documents` and `AllocationRule` have always
+/// re-checked their outputs; the constructor now does too.
+#[test]
+fn the_primary_constructor_returns_only_documents_that_pass_their_own_validate() {
+    // BR-O-11: "not subject to VAT" cannot coexist with another breakdown group.
+    // Two tagged layers is all it takes, and both are individually lawful.
+    let out_of_scope = FixedRateTax::exempt(
+        "Nicht steuerbar",
+        TaxCategory::OutOfScope,
+        "Nicht steuerbarer Auslagenersatz",
+    )
+    .unwrap()
+    .with_tag("outside");
+
+    let result = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Auslagen", Amount::parse("100.00000").unwrap())
+                .tag("outside")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Beratung", Amount::parse("900.00000").unwrap())
+                .tag("taxed")
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(out_of_scope.boxed())
+        .extra_tax(
+            FixedRateTax::new("MwSt", dec!(0.19))
+                .unwrap()
+                .with_tag("taxed")
+                .boxed(),
+        )
+        .build();
+
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("BR-O-11"),
+        "the constructor must refuse, naming the rule; got: {err}"
+    );
+
+    // Each half on its own still builds and validates, so this is not a blanket
+    // refusal of `O` or of tagged layers.
+    BillingDocument::builder()
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Auslagen", Amount::parse("100.00000").unwrap())
+                .tag("outside")
+                .build()
+                .unwrap(),
+        ])
+        .extra_tax(
+            FixedRateTax::exempt("Nicht steuerbar", TaxCategory::OutOfScope, "Auslagenersatz")
+                .unwrap()
+                .boxed(),
+        )
+        .build()
+        .unwrap()
+        .assert_valid();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. The `en16931` adapter review — verified against KoSIT and CEN artefacts
+//
+// Every claim below was re-derived from the primary artefacts before it was
+// acted on:
+//   itplr-kosit/xrechnung-schematron @ master  (BR-DE-18, and its test fixtures)
+//   ConnectingEurope/eInvoicing-EN16931 @ validation-1.3.16  (BR-CL-08, BR-CL-10)
+//   OpenPEPPOL/peppol-bis-invoice-3 @ master  (PEPPOL-EN16931-R002)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `PaymentTerms: Display` omitted the newline `BR-DE-18` requires after the last
+/// `#SKONTO#…#` segment, so every XRechnung carrying an early-payment discount was
+/// rejected — **fatally**.
+///
+/// The rule is two assertions folded into one `satisfies`, and the second is the
+/// one that bites:
+///
+/// ```xpath
+/// matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
+/// ```
+///
+/// Without a terminator `tokenize(., '#.+#')[last()]` is the empty string. Verified
+/// against a real XPath 2.0 engine and against KoSIT's own fixture, which is marked
+/// `schematron-invalid="xrcii:BR-DE-18"` and titled "Every skonto entry should end
+/// with a newline".
+#[test]
+fn bt20_terminates_every_skonto_entry_with_a_newline() {
+    use billing::{EarlyPaymentDiscount, PaymentTerms};
+
+    let one = PaymentTerms::text("Zahlbar innerhalb 30 Tagen ohne Abzug.")
+        .with_discount(EarlyPaymentDiscount::new(10, dec!(2.00)).unwrap());
+    assert_eq!(
+        one.to_string(),
+        "Zahlbar innerhalb 30 Tagen ohne Abzug.\n#SKONTO#TAGE=10#PROZENT=2.00#\n"
+    );
+
+    // Staged terms: one terminator, after the last segment.
+    let staged = PaymentTerms::default()
+        .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap())
+        .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
+    assert_eq!(
+        staged.to_string(),
+        "#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#\n"
+    );
+
+    // With BASISBETRAG too.
+    let based = PaymentTerms::default().with_discount(
+        EarlyPaymentDiscount::new(10, dec!(2.50))
+            .unwrap()
+            .with_base_amount(Amount::parse("485.98000").unwrap())
+            .unwrap(),
+    );
+    assert_eq!(
+        based.to_string(),
+        "#SKONTO#TAGE=10#PROZENT=2.50#BASISBETRAG=485.98#\n"
+    );
+
+    // A prose-only BT-20 gets NO terminator: BR-DE-18's `every … satisfies` is
+    // vacuously true when no line starts with `#`, so one would be pure noise.
+    let prose = PaymentTerms::text("Zahlbar innerhalb 30 Tagen ohne Abzug.");
+    assert_eq!(prose.to_string(), "Zahlbar innerhalb 30 Tagen ohne Abzug.");
+    assert_eq!(PaymentTerms::default().to_string(), "");
+
+    // The terminator must not break the round trip.
+    for terms in [one.clone(), staged.clone(), based.clone(), prose.clone()] {
+        assert_eq!(
+            terms.to_string().parse::<PaymentTerms>().unwrap(),
+            terms,
+            "Display -> FromStr must be an identity for {terms:?}"
+        );
+    }
+
+    // Every rendered field either ends in a newline or carries no segment at all —
+    // which is the shape of BR-DE-18's second assertion, stated as an invariant.
+    for terms in [&one, &staged, &based, &prose] {
+        let rendered = terms.to_string();
+        assert_eq!(
+            rendered.ends_with('\n'),
+            !terms.discounts().is_empty(),
+            "wrong terminator for {rendered:?}"
+        );
+    }
+}
+
+/// BG-1 is `0..n` and each note has a UNCL 4451 subject code (BT-21, `BR-CL-08`).
+/// `DocumentMeta::notes` was one uncoded `Option<String>` and could express neither.
+#[test]
+fn document_notes_model_bg_1_with_its_subject_code() {
+    use billing::Note;
+
+    let meta = DocumentMeta {
+        notes: vec![
+            "Lieferung ab Werk.".into(),
+            Note::coded("AAI", "Es gelten unsere AGB."),
+            Note::coded("REG", "Amtsgericht Musterstadt HRB 12345"),
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(meta.notes.len(), 3);
+    assert_eq!(meta.notes[0].subject_code, None); // BT-21 absent is lawful
+    assert_eq!(meta.notes[0].text, "Lieferung ab Werk.");
+    assert_eq!(meta.notes[1].subject_code.as_deref(), Some("AAI"));
+    // `Display` renders BT-22 alone — BT-21 is metadata about the note.
+    assert_eq!(
+        meta.notes[2].to_string(),
+        "Amtsgericht Musterstadt HRB 12345"
+    );
+
+    // The document carries them through assembly untouched.
+    let doc = BillingDocument::builder()
+        .meta(meta)
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(doc.meta.notes.len(), 3);
+}
+
+/// BT-29 / BT-46 are `Identifier`s whose scheme `BR-CL-10` restricts to the ISO 6523
+/// ICD list — *fatal*. A bare `String` could not say which registry an identifier
+/// came from, so the adapter could not map these fields at all.
+#[test]
+fn party_identifiers_carry_the_registry_they_came_from() {
+    use billing::PartyIdentifier;
+
+    let gln = PartyIdentifier::scheme("0088", "4012345000009");
+    assert_eq!(gln.scheme.as_deref(), Some("0088"));
+    assert_eq!(gln.value, "4012345000009");
+    assert_eq!(gln.to_string(), "4012345000009"); // the scheme is not part of the text
+
+    // No scheme is lawful — BR-CL-10 only constrains one that is present. The
+    // *value* has to be asserted as well as the absent scheme: `Default::default()`
+    // also has no scheme, so checking only that cannot tell a working `From` impl
+    // from one that discards its input.
+    let internal: PartyIdentifier = "KND-4711".into();
+    assert_eq!(internal.value, "KND-4711");
+    assert_eq!(internal.scheme, None);
+    assert_ne!(internal, PartyIdentifier::default());
+
+    let doc = BillingDocument::builder()
+        .meta(DocumentMeta {
+            issuer_id: Some(gln),
+            recipient_id: Some(internal),
+            ..Default::default()
+        })
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap();
+    assert_eq!(
+        doc.meta.issuer_id.as_ref().unwrap().scheme.as_deref(),
+        Some("0088")
+    );
+    assert_eq!(doc.meta.recipient_id.as_ref().unwrap().scheme, None);
+}
+
+/// `is_self_billed()` joins `is_credit_note()` and `is_peppol_billing_code()`:
+/// the semantics as a predicate, with the code as its rendering.
+#[test]
+fn self_billing_is_a_predicate_not_a_comparison_against_389() {
+    assert!(DocumentKind::SelfBilledInvoice.is_self_billed());
+    assert_eq!(DocumentKind::SelfBilledInvoice.code(), 389);
+    for k in DocumentKind::ALL {
+        assert_eq!(k.is_self_billed(), k == DocumentKind::SelfBilledInvoice);
+    }
+    // The one kind outside the Peppol *Billing* profile is exactly the self-billed
+    // one — self-billing is a different customization, not a forbidden invoice.
+    let outside: Vec<_> = DocumentKind::ALL
+        .into_iter()
+        .filter(|k| !k.is_peppol_billing_code())
+        .collect();
+    assert_eq!(outside, vec![DocumentKind::SelfBilledInvoice]);
+    assert!(outside.iter().all(DocumentKind::is_self_billed));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. Period rules the engine could decide and did not
+//
+// `Period::is_ordered()` shipped in 0.12.0 and was called by nothing but its own
+// tests. BR-29, BR-30, PEPPOL-EN16931-R110 and R111 are all fatal and all
+// decidable from dates the engine already holds — the same argument that puts
+// BR-B-02 and BR-O-11 inside `validate()` rather than in a consumer's lap.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// BR-30: a line period whose end precedes its start is refused by the position
+/// itself, so it cannot enter a document at all.
+#[test]
+fn a_line_period_must_not_end_before_it_starts() {
+    let backwards = LineItem::fixed("Grundpreis", Amount::parse("30.00000").unwrap())
+        .period("2026-06-30", "2026-06-01")
+        .build();
+    let err = backwards.unwrap_err();
+    assert!(err.to_string().contains("BR-29 / BR-30"), "got: {err}");
+
+    // A single-day period is ordered — both rules say "later *or equal*".
+    LineItem::fixed("Grundpreis", Amount::parse("30.00000").unwrap())
+        .period("2026-06-01", "2026-06-01")
+        .build()
+        .unwrap();
+
+    // Not ISO 8601: the engine stays date-type-agnostic and says nothing rather
+    // than ordering a format it cannot order.
+    LineItem::fixed("Grundpreis", Amount::parse("30.00000").unwrap())
+        .period("30.6.2026", "1.6.2026")
+        .build()
+        .unwrap();
+}
+
+/// BR-29 on the document, and `PEPPOL-EN16931-R110` / `R111` across the two levels:
+/// a line period must lie inside the invoicing period.
+#[test]
+fn a_line_period_must_lie_inside_the_invoicing_period() {
+    let build = |line_from: &str, line_to: &str| {
+        BillingDocument::builder()
+            .meta(DocumentMeta {
+                period: Some(Period::new("2026-06-01", "2026-06-30")),
+                ..Default::default()
+            })
+            .currency(Currency::EUR)
+            .positions(vec![
+                LineItem::fixed("Arbeit", Amount::parse("100.00000").unwrap())
+                    .period(line_from, line_to)
+                    .build()
+                    .unwrap(),
+            ])
+            .build()
+    };
+
+    // Inside, and coterminous, are both fine.
+    build("2026-06-01", "2026-06-14").unwrap().assert_valid();
+    build("2026-06-01", "2026-06-30").unwrap().assert_valid();
+
+    // R110 — the line starts before the invoicing period.
+    let err = build("2026-05-28", "2026-06-14").unwrap_err();
+    assert!(err.to_string().contains("R110"), "got: {err}");
+    // R111 — the line ends after it.
+    let err = build("2026-06-15", "2026-07-02").unwrap_err();
+    assert!(err.to_string().contains("R111"), "got: {err}");
+
+    // BR-29 on the document's own period.
+    let err = BillingDocument::builder()
+        .meta(DocumentMeta {
+            period: Some(Period::new("2026-06-30", "2026-06-01")),
+            ..Default::default()
+        })
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Arbeit", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("BR-29"), "got: {err}");
+
+    // A non-ISO invoicing period disables the comparison rather than failing it —
+    // the crate never guesses at a date format it cannot order.
+    BillingDocument::builder()
+        .meta(DocumentMeta {
+            period: Some(Period::new("1.6.2026", "30.6.2026")),
+            ..Default::default()
+        })
+        .currency(Currency::EUR)
+        .positions(vec![
+            LineItem::fixed("Arbeit", Amount::parse("100.00000").unwrap())
+                .period("2026-05-01", "2026-05-31")
+                .build()
+                .unwrap(),
+        ])
+        .build()
+        .unwrap()
+        .assert_valid();
+}
+
+/// `RateSchedule::split` and `apply_peak` both refuse a negative quantity;
+/// `RateLookup::rate_for` did not. Every bound in a lookup table is positive, so a
+/// negative parameter is below all of them and the `<=` search returned the
+/// **lowest** band — the cheapest rate — for what is a data error. The three rate
+/// tables now agree.
+#[test]
+fn a_negative_lookup_parameter_is_an_error_not_the_cheapest_band() {
+    let lookup = billing::RateLookup::builder()
+        .at_most(dec!(10), Amount::parse("0.00811").unwrap())
+        .at_most(dec!(40), Amount::parse("0.00679").unwrap())
+        .fallback(Amount::parse("0.00556").unwrap())
+        .build()
+        .unwrap();
+
+    // Zero is a real installed capacity; negative is not.
+    assert_eq!(
+        lookup.rate_for(dec!(0)).unwrap(),
+        Amount::parse("0.00811").unwrap()
+    );
+    let err = lookup.rate_for(dec!(-1)).unwrap_err();
+    assert!(err.to_string().contains("non-negative"), "got: {err}");
+
+    // The sibling rate tables have always refused it, which is the point.
+    let schedule = RateSchedule::capacity()
+        .unit("kW")
+        .band(RateBand::over(dec!(0), Amount::parse("10.00000").unwrap()))
+        .build()
+        .unwrap();
+    assert!(schedule.apply_peak(dec!(-1)).is_err());
+    assert!(
+        RateSchedule::graduated()
+            .unit("kWh")
+            .band(RateBand::over(dec!(0), Amount::parse("0.30000").unwrap()))
+            .build()
+            .unwrap()
+            .split(dec!(-1))
+            .is_err()
+    );
+}
