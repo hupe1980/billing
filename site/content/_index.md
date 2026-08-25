@@ -101,7 +101,8 @@ arithmetic path, overflow is never silent, and rounding is always an explicit ar
 ### Pricing models
 
 Graduated, volume, block and capacity rate schedules; time-of-use bands; spot
-pricing; capacity-keyed rate tables; six usage aggregators.
+pricing; capacity-keyed rate tables; eight usage aggregators, including the
+95th-percentile burstable model.
 
 [Pricing models →](docs/pricing/)
 

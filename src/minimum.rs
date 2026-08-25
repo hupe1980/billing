@@ -1,9 +1,27 @@
-//! [`minimum_charge`] — guaranteed minimum spend helper.
+//! [`minimum_charge`] and [`minimum_charge_gross`] — guaranteed minimum spend.
+//!
+//! # Two functions, because contracts are written both ways
+//!
+//! A B2B supply agreement states a *Mindestumsatz* **netto**; a consumer supply
+//! contract states a *Mindestbetrag* **brutto**, because that is the figure on the
+//! price sheet and the one §1 PAngV makes the seller quote. The two are not the
+//! same arithmetic, and picking the wrong one is silent:
+//!
+//! | Contract says | Use | Compares against |
+//! |---|---|---|
+//! | "Mindestumsatz 100,00 € netto" | [`minimum_charge`] | [`BillingDocument::net_total`] |
+//! | "Mindestbetrag 9,90 € brutto" | [`minimum_charge_gross`] | [`BillingDocument::gross_total`] (BT-112) |
+//!
+//! Deriving the second from the first by hand is where the money goes missing —
+//! see [`minimum_charge_gross`] for the mixed-rate case that motivated it.
+use rust_decimal::Decimal;
+
 use crate::amount::Amount;
 use crate::currency::Currency;
 use crate::document::BillingDocument;
 use crate::error::BillingError;
-use crate::line_item::LineItem;
+use crate::line_item::{LineItem, LineItemBuilder};
+use crate::vat::LineVat;
 
 /// Apply a minimum charge if `doc.net_total() < minimum`.
 ///
@@ -85,10 +103,125 @@ pub fn minimum_charge(
         return Ok(None);
     }
     let shortfall = minimum.checked_sub(doc.net_total())?;
-    let item = LineItem::flat_fee(description, shortfall, currency)
-        .tag(crate::tags::MINIMUM_CHARGE)
-        .build()?;
-    Ok(Some(item))
+    Ok(Some(
+        shortfall_line(description, shortfall, currency).build()?,
+    ))
+}
+
+/// The shortfall position both helpers return: a complete invoice line carrying
+/// the reserved [`crate::tags::MINIMUM_CHARGE`] tag.
+fn shortfall_line(description: &str, net: Amount<5>, currency: Currency) -> LineItemBuilder {
+    LineItem::flat_fee(description, net, currency).tag(crate::tags::MINIMUM_CHARGE)
+}
+
+/// Apply a minimum charge stated **gross** — `doc.gross_total() < minimum_gross`.
+///
+/// The consumer-contract counterpart of [`minimum_charge`]. A *Mindestbetrag* is
+/// quoted inclusive of VAT, because that is the figure §1 PAngV makes the seller
+/// show, while EN 16931's totals chain is net — so the top-up enters the document as
+/// a net line:
+///
+/// ```text
+/// net top-up = (BT-112 target − BT-112 so far) ÷ (1 + rate)
+/// ```
+///
+/// # The rate is an argument, and it is enforced
+///
+/// A minimum charge is a **contractual** charge, so the contract names its rate. It
+/// is not derivable from the document: a Stadtwerk bill carrying 7 % Trinkwasser
+/// beside 19 % Energie has two, and "use the standard one" fails the moment the
+/// top-up is taxed at the other — silently, and not by a rounding unit. Grossing a
+/// 5,38 € shortfall down at 19 % while it is taxed at 7 % invoices **9,36 €** against
+/// a 9,90 € minimum: 0,54 € short, 5,5 %, with every total reconciling and
+/// [`BillingDocument::validate`] passing.
+///
+/// So the returned line carries the [`LineVat`] you name, and the claim is checked:
+/// a layer covering the shortfall at a different (category, rate) fails assembly with
+/// [`BillingError::LayerError`] (BR-S-08 — one VAT group per position), and no layer
+/// covering it at all is what [`BillingDocument::verify_vat_attribution`] reports.
+///
+/// A zero rate needs no special case: under reverse charge the divisor is `1`, so
+/// gross and net coincide.
+///
+/// # The document must already be taxed
+///
+/// [`minimum_charge`] settles against an *untaxed* provisional document, because a
+/// net minimum does not depend on the layers. A gross minimum does.
+///
+/// ```rust
+/// use billing::prelude::*;
+/// use billing::{FixedRateTax, TaxCategory, TaxLayer};
+/// use rust_decimal::dec;
+///
+/// let positions = vec![
+///     LineItem::fixed("Trinkwasser", Amount::parse("2.00000")?).tag("reduced").build()?,
+///     LineItem::fixed("Grundpreis",  Amount::parse("2.00000")?).tag("full").build()?,
+/// ];
+/// // Rebuilt per document: a `Box<dyn TaxLayer>` is consumed by assembly.
+/// let layers = || -> Result<Vec<Box<dyn TaxLayer>>, BillingError> {
+///     Ok(vec![
+///         FixedRateTax::new("MwSt 7 %",  dec!(0.07))?.with_tag("reduced").boxed(),
+///         FixedRateTax::new("MwSt 19 %", dec!(0.19))?.with_tag("full").boxed(),
+///     ])
+/// };
+/// let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+///
+/// let provisional = BillingDocument::from_positions(meta(), positions.clone(), layers()?, vec![])?;
+/// assert_eq!(provisional.gross_total(), Amount::parse("4.52000")?);
+///
+/// let mut positions = positions;
+/// if let Some(mut top_up) = minimum_charge_gross(
+///     &provisional,
+///     Amount::parse("9.90000")?,
+///     LineVat::new(TaxCategory::Standard, dec!(0.19))?,   // the rate the contract names
+///     "Mindestbetrag",
+///     Currency::EUR,
+/// )? {
+///     top_up.tags.push("full".into());   // so the 19 % layer really covers it
+///     positions.push(top_up);
+/// }
+///
+/// let doc = BillingDocument::from_positions(meta(), positions, layers()?, vec![])?;
+/// assert_eq!(doc.gross_total(), Amount::parse("9.90000")?);
+/// doc.verify_vat_attribution()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// The net top-up is one rounding of an exact quotient, so BT-112 lands within a
+/// rounding unit of the target rather than always exactly on it. Assert
+/// `doc.gross_total() >= minimum_gross` if the contract reads as a hard floor.
+///
+/// # Errors
+/// - [`BillingError::MonetaryOverflow`] if the shortfall or the quotient leaves the
+///   representable range.
+/// - [`BillingError::InvalidInput`] from [`LineItem::flat_fee`]'s own checks.
+pub fn minimum_charge_gross(
+    doc: &BillingDocument,
+    minimum_gross: Amount<5>,
+    vat: LineVat,
+    description: &str,
+    currency: Currency,
+) -> Result<Option<LineItem>, BillingError> {
+    if doc.gross_total() >= minimum_gross {
+        return Ok(None);
+    }
+    let shortfall_gross = minimum_gross.checked_sub(doc.gross_total())?;
+    // `1 + rate` is at least 1 — `LineVat::new` refuses a negative rate — so the
+    // division is always defined, and degenerates to the identity at a zero rate.
+    // `checked_add`: `Decimal`'s `+` panics on overflow rather than saturating.
+    let divisor = Decimal::ONE
+        .checked_add(vat.rate)
+        .ok_or(BillingError::MonetaryOverflow {
+            precision: 5,
+            input_value: Some(vat.rate),
+        })?;
+    // One rounding of the exact quotient, at the engine's five decimals.
+    let net = shortfall_gross.checked_div(divisor)?;
+    Ok(Some(
+        shortfall_line(description, net, currency)
+            .vat(vat)
+            .build()?,
+    ))
 }
 
 #[cfg(test)]
@@ -153,12 +286,11 @@ mod tests {
         );
     }
 
-    /// The shortfall is an invoice line (BG-25), so BR-22 / BR-23 / BR-26 apply
-    /// to it. Building it with `LineItem::fixed` — which is what this helper did
-    /// until 0.13.0 — states BT-131 and leaves BT-129, BT-130 and BT-146 unset,
-    /// which is three fatal rules on a position the *engine itself* produced.
-    /// Nothing in the totals notices, because a missing quantity changes no
-    /// amount.
+    /// The shortfall is an invoice line (BG-25), so BR-22 / BR-23 / BR-26 apply to
+    /// it. Building it with `LineItem::fixed` states BT-131 and leaves BT-129,
+    /// BT-130 and BT-146 unset — three fatal rules on a position the *engine itself*
+    /// produced, and nothing in the totals notices, because a missing quantity
+    /// changes no amount.
     #[test]
     fn the_shortfall_is_a_complete_en16931_invoice_line() {
         let d = doc("200.00000");
@@ -189,5 +321,220 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(item.unit_price.as_ref().unwrap().unit, "CHF");
+    }
+
+    // ── minimum_charge_gross ─────────────────────────────────────────────────
+
+    use crate::tax::{FixedRateTax, TaxLayer};
+    use crate::vat::{LineVat, TaxCategory};
+    use rust_decimal::dec;
+
+    fn meta() -> DocumentMeta {
+        DocumentMeta {
+            currency: Currency::EUR,
+            ..Default::default()
+        }
+    }
+
+    /// A Stadtwerk bill: 7 % Trinkwasser beside 19 % Energie.
+    fn mixed_positions() -> Vec<LineItem> {
+        vec![
+            LineItem::fixed("Trinkwasser", Amount::parse("2.00000").unwrap())
+                .tag("reduced")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Grundpreis", Amount::parse("2.00000").unwrap())
+                .tag("full")
+                .build()
+                .unwrap(),
+        ]
+    }
+
+    fn mixed_layers() -> Vec<Box<dyn TaxLayer>> {
+        vec![
+            FixedRateTax::new("MwSt 7", dec!(0.07))
+                .unwrap()
+                .with_tag("reduced")
+                .boxed(),
+            FixedRateTax::new("MwSt 19", dec!(0.19))
+                .unwrap()
+                .with_tag("full")
+                .boxed(),
+        ]
+    }
+
+    #[test]
+    fn a_gross_minimum_is_met_exactly_when_the_named_rate_is_the_one_applied() {
+        let positions = mixed_positions();
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), mixed_layers(), vec![])
+                .unwrap();
+        assert_eq!(provisional.gross_total(), Amount::parse("4.52000").unwrap());
+
+        let mut top_up = minimum_charge_gross(
+            &provisional,
+            Amount::parse("9.90000").unwrap(),
+            LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+            "Mindestbetrag",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(top_up.has_tag(crate::tags::MINIMUM_CHARGE));
+        // 5.38 / 1.19 = 4.5210084…
+        assert_eq!(top_up.net_amount, Amount::parse("4.52101").unwrap());
+
+        top_up.tags.push("full".into());
+        let mut positions = positions;
+        positions.push(top_up);
+        let doc =
+            BillingDocument::from_positions(meta(), positions, mixed_layers(), vec![]).unwrap();
+        assert_eq!(doc.gross_total(), Amount::parse("9.90000").unwrap());
+        doc.verify_vat_attribution().unwrap();
+    }
+
+    /// The mistake this function exists to make impossible, as a build-time error.
+    ///
+    /// Grossing the shortfall down at 19 % while the top-up is actually taxed at
+    /// 7 % lands 0,54 € short of a 9,90 € minimum — 5,5 % — with every total
+    /// reconciling and `validate()` passing. The stated [`LineVat`] makes the two
+    /// layers contradict each other instead.
+    #[test]
+    fn naming_one_rate_and_being_taxed_at_another_is_an_error_not_a_shortfall() {
+        let positions = mixed_positions();
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), mixed_layers(), vec![])
+                .unwrap();
+
+        let mut top_up = minimum_charge_gross(
+            &provisional,
+            Amount::parse("9.90000").unwrap(),
+            LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+            "Mindestbetrag",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        // The mistake: tagged into the 7 % layer, priced for 19 %.
+        top_up.tags.push("reduced".into());
+        let mut positions = positions;
+        positions.push(top_up);
+
+        let err =
+            BillingDocument::from_positions(meta(), positions, mixed_layers(), vec![]).unwrap_err();
+        assert!(
+            matches!(err, BillingError::LayerError { .. }),
+            "expected a layer conflict, got {err}"
+        );
+        assert!(err.to_string().contains("exactly one VAT group"), "{err}");
+    }
+
+    /// The other half of the enforcement: a shortfall no layer covers keeps an
+    /// attribution the breakdown does not contain.
+    #[test]
+    fn a_shortfall_no_layer_taxes_is_reported_by_verify_vat_attribution() {
+        let positions = mixed_positions();
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), mixed_layers(), vec![])
+                .unwrap();
+        let top_up = minimum_charge_gross(
+            &provisional,
+            Amount::parse("9.90000").unwrap(),
+            LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+            "Mindestbetrag",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        // Neither "full" nor "reduced": no layer's base includes it.
+        let mut positions = positions;
+        positions.push(top_up);
+
+        let doc =
+            BillingDocument::from_positions(meta(), positions, mixed_layers(), vec![]).unwrap();
+        // The totals still reconcile …
+        doc.validate().unwrap();
+        // … and the attribution check is what notices.
+        assert!(doc.verify_vat_attribution().is_err());
+        assert!(doc.gross_total() < Amount::parse("9.90000").unwrap());
+    }
+
+    /// Under reverse charge or a zero-rated supply the divisor is 1, so the gross
+    /// minimum *is* the net minimum. No special case, no branch.
+    #[test]
+    fn a_zero_rate_makes_gross_and_net_coincide() {
+        let doc = BillingDocument::from_positions(
+            meta(),
+            vec![
+                LineItem::fixed("Leistung", Amount::parse("40.00000").unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let top_up = minimum_charge_gross(
+            &doc,
+            Amount::parse("100.00000").unwrap(),
+            LineVat::new(TaxCategory::ReverseCharge, Decimal::ZERO).unwrap(),
+            "Mindestbetrag",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(top_up.net_amount, Amount::parse("60.00000").unwrap());
+        assert_eq!(
+            top_up.vat.unwrap().category,
+            crate::vat::TaxCategory::ReverseCharge
+        );
+    }
+
+    #[test]
+    fn a_gross_minimum_already_met_adds_nothing() {
+        let doc =
+            BillingDocument::from_positions(meta(), mixed_positions(), mixed_layers(), vec![])
+                .unwrap();
+        assert!(
+            minimum_charge_gross(
+                &doc,
+                Amount::parse("4.52000").unwrap(),
+                LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+                "Mindestbetrag",
+                Currency::EUR,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    /// The gross variant compares BT-112 and the net variant BT-106 − BT-107, so on
+    /// a taxed document they disagree — which is the entire point.
+    #[test]
+    fn the_net_and_gross_helpers_answer_different_questions() {
+        let doc =
+            BillingDocument::from_positions(meta(), mixed_positions(), mixed_layers(), vec![])
+                .unwrap();
+        let minimum = Amount::<5>::parse("4.52000").unwrap();
+        // Gross is already 4.52, so nothing is owed …
+        assert!(
+            minimum_charge_gross(
+                &doc,
+                minimum,
+                LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+                "m",
+                Currency::EUR
+            )
+            .unwrap()
+            .is_none()
+        );
+        // … while the net is 4.00 and the net helper still tops it up.
+        assert_eq!(
+            minimum_charge(&doc, minimum, "m", Currency::EUR)
+                .unwrap()
+                .unwrap()
+                .net_amount,
+            Amount::parse("0.52000").unwrap()
+        );
     }
 }

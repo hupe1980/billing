@@ -326,11 +326,11 @@ pub(crate) fn exact_tax_in_gross(gross: Decimal, rate: Decimal) -> Result<Decima
 ///
 /// # No currency-named aliases
 ///
-/// There is deliberately no `EuroAmount` or `InvoiceAmt`. Both existed until 0.12.0
-/// and both were unused: `Amount<5>` says what `EuroAmount` said without claiming a
-/// currency the crate is careful never to assume, and `Amount<2>` says what
-/// `InvoiceAmt` said without implying that two decimals is "the invoice precision" —
-/// documents are assembled at `Amount<5>` and reduced with [`AmountScale`].
+/// There is deliberately no `EuroAmount` or `InvoiceAmt`. `Amount<5>` says what the
+/// first would without claiming a currency the crate is careful never to assume, and
+/// `Amount<2>` says what the second would without implying that two decimals is "the
+/// invoice precision" — documents are assembled at `Amount<5>` and reduced with
+/// [`AmountScale`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[must_use = "Amount is an immutable value; every operation returns a new one"]
 pub struct Amount<const P: u8>(i64);
@@ -382,6 +382,41 @@ impl<const P: u8> Amount<P> {
     /// - the value would overflow `i64`, or
     /// - the string carries **non-zero digits beyond `P`** decimal places
     ///   (excess trailing zeros are accepted).
+    ///
+    /// # If you are holding a `Decimal`, do not come through here
+    ///
+    /// This is the *text* boundary — a price from a CSV, a JSON string, a config
+    /// file. Converting a `Decimal` by formatting it and parsing the result is a
+    /// round trip through a string that can only lose, and the excess-precision
+    /// refusal above then reads as an obstacle to work around rather than as the
+    /// signal it is:
+    ///
+    /// ```rust
+    /// use billing::{Amount, RoundingStrategy};
+    /// use rust_decimal::dec;
+    ///
+    /// // A statutory rate in ct/kWh, as EUR/kWh. The quotient does not terminate.
+    /// let ct_per_kwh = dec!(12.03);
+    /// let eur_per_kwh = ct_per_kwh / dec!(100);
+    ///
+    /// // NOT this — `to_string()` then `parse`, with a `format!("{:.5}")` fallback
+    /// // for when the first attempt carries too many decimals.
+    /// // ✔ This: one named rounding, no text in the middle.
+    /// let price = Amount::<5>::from_decimal_rounded(
+    ///     eur_per_kwh, RoundingStrategy::MidpointAwayFromZero,
+    /// )?;
+    /// assert_eq!(price, Amount::parse("0.12030")?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// | You have | Excess precision should | Use |
+    /// |---|---|---|
+    /// | a string | be refused | this, or [`FromStr`] |
+    /// | a `Decimal` | be refused | [`checked_from_decimal`](Self::checked_from_decimal) |
+    /// | a `Decimal` | be rounded away | [`from_decimal_rounded`](Self::from_decimal_rounded) |
+    ///
+    /// The first two rows agree on every value by construction — that is what the
+    /// refusal above is for.
     ///
     /// # Examples
     /// ```rust
@@ -545,11 +580,10 @@ impl<const P: u8> Amount<P> {
     ///
     /// # Why exact, and not silently rounded
     ///
-    /// This is the `Decimal` counterpart of [`Amount::parse`], and the two now
-    /// agree: `parse("0.123456")` and `checked_from_decimal(dec!(0.123456))` both
-    /// fail at `P = 5`. Earlier releases rounded this conversion while `parse`
-    /// rejected it, so the same unrepresentable price was refused when it arrived
-    /// as text and quietly altered when it arrived as a `Decimal`.
+    /// This is the `Decimal` counterpart of [`Amount::parse`], and the two agree:
+    /// `parse("0.123456")` and `checked_from_decimal(dec!(0.123456))` both fail at
+    /// `P = 5`. Rounding here while `parse` refuses would mean the same
+    /// unrepresentable price is rejected as text and quietly altered as a `Decimal`.
     ///
     /// Rounding is never implicit in this crate. To round, name the strategy with
     /// [`Amount::from_decimal_rounded`].
@@ -1318,13 +1352,12 @@ impl<const P: u8> Amount<P> {
     /// # Total, and deliberately not fallible
     ///
     /// This comparison **cannot fail** — there is no error arm to handle and no
-    /// `unwrap` to write. Earlier releases returned `Result`, because the
-    /// difference was taken with `checked_sub` in `i64` and could overflow for
-    /// operands at opposite extremes of the range. Every real call site collapsed
-    /// that with `.unwrap_or(false)`, which silently reported *"outside
-    /// tolerance"* for what was actually an internal arithmetic failure — turning
-    /// a computation error into a spurious finding, in exactly the tolerance
-    /// checks written to catch billing discrepancies.
+    /// `unwrap` to write. A `Result` here (the difference taken in `i64`, which
+    /// overflows for operands at opposite extremes) collapses at every real call
+    /// site into `.unwrap_or(false)`, which reports *"outside tolerance"* for what
+    /// is actually an internal arithmetic failure — a computation error turned into
+    /// a spurious finding, in exactly the checks written to catch billing
+    /// discrepancies. The difference is taken in `i128` instead.
     ///
     /// Widening the subtraction to `i128` removes the failure mode rather than
     /// reporting it: every `i64` difference fits, so the answer is always the
@@ -1448,9 +1481,9 @@ impl<const P: u8> fmt::Display for Amount<P> {
 ///
 /// `Formatter::pad` is not usable here: it defaults to *left* alignment and it
 /// truncates to the formatter's precision, which would mangle a number into
-/// something like `"4."`. Writing through `write!` with an inline precision — what
-/// this impl used to do — silently discards width, fill and alignment altogether,
-/// so `{:>12}` was a no-op and invoice columns never lined up.
+/// something like `"4."`. Writing through `write!` with an inline precision silently
+/// discards width, fill and alignment altogether, making `{:>12}` a no-op so invoice
+/// columns never line up.
 fn pad_numeric(f: &mut fmt::Formatter<'_>, body: &str) -> fmt::Result {
     let width = match f.width() {
         Some(w) => w,
@@ -1558,6 +1591,12 @@ impl<const P: u8> Amount<P> {
     }
 }
 
+/// Text-boundary conversion — equivalent to [`Amount::parse`], including its
+/// refusal of non-zero digits beyond `P`.
+///
+/// For a [`Decimal`] use [`Amount::checked_from_decimal`] (refuse) or
+/// [`Amount::from_decimal_rounded`] (round) rather than formatting it and parsing
+/// the result.
 impl<const P: u8> FromStr for Amount<P> {
     type Err = ParseAmountError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -1740,10 +1779,10 @@ mod tests {
 
     #[test]
     fn checked_div_returns_the_quotient_and_refuses_a_zero_divisor() {
-        // Until 0.12.0 the only thing asserting this was a doctest: `properties.rs`
-        // called it and discarded the result, so replacing the whole body with
-        // `Ok(Default::default())` passed the suite. Deriving a unit price from a
-        // total is exactly where a silent zero would be least visible.
+        // A doctest is not enough here: the property test calls this and discards
+        // the result, so replacing the whole body with `Ok(Default::default())` gets
+        // past the suite. Deriving a unit price from a total is exactly where a
+        // silent zero is least visible.
         let total = Amount::<5>::parse("100.00000").unwrap();
         assert_eq!(
             total.checked_div(Decimal::from(4u32)).unwrap(),

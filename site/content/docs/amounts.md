@@ -35,11 +35,11 @@ above any single invoice, which is why the backing type is `i64` rather than `i1
 If you do aggregate past it, sum at a coarser precision rather than reaching for a
 wider integer.
 
-> There is deliberately no `EuroAmount` or `InvoiceAmt` alias. Both existed until
-> 0.12.0 and both were unused: `Amount<5>` says what the first said without claiming a
-> currency this crate is careful never to assume, and `Amount<2>` says what the second
-> said without implying two decimals is "the invoice precision" — documents are
-> assembled at `Amount<5>` and reduced with `AmountScale`.
+> There is deliberately no `EuroAmount` or `InvoiceAmt` alias. `Amount<5>` says what
+> the first would without claiming a currency this crate is careful never to assume,
+> and `Amount<2>` says what the second would without implying two decimals is "the
+> invoice precision" — documents are assembled at `Amount<5>` and reduced with
+> `AmountScale`.
 
 ## Overflow is visible, never silent
 
@@ -82,9 +82,41 @@ assert_eq!(
 );
 ```
 
-Earlier releases rounded the `Decimal` conversion while `parse` rejected it, so the
-same unrepresentable price was refused when it arrived as text and quietly altered
-when it arrived as a `Decimal`. That asymmetry is gone.
+Rounding the `Decimal` conversion while `parse` rejects it would refuse an
+unrepresentable price arriving as text and quietly alter the same one arriving as a
+`Decimal`. The two paths agree instead.
+
+### Which of the three, and never through a string
+
+`parse` is the **text** boundary — a price from a CSV, a JSON string, a config file.
+If you are holding a `Decimal`, going through `to_string()` is a round trip that can
+only lose, and the excess-precision refusal then reads as an obstacle to work around
+rather than as the signal it is. The shape that grows out of that misreading is a
+`parse` with a `format!("{:.5}", …)` fallback — two conversions, one of which
+[panics on a large enough value](../pricing/).
+
+| You have | Excess precision should | Use |
+|---|---|---|
+| a string | be refused | `parse`, or `FromStr` |
+| a `Decimal` | be refused | `checked_from_decimal` |
+| a `Decimal` | be rounded away | `from_decimal_rounded` |
+
+The first two rows agree on every value by construction — that is what the refusal is
+for. The third is the one you want whenever the value was *derived*: a statutory rate
+in ct/kWh divided by 100, a unit price from `total ÷ quantity`, an exchange
+conversion.
+
+```rust
+use billing::{Amount, RoundingStrategy};
+use rust_decimal::dec;
+
+// A statutory EEG rate in ct/kWh, as EUR/kWh. One named rounding, no text.
+let eur_per_kwh = dec!(12.03) / dec!(100);
+assert_eq!(
+    Amount::<5>::from_decimal_rounded(eur_per_kwh, RoundingStrategy::MidpointAwayFromZero)?,
+    Amount::parse("0.12030")?,
+);
+```
 
 ### The five strategies
 
@@ -188,11 +220,11 @@ assert!(stated.within_tolerance_ppm(computed, 10_000));   // within 1 %
 assert!(!stated.within_tolerance_ppm(computed, 4_000));   // not within 0.4 %
 ```
 
-It used to return `Result`, and every real call site collapsed that with
-`.unwrap_or(false)` — which reported *"outside tolerance"* for what was actually an
-internal arithmetic failure, in exactly the checks written to catch billing
-discrepancies. Widening the subtraction to `i128` removed the failure mode instead of
-reporting it.
+It returns `bool`, not `Result`. A fallible signature here collapses at every real
+call site into `.unwrap_or(false)`, which reports *"outside tolerance"* for what is
+actually an internal arithmetic failure — in exactly the checks written to catch
+billing discrepancies. Widening the subtraction to `i128` removes the failure mode
+rather than reporting it.
 
 ## Currency
 

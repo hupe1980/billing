@@ -465,7 +465,7 @@ pub struct TaxBreakdownEntry {
     /// A lawful *alternative* to [`exemption_reason`](Self::exemption_reason), not
     /// an addition to it: BR-E-10, BR-AE-10, BR-IC-10, BR-G-10 and BR-O-10 each
     /// require "a VAT exemption reason code (BT-121) **or** a VAT exemption reason
-    /// text (BT-120)". A caller holding only the code no longer has to invent
+    /// text (BT-120)". A caller holding only the code does not have to invent
     /// prose to satisfy the engine.
     ///
     /// **BR-CL-22** restricts the value to the VATEX code list; the engine does not

@@ -195,10 +195,10 @@ proptest! {
         n in 1usize..12,
         scale in 0u32..6,
     ) {
-        // The test above builds fractions that sum to *exactly* one, and that
-        // construction is precisely what hid the 0.11.0 bug: with no drift the
-        // deficit can never exceed one unit per fraction, so the branch that
-        // mishandled a larger one was unreachable from this generator.
+        // The test above builds fractions that sum to *exactly* one, which is the
+        // region where the interesting bug cannot occur: with no drift the deficit
+        // never exceeds one unit per fraction, so the branch that has to handle a
+        // larger one is unreachable from that generator.
         //
         // Real callers do not get exact fractions. `1/n` truncated to nine
         // decimals is what a config file or a spreadsheet hands you, and it sums
@@ -246,9 +246,9 @@ proptest! {
         total in 0u64..29_999_999u64,
         scale in 0u32..3,
     ) {
-        // The concrete shape from the 0.11.0 bug report, held as a law rather than
-        // a single example: three `0.333333333` shares are inside the documented
-        // tolerance, so they must split rather than fail — at every total the
+        // Held as a law rather than as a single example: three `0.333333333` shares
+        // are inside the documented tolerance, so they must split rather than fail —
+        // at every total the
         // tolerance accepts, not merely at the one that was tested.
         let fractions = [Decimal::new(333_333_333, 9); 3];
         let total = Decimal::from(total);
@@ -643,9 +643,9 @@ proptest! {
     /// `Amount::parse` and `Amount::checked_from_decimal` are documented as the
     /// text and `Decimal` halves of one conversion — *"a value refused as text is
     /// refused as a `Decimal`"*. Nothing enforced that across arbitrary inputs, and
-    /// the two did disagree: `Decimal::from_str` accepts an omitted integer part
-    /// and `parse` rejected it until 0.13.0, so `".5"` was refused as text and
-    /// accepted as a `Decimal` — the exact shape a CSV export produces.
+    /// they can disagree in ways no example catches: `Decimal::from_str` accepts an
+    /// omitted integer part, so a `parse` that refused `".5"` would reject as text
+    /// what it accepts as a `Decimal` — the exact shape a CSV export produces.
     ///
     /// Comparing acceptance rather than the value is what makes this a real check:
     /// it fails whichever of the two is the stricter one.
@@ -870,14 +870,11 @@ proptest! {
     /// An allocated share satisfies `verify_vat_attribution` whenever the document
     /// it came from did — **BR-S-08** and **BR-CO-14**, per recipient.
     ///
-    /// This is the property the 0.13.0 rewrite of `ProportionalAllocation` exists
-    /// to establish, and it needs a *multi-group* document to be interesting. With
-    /// one VAT group the old construction happened to agree; with two rates it
-    /// split the breakdown per group while correcting the positions in aggregate,
-    /// and the two landed a minor unit apart for roughly 45 % of recipients.
-    ///
-    /// A single-group generator would have passed against the old code, which is
-    /// exactly the way a property test can be strong and still prove nothing.
+    /// It needs a *multi-group* document to be interesting. Splitting the breakdown
+    /// per group while correcting the positions in aggregate happens to agree on a
+    /// single VAT group, and lands a minor unit apart for roughly 45 % of recipients
+    /// on two — so a single-group generator would pass against a broken split, which
+    /// is exactly the way a property test can be strong and still prove nothing.
     #[test]
     fn allocation_preserves_br_s_08_on_a_multi_rate_document(
         full in prop::collection::vec(1i64..50_000_000, 1..5),
@@ -973,5 +970,382 @@ proptest! {
                 "position {} does not reassemble from its shares", p
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Percentile billing — every figure billed is a rate that actually occurred
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Nearest-rank never interpolates, so the answer is always one of the samples.
+    /// The other common percentile definition averages the two neighbours, which
+    /// would bill a throughput figure the link never carried.
+    #[test]
+    fn a_percentile_is_always_a_sample_that_occurred(
+        values in prop::collection::vec(0i64..1_000_000, 1..64),
+        percent in 0u32..=100,
+    ) {
+        use billing::aggregation::{PercentileAggregator, UsageAggregator};
+        let agg = PercentileAggregator::new(
+            Decimal::from(percent),
+            |v: &i64| Decimal::from(*v),
+        ).unwrap();
+        let got = agg.aggregate(&values).unwrap();
+        prop_assert!(values.iter().any(|v| Decimal::from(*v) == got));
+    }
+
+    /// A higher percentile never bills less, and 100 % is the peak.
+    #[test]
+    fn percentiles_are_monotonic_and_top_out_at_the_maximum(
+        values in prop::collection::vec(0i64..1_000_000, 1..64),
+        a in 0u32..=100,
+        b in 0u32..=100,
+    ) {
+        use billing::aggregation::{MaxAggregator, PercentileAggregator, UsageAggregator};
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let at = |p: u32| PercentileAggregator::new(Decimal::from(p), |v: &i64| Decimal::from(*v))
+            .unwrap()
+            .aggregate(&values)
+            .unwrap();
+        prop_assert!(at(lo) <= at(hi));
+        prop_assert_eq!(
+            at(100),
+            MaxAggregator::new(|v: &i64| Decimal::from(*v)).aggregate(&values).unwrap()
+        );
+    }
+
+    /// "Discard the top 5 %, bill the highest one left" is the settlement rule every
+    /// transit contract states, and `ceil(0.95 × n)` is that rule as an index.
+    #[test]
+    fn p95_is_the_highest_sample_left_after_the_top_five_percent_is_discarded(
+        values in prop::collection::vec(0i64..1_000_000, 1..200),
+    ) {
+        use billing::aggregation::{PercentileAggregator, UsageAggregator};
+        let got = PercentileAggregator::p95(|v: &i64| Decimal::from(*v))
+            .aggregate(&values)
+            .unwrap();
+
+        let mut sorted = values.clone();
+        sorted.sort_unstable();
+        // `n - ceil(0.95n)` is what "the top 5 %" rounds down to.
+        let keep = (values.len() * 95).div_ceil(100).max(1);
+        sorted.truncate(keep);
+        prop_assert_eq!(got, Decimal::from(*sorted.last().unwrap()));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dynamic pricing rounds once over the whole sequence
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// An interval is not a leaf — it never becomes its own invoice line — so the
+    /// products are accumulated exactly and reduced **once**. Rounding each one
+    /// first drifts in a single direction, because commercial rounding is not
+    /// unbiased on a repeated fractional part.
+    #[test]
+    fn dynamic_pricing_is_the_single_rounding_of_the_exact_sum(
+        intervals in prop::collection::vec((1i64..1_000_000i64, 1i64..100_000i64), 1..40),
+    ) {
+        let mut builder = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
+        let mut exact = Decimal::ZERO;
+        for (qty_raw, price_raw) in &intervals {
+            // Quantities carry three decimals, prices five — the shape a spot
+            // sequence actually has, and enough for the product to exceed five.
+            let qty = Decimal::new(*qty_raw, 3);
+            let price = Amount::<5>::from_raw_units(*price_raw);
+            exact += qty * price.into_decimal();
+            builder = builder.interval(qty, price);
+        }
+        let net = builder.build().unwrap().calculate().unwrap().net_amount;
+        prop_assert_eq!(
+            net,
+            Amount::<5>::from_decimal_rounded(exact, RoundingStrategy::MidpointAwayFromZero).unwrap()
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Late payment interest
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Simple interest, never compounded — art. 2(6) of Directive 2011/7/EU says
+    /// so and §289 BGB forbids the alternative outright. Doubling the days doubles
+    /// the interest, up to the one rounding at the end.
+    #[test]
+    fn late_payment_interest_is_linear_in_the_days(
+        overdue in arb_positive_amount(),
+        percent in 1u32..=100_000,
+        days in 1u32..1_000,
+    ) {
+        let penalty = LatePaymentPenalty::new(Decimal::new(percent as i64, 4)).unwrap();
+        let once = penalty.interest_on(overdue, days).unwrap();
+        let twice = penalty.interest_on(overdue, days * 2).unwrap();
+        let doubled = once.checked_add(once).unwrap();
+        // Both sides round once at five decimals, so they can differ by one unit.
+        let gap = twice.checked_sub(doubled).unwrap().abs();
+        prop_assert!(gap <= Amount::<5>::from_raw_units(1), "gap {gap}");
+    }
+
+    /// The whole point of the type: an invoice's own totals never move, and paying
+    /// late costs strictly more than paying on the due date.
+    #[test]
+    fn a_penalty_only_ever_adds_to_what_is_payable(
+        overdue in arb_positive_amount(),
+        percent in 1u32..=100_000,
+        days in 0u32..1_000,
+        fee_raw in 0i64..10_000_000,
+    ) {
+        let penalty = LatePaymentPenalty::new(Decimal::new(percent as i64, 4))
+            .unwrap()
+            .with_recovery_fee(Amount::<5>::from_raw_units(fee_raw))
+            .unwrap();
+        let payable = penalty.payable_on(overdue, days).unwrap();
+        prop_assert!(payable >= overdue);
+        if days == 0 {
+            prop_assert_eq!(payable, overdue);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Every position the engine generates is emittable as an invoice line
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The crate states this as a design invariant. The arithmetic half of it is
+    /// `PEPPOL-EN16931-R120` — **fatal** — which requires BT-131 to equal
+    /// `BT-129 × (BT-146 ÷ BT-149)` plus the BG-27 / BG-28 leaves, within ±0.02.
+    ///
+    /// Every generator in the crate is exercised here, because the one that fails it
+    /// is the one whose price is *derived* rather than quoted.
+    #[test]
+    fn every_generated_position_satisfies_r120(
+        qty_raw in 1i64..100_000_000i64,
+        price_raw in 1i64..10_000_000i64,
+        block_raw in 1i64..1_000_000i64,
+        intervals in prop::collection::vec((1i64..1_000_000i64, 1i64..100_000i64), 1..40),
+    ) {
+        let qty = Decimal::new(qty_raw, 3);
+        let price = Amount::<5>::from_raw_units(price_raw);
+        let check = |item: &LineItem| item.check_price_consistency();
+
+        // Graduated, volume and block schedules.
+        for schedule in [
+            RateSchedule::graduated()
+                .unit("kWh").currency(Currency::EUR)
+                .band(RateBand::up_to(Decimal::new(qty_raw / 2 + 1, 3), price))
+                .band(RateBand::over(Decimal::new(qty_raw / 2 + 1, 3), price))
+                .build().unwrap(),
+            RateSchedule::volume()
+                .unit("kWh").currency(Currency::EUR)
+                .band(RateBand::over(Decimal::ZERO, price))
+                .build().unwrap(),
+            RateSchedule::block()
+                .unit("GB").currency(Currency::EUR)
+                .band(RateBand::block(Decimal::new(block_raw, 3), price))
+                .build().unwrap(),
+        ] {
+            for item in schedule.split(qty).unwrap() {
+                prop_assert!(check(&item).is_ok(), "{:?}: {:?}", item.description, check(&item));
+            }
+        }
+
+        // Capacity — a flat fee, so R120 holds as `1 × amount`.
+        let capacity = RateSchedule::capacity()
+            .unit("Mbps").currency(Currency::EUR)
+            .band(RateBand::over(Decimal::ZERO, price))
+            .build().unwrap();
+        prop_assert!(check(&capacity.apply_peak(qty).unwrap()).is_ok());
+
+        // Time-of-use bands.
+        let tou = TimeOfUsePricing::builder()
+            .unit("kWh").currency(Currency::EUR)
+            .band(TimeBand::new("peak", price))
+            .build().unwrap();
+        for item in tou.calculate(&[("peak", qty)]).unwrap() {
+            prop_assert!(check(&item).is_ok());
+        }
+
+        // Dynamic pricing — the aggregate line, whose BT-146 is a weighted average
+        // with a long non-terminating expansion. This is the one that can fail.
+        let mut b = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
+        for (q, p) in &intervals {
+            b = b.interval(Decimal::new(*q, 3), Amount::<5>::from_raw_units(*p));
+        }
+        let dynamic = b.build().unwrap().calculate().unwrap();
+        prop_assert!(check(&dynamic).is_ok(), "dynamic: {:?}", check(&dynamic));
+
+        // …and it still holds once the document is reduced to EN 16931's two
+        // decimals, which is where the amount moves and the price does not.
+        let doc = BillingDocument::builder()
+            .currency(Currency::EUR)
+            .amount_scale(AmountScale::EN16931)
+            .positions(vec![dynamic])
+            .build().unwrap();
+        prop_assert_eq!(doc.price_inconsistent_positions().count(), 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A gross minimum charge reaches its target
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// `minimum_charge_gross` tops the document up to `minimum_gross` at the rate
+    /// the contract names. The net top-up is one rounding of the exact quotient, so
+    /// the gross that comes back lands within a rounding unit of the target — never
+    /// the 5 % short that deriving it by hand at the wrong rate produced.
+    #[test]
+    fn a_gross_minimum_lands_on_its_target(
+        base_raw in 1i64..1_000_000_000i64,
+        extra_raw in 1i64..1_000_000_000i64,
+        rate in arb_rate(),
+    ) {
+        use billing::{TaxCategory, minimum_charge_gross};
+
+        let base = Amount::<5>::from_raw_units(base_raw);
+        let vat = LineVat::new(TaxCategory::Standard, rate).unwrap();
+        let layers = || -> Vec<Box<dyn billing::TaxLayer>> {
+            vec![FixedRateTax::new("VAT", rate).unwrap().boxed()]
+        };
+        let positions = vec![LineItem::fixed("Verbrauch", base).build().unwrap()];
+        let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), layers(), vec![]).unwrap();
+        // A minimum strictly above the current gross, so a top-up is always due.
+        let minimum = provisional
+            .gross_total()
+            .checked_add(Amount::<5>::from_raw_units(extra_raw))
+            .unwrap();
+
+        let top_up = minimum_charge_gross(&provisional, minimum, vat, "Mindestbetrag",
+                                          Currency::EUR).unwrap().unwrap();
+        prop_assert!(!top_up.net_amount.is_negative());
+
+        let mut positions = positions;
+        positions.push(top_up);
+        let doc = BillingDocument::from_positions(meta(), positions, layers(), vec![]).unwrap();
+
+        // Two roundings stand between the exact quotient and BT-112 — the net top-up
+        // at five decimals and the tax on it — so the target is met to within them.
+        let gap = doc.gross_total().checked_sub(minimum).unwrap().abs();
+        prop_assert!(gap <= Amount::<5>::from_raw_units(2), "gap {gap}");
+        doc.verify_vat_attribution().unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// serde round trip
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "serde")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// `from_str(to_string(doc)) == doc`, for a document carrying every field the
+    /// header and the settlement chain have.
+    ///
+    /// Worth stating as a law rather than as a handful of examples, because almost
+    /// every type in this crate deserialises through `#[serde(try_from = …)]` and
+    /// re-runs its constructor. That is what keeps an invalid document out of the
+    /// process — and it is also what makes a field that serialises but is never read
+    /// back look exactly like a field that works. A `Vec` without `#[serde(default)]`
+    /// fails loudly; one *with* it silently comes back empty if the writer spelled
+    /// the key differently.
+    #[test]
+    fn a_document_survives_a_json_round_trip(
+        amounts in prop::collection::vec(1i64..100_000_000, 1..6),
+        rate in arb_rate(),
+        prepaid_raw in 0i64..1_000_000,
+        note in "[a-zA-Z ]{0,24}",
+        preceding in prop::collection::vec("[A-Z]{2}-[0-9]{4}", 0..3),
+    ) {
+        let positions: Vec<LineItem> = amounts
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
+                    .period("2026-06-01", "2026-06-30")
+                    .meta("malo_id", "52435677816")
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+
+        let meta = DocumentMeta {
+            invoice_number: "INV-2026-001".into(),
+            currency: Currency::EUR,
+            period: Some(Period::new("2026-06-01", "2026-06-30")),
+            issue_date: Some("2026-07-01".into()),
+            due_date: Some("2026-07-31".into()),
+            payment_terms: Some(
+                PaymentTerms::text("Zahlbar in 30 Tagen.")
+                    .with_discount(EarlyPaymentDiscount::new(10, dec!(2)).unwrap()),
+            ),
+            issuer_id: Some(PartyIdentifier::scheme("0088", "4004404000018")),
+            recipient_id: Some(PartyIdentifier::new("KND-4711")),
+            preceding: preceding
+                .iter()
+                .map(|n| PrecedingInvoice::new(n).unwrap().with_issue_date("2026-05-31"))
+                .collect(),
+            notes: vec![Note::coded("AAI", note)],
+            ..Default::default()
+        };
+
+        let taxes: Vec<Box<dyn TaxLayer>> =
+            vec![FixedRateTax::new("MwSt", rate).unwrap().boxed()];
+        let doc = BillingDocument::from_positions(meta, positions, taxes, vec![]).unwrap();
+        // BT-111 is BT-110 converted, so `PEPPOL-EN16931-R055` (shared sign) holds.
+        let bt111 = VatAccountingCurrency::converted(
+            Currency::new("PLN").unwrap(),
+            doc.vat_total().unwrap(),
+            dec!(4.30),
+            AmountScale::EN16931,
+        ).unwrap();
+        let doc = doc
+            .with_prepaid(Amount::<5>::from_raw_units(prepaid_raw))
+            .unwrap()
+            .with_vat_accounting_currency(bt111)
+            .unwrap();
+
+        let json = serde_json::to_string(&doc).unwrap();
+        // Non-vacuity: the field has to be *on the wire* for the round trip to mean
+        // anything. Comparing two values that both lost it would still pass.
+        for reference in &preceding {
+            prop_assert!(json.contains(reference.as_str()), "BT-25 {reference} missing from {json}");
+        }
+        // `PaymentTerms` persists as its two structured halves, not as the BT-20
+        // rendering — `Display`/`FromStr` are the wire syntax, serde is storage.
+        prop_assert!(json.contains("Zahlbar in 30 Tagen."));
+        prop_assert!(json.contains("\"days\":10"));
+        prop_assert!(json.contains("4004404000018"));
+
+        let back: BillingDocument = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back, &doc);
+
+        // The header fields specifically, because `PartialEq` on the whole document
+        // would still pass if *both* sides lost the same field to a `default`.
+        prop_assert_eq!(back.meta.preceding.len(), doc.meta.preceding.len());
+        prop_assert_eq!(back.meta.payment_terms.as_ref(), doc.meta.payment_terms.as_ref());
+        prop_assert_eq!(back.meta.issuer_id.as_ref(), doc.meta.issuer_id.as_ref());
+        prop_assert_eq!(back.meta.notes.len(), 1);
+        prop_assert_eq!(back.prepaid(), doc.prepaid());
+
+        // And it is validated on the way in, not merely reconstructed.
+        back.validate().unwrap();
     }
 }

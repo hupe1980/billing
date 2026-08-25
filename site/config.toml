@@ -35,7 +35,6 @@ insert_anchor_links = "left"
 # of the HTML can serve both palettes. Zola generates the two stylesheets from the
 # light/dark theme pair; the shell switches between them without a reflow.
 [markdown.highlighting]
-enabled = true
 style = "class"
 light_theme = "github-light"
 dark_theme = "github-dark"

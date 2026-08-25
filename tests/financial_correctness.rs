@@ -516,9 +516,9 @@ fn tou_zero_quantity_band_skipped() {
 
 #[test]
 fn tou_unknown_band_is_an_error_not_a_silent_skip() {
-    // Regression: an unknown band name used to be skipped silently, which meant a
-    // typo'd or renamed band dropped real consumption off the invoice with no
-    // signal at all — systematic under-billing. It is now a hard error.
+    // Skipping an unknown band name silently means a typo'd or renamed band drops
+    // real consumption off the invoice with no signal at all — systematic
+    // under-billing. It is a hard error.
     let tou = TimeOfUsePricing::builder()
         .unit("kWh")
         .currency(Currency::EUR)
@@ -1413,7 +1413,7 @@ fn minimum_charge_none_returns_ok_none() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// RateBand::free_up_to — description no longer hardcodes "units"
+// RateBand::free_up_to — the description carries no hardcoded unit
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -2007,7 +2007,7 @@ fn assert_valid_overflow_returns_err() {
 // LineItem — negative unit price rejected
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// BUG-1 fix: negative unit price is now ALLOWED (§27 EEG 2023 negative EPEX hours).
+/// A negative unit price is allowed — §27 EEG 2023 negative EPEX hours.
 /// A debit at a negative unit_price produces a negative net_amount.
 #[test]
 fn line_item_negative_unit_price_debit_produces_negative_net() {
@@ -2739,7 +2739,8 @@ fn all_positions_count_correct() {
 }
 
 /// Two VAT layers whose bases overlap tax the same position twice, so BR-S-08
-/// cannot hold for either group. Assembly used to accept this silently.
+/// cannot hold for either group, so assembly refuses it rather than accepting it
+/// silently.
 #[test]
 fn two_vat_layers_covering_one_position_are_rejected() {
     let taxes: Vec<Box<dyn TaxLayer>> = vec![
@@ -3314,9 +3315,9 @@ fn checked_from_decimal_basic() {
 
 /// `checked_from_decimal` refuses excess precision; it does not round it away.
 ///
-/// The rounding it used to do was implicit — no `RoundingStrategy` argument — which
-/// contradicted both the crate's "rounding is always explicit" invariant and
-/// `parse`, which rejects the identical value. Rounding is now opt-in and named.
+/// Rounding here would be implicit — there is no `RoundingStrategy` argument —
+/// contradicting both the crate's "rounding is always explicit" invariant and
+/// `parse`, which rejects the identical value. Rounding is opt-in and named.
 #[test]
 fn checked_from_decimal_refuses_excess_precision() {
     use rust_decimal::Decimal;
@@ -3548,9 +3549,9 @@ fn within_tolerance_ppm_no_panic_when_diff_equals_i64_min() {
 
 /// The comparison is **total**: opposite extremes give a real answer, not an error.
 ///
-/// `MAX - MIN` overflows `i64`, which is why this used to return `Err` — and why
-/// every call site wrote `.unwrap_or(false)`, silently converting an arithmetic
-/// failure into a spurious "outside tolerance" finding. The difference is now taken
+/// `MAX - MIN` overflows `i64`, so a fallible signature would force every call site
+/// into `.unwrap_or(false)`, silently converting an arithmetic failure into a
+/// spurious "outside tolerance" finding. The difference is taken
 /// in `i128`, so the answer is the mathematically correct one.
 #[test]
 fn within_tolerance_ppm_is_total_at_the_extremes() {
@@ -3595,10 +3596,10 @@ fn minimum_charge_empty_description_returns_err() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// v0.4.0 — New APIs from eeg-billing feedback
+// Credits, unit labels and metadata on a position
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ── BUG-2: LineItem::credit_fixed ────────────────────────────────────────────
+// ── LineItem::credit_fixed ───────────────────────────────────────────────────
 
 #[test]
 fn credit_fixed_produces_negative_net() {
@@ -3633,7 +3634,7 @@ fn fixed_and_credit_fixed_are_symmetric() {
     assert_eq!(debit.net_amount.to_raw(), -credit.net_amount.to_raw());
 }
 
-// ── FR-3: LineItem::for_usage ────────────────────────────────────────────────
+// ── LineItem::for_usage ──────────────────────────────────────────────────────
 
 #[test]
 fn for_usage_positive_price() {
@@ -3661,7 +3662,7 @@ fn for_usage_zero_quantity_gives_zero_net() {
     assert!(item.net_amount.is_zero());
 }
 
-// ── FR-4: LineItem::get_meta ─────────────────────────────────────────────────
+// ── LineItem::get_meta ───────────────────────────────────────────────────────
 
 #[test]
 fn get_meta_returns_existing_value() {
@@ -3675,7 +3676,7 @@ fn get_meta_returns_existing_value() {
     assert_eq!(item.get_meta("missing_key"), None);
 }
 
-// ── FR-7: LineItem: Eq ───────────────────────────────────────────────────────
+// ── LineItem: Eq ─────────────────────────────────────────────────────────────
 
 #[test]
 fn line_item_implements_eq() {
@@ -3703,7 +3704,7 @@ fn line_item_implements_eq_with_vec_dedup() {
     assert_eq!(items.len(), 2); // a==b, so dedup removes one
 }
 
-// ── BUG-3 correction: BillingError is #[non_exhaustive] — idiomatic _ => pattern ──
+// ── BillingError is #[non_exhaustive] — the idiomatic `_ =>` arm ─────────────
 
 /// `BillingError` is `#[non_exhaustive]` so the library can add new variants in
 /// minor releases without breaking callers.  The idiomatic match pattern always
@@ -3734,7 +3735,7 @@ fn billing_error_non_exhaustive_match_pattern() {
     );
 }
 
-// ── FR-1: DocumentMeta new typed fields ─────────────────────────────────────
+// ── DocumentMeta's typed fields ──────────────────────────────────────────────
 
 #[test]
 fn document_meta_new_fields_round_trip() {
@@ -3796,7 +3797,7 @@ fn document_meta_equality_uses_new_fields() {
     assert_ne!(base, different);
 }
 
-// ── FR-5: RateLookup (capacity-based rate table) ─────────────────────────────
+// ── RateLookup — a capacity-keyed rate table ─────────────────────────────────
 
 #[test]
 fn rate_lookup_eeg_scenario() {
@@ -3868,7 +3869,7 @@ fn rate_lookup_no_fallback_error() {
     assert!(lookup.rate_for(dec!(50)).is_err());
 }
 
-// ── FR-6: BillingDocument::validate() returns Result ────────────────────────
+// ── BillingDocument::validate() returns Result ───────────────────────────────
 // (Corruption tests live in src/document.rs unit tests which have private field access.)
 
 #[test]
@@ -3905,10 +3906,10 @@ fn assert_valid_does_not_panic_on_valid_doc() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// v0.5.0 deep audit — 5 correctness fixes
+// Sign, reserved tags and layer bases
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ── Fix 1: LineItem stores Sign field ────────────────────────────────────────
+// ── LineItem stores an explicit Sign ─────────────────────────────────────────
 
 #[test]
 fn line_item_sign_stored_debit() {
@@ -3980,7 +3981,7 @@ fn line_item_for_usage_sign_is_debit() {
     assert_eq!(item.sign, billing::Sign::Debit);
 }
 
-// ── Fix 2: PerUnitLevy uses sign field, not net_amount polarity ──────────────
+// ── PerUnitLevy reads `sign`, not net_amount polarity ────────────────────────
 
 /// Core regression: a Sign::Debit position at a negative price (EPEX scenario)
 /// MUST be included in the PerUnitLevy base. Before the fix, `!net_amount.is_negative()`
@@ -4049,7 +4050,7 @@ fn per_unit_levy_mixed_sign_positions() {
     assert_eq!(tax_item.net_amount, Amount::parse("20.50000").unwrap());
 }
 
-// ── Fix 3: Amount::checked_abs ───────────────────────────────────────────────
+// ── Amount::checked_abs ──────────────────────────────────────────────────────
 
 #[test]
 fn checked_abs_positive() {
@@ -4082,7 +4083,7 @@ fn checked_abs_min_returns_err() {
     );
 }
 
-// ── Fix 4: split_graduated errors when quantity exceeds last band upper ──────
+// ── split_graduated errors when quantity exceeds the last band ───────────────
 
 #[test]
 fn graduated_quantity_exceeds_last_finite_band_errors() {
@@ -4139,7 +4140,7 @@ fn graduated_open_ended_last_band_handles_any_quantity() {
     assert_eq!(total, Amount::parse("300.00000").unwrap());
 }
 
-// ── Fix 5: Sign derives Hash ─────────────────────────────────────────────────
+// ── Sign derives Hash ────────────────────────────────────────────────────────
 
 #[test]
 fn sign_usable_as_hashmap_key() {
@@ -4181,7 +4182,7 @@ fn percentage_charge_includes_debit_at_negative_price() {
 #[test]
 fn percentage_charge_does_not_become_a_credit_on_a_negative_base() {
     use billing::PercentageCharge;
-    // Earlier releases returned −0.50 here: 5 % of a base of −10.00. That is a
+    // Taking 5 % of a base of −10.00 would return −0.50 here. That is a
     // "charge" that increases what the supplier owes the customer, which is exactly
     // what `PercentageCharge::new` refuses when the same result is asked for through
     // a negative *rate* ("a negative charge is a discount"). Reaching it through the
@@ -4225,7 +4226,7 @@ fn percentage_discount_excludes_credit_positions() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-2: LineItem::period + Period type (v0.6.0)
+// LineItem::period and the Period type
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -4328,10 +4329,10 @@ fn document_meta_period_consistent_with_line_item() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// v0.7.0 deep audit fixes
+// No hidden panic inside a Result-returning path
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ── Fix 1: allocation uses checked_mul_qty (no hidden panic in Result fn) ────
+// ── Allocation multiplies with checked_mul_qty ───────────────────────────────
 
 /// Allocation on a document where net_total × share would overflow mul_qty.
 /// Before the fix, `ProportionalAllocation::allocate` could panic inside a
@@ -4377,7 +4378,7 @@ fn allocation_position_scaling_exact() {
     assert_eq!(total, Amount::parse("300.00000").unwrap());
 }
 
-// ── Fix 2: DynamicPricing uses checked_mul_qty ────────────────────────────────
+// ── DynamicPricing multiplies with checked arithmetic ────────────────────────
 
 #[test]
 fn dynamic_pricing_no_panic_on_large_price_and_qty() {
@@ -4407,7 +4408,7 @@ fn dynamic_pricing_negative_epex_price() {
     assert_eq!(item.sign, billing::Sign::Debit);
 }
 
-// ── Fix 3: Amount::checked_round_to ──────────────────────────────────────────
+// ── Amount::checked_round_to ─────────────────────────────────────────────────
 
 #[test]
 fn checked_round_to_lower_precision() {
@@ -4442,7 +4443,7 @@ fn round_to_same_precision_is_identity() {
     assert_eq!(a, r);
 }
 
-// ── Fix 4: prorate clears period to prevent stale date propagation ───────────
+// ── prorate clears the period, so no stale date propagates ───────────────────
 
 #[test]
 fn prorate_clears_source_period() {
@@ -4476,10 +4477,10 @@ fn prorate_caller_can_set_period_after_prorate() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// v0.8.0 deep audit — Amount::parse i128 fix + edge case coverage
+// Amount::parse at the representable limits
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ── Critical fix: Amount::MIN parse round-trip ───────────────────────────────
+// ── Amount::MIN survives a Display / parse round trip ────────────────────────
 
 /// The most negative Amount<5> value (-92233720368547.75808) must round-trip
 /// through Display → parse. Before the i128 fix, parse returned Err because the
@@ -4745,7 +4746,7 @@ fn rate_lookup_zero_parameter() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// BUG-1 — MonetaryOverflow carries the offending input value
+// MonetaryOverflow carries the offending input value
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -4820,7 +4821,7 @@ fn overflow_error_checked_abs_includes_self() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// BUG-2 — InvalidInput / InvalidSchedule accept dynamic String messages
+// InvalidInput / InvalidSchedule accept dynamic String messages
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -4878,7 +4879,7 @@ fn billing_error_display_overflow_with_input() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// BUG-3 — LineItem::for_usage_rounded prevents unit-price precision drift
+// LineItem::for_usage_rounded prevents unit-price precision drift
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -4920,7 +4921,7 @@ fn for_usage_rounded_net_agrees_with_rounded_price() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-2 — LineItem::credit_for_usage
+// LineItem::credit_for_usage
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -4994,7 +4995,7 @@ fn credit_for_usage_excluded_from_per_unit_levy() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-4 — DocumentMeta.labels
+// DocumentMeta.labels
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5041,7 +5042,7 @@ fn document_meta_labels_propagated_through_allocation() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-7 — Amount::to_decimal()
+// Amount::to_decimal()
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5062,7 +5063,7 @@ fn to_decimal_lossless_roundtrip() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-5 — Mixed VAT rates via require_tag (documented pattern)
+// Mixed VAT rates via require_tag (documented pattern)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5101,7 +5102,7 @@ fn mixed_vat_rates_require_tag_pattern() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// BUG-4 — RateLookup::build() returns Err (not panic) on empty table
+// RateLookup::build() returns Err (not panic) on empty table
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5111,7 +5112,7 @@ fn rate_lookup_empty_builder_returns_err() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-6 — RateLookup with Decimal-keyed capacity blocks
+// RateLookup with Decimal-keyed capacity blocks
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5201,7 +5202,7 @@ fn eeg_feed_in_billing_end_to_end() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-3 — Period::from_display
+// Period::from_display
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
@@ -5292,7 +5293,7 @@ fn credit_for_usage_rounded_price_scale_applied() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-8 — proportional_split
+// proportional_split
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// Verify the key invariant: Σ(parts) == total (at given scale).
@@ -5461,7 +5462,7 @@ fn proportional_split_eeg_42b_scenario() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// FR-5 — mixed-rate tax document (tag-based tax exemption)
+// mixed-rate tax document (tag-based tax exemption)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// German prosumer billing: 19% VAT on grid charges, 0% (exempt) on PV feed-in.
@@ -5528,10 +5529,10 @@ fn tagged_tax_layer_excludes_untagged_positions_exactly() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// BUG-1 / BUG-4 regression guards — ensure fixes are not regressed
+// Two guards that are easy to lose in a refactor
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// BUG-1: checked_from_decimal must return the offending input value on overflow.
+/// `checked_from_decimal` must return the offending input value on overflow.
 #[test]
 fn checked_from_decimal_overflow_carries_input_value() {
     // Construct a Decimal that is just above Amount<5>::MAX.
@@ -5552,7 +5553,7 @@ fn checked_from_decimal_overflow_carries_input_value() {
     }
 }
 
-/// BUG-4: RateLookup::builder().build() with zero entries must return Err, not panic.
+/// `RateLookup::builder().build()` with zero entries must return `Err`, not panic.
 #[test]
 fn rate_lookup_empty_builder_returns_err_not_panics() {
     let result = RateLookup::builder().build();

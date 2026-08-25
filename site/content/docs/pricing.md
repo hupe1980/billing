@@ -14,7 +14,7 @@ positions.
 | `graduated` | each tier at its own price (Staffelpreise) | one position per tier |
 | `volume` | **all** units at the price of the top tier reached | one position |
 | `block` | rounded-up blocks × price per block | one position |
-| `capacity` | the peak selects a tier; a flat charge is billed | one position |
+| `capacity` | one value selects a tier — a peak, or a P95 — and a flat charge is billed | one position |
 
 ```rust
 use billing::prelude::*;
@@ -111,6 +111,21 @@ which is informational: the net amount is set from the exact accumulated total, 
 from `total_quantity × average_price`, so no rounding error is introduced by the
 display figure.
 
+### One rounding over the whole sequence
+
+An interval is **not a leaf**. Unlike a time-of-use band or a schedule tier it never
+becomes its own invoice line, so there is nothing at that level to round to — and
+`Σ(qty × price)` is accumulated as exact `Decimal` and reduced once at the end.
+
+The difference is not academic. A settled spot-price year is 8 760 hourly intervals,
+or 35 040 quarter-hourly ones, and commercial rounding is not unbiased on a repeated
+fractional part. Rounding each product to the engine's five decimals first therefore
+drifts in *one* direction, by up to `5 × 10⁻⁶` per interval — `0.0438` over a year,
+which is four whole cents on a two-decimal invoice, from arithmetic alone.
+
+It is the same rule [`AmountScale::apply_decimal`](../amounts/) states at the
+interchange boundary: two roundings are not one.
+
 Negative prices are legally binding in spot markets, and the crate represents them.
 A `Sign::Debit` position with a negative unit price stays a *debit* — that is what
 distinguishes "consumption at a negative price" from "a credit", and levy and
@@ -144,11 +159,35 @@ parameter above every bound with no `fallback` is an error rather than a silent
 fall-through to the last entry, and a negative parameter is refused — the same
 "no silent under-billing" rule `RateSchedule::split` and `apply_peak` follow.
 
+### `.ok()` on a table written as literals swallows the bug
+
+`build()` returns `Result` because a rate table is often loaded from configuration,
+where a bad ladder is a runtime condition. When the table is **written in the
+source** — a statutory tier list, an EEG ladder, a regulated fee schedule — a
+construction failure is an *authorship* bug, and the two must not be spelled the same
+way:
+
+```rust,ignore
+// ✘ A non-contiguous ladder now returns the same answer as "no table for this
+//   year", and the caller is told to look elsewhere rather than that it is wrong.
+2023..=2026 => RateLookup::builder().at_most(..).build().ok(),
+
+// ✔ The two states stay distinguishable, and the message names the table.
+2023..=2026 => Some(RateLookup::builder().at_most(..).build()
+                    .expect("EEG 2023 hydro ladder is malformed")),
+_ => None,
+```
+
+There is deliberately no `build_static()` doing this for you: `.expect("…")` already
+is one, and it carries a message the crate could not have written. The same applies
+to every fallible builder here.
+
 ## Usage aggregation
 
-Six aggregators reduce a slice of raw events to the scalar a schedule prices:
-`SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `LATEST`, `WEIGHTED_SUM`. Each takes a closure,
-so they work on your event type without a trait impl.
+Eight aggregators reduce a slice of raw events to the scalar a schedule prices:
+`SUM`, `COUNT`, `UNIQUE_COUNT`, `MAX`, `MEAN`, `PERCENTILE`, `LATEST`,
+`WEIGHTED_SUM`. Each takes a closure, so they work on your event type without a
+trait impl.
 
 ```rust
 use billing::aggregation::{MaxAggregator, SumAggregator, UsageAggregator};
@@ -174,9 +213,44 @@ assert!(SumAggregator::new(|_: &Sample| Decimal::MAX)
 where each resource contributes `value × fraction_of_period` — and is the one most
 able to overflow, because it multiplies before it accumulates.
 
-`COUNT`, `UNIQUE_COUNT`, `MAX` and `LATEST` select or count rather than accumulate,
-so they never return `Err`. They share the signature anyway, because that is what
-lets you write code generic over `UsageAggregator`.
+`COUNT`, `UNIQUE_COUNT`, `MAX`, `PERCENTILE` and `LATEST` select or count rather than
+accumulate, so they never return `Err`. They share the signature anyway, because that
+is what lets you write code generic over `UsageAggregator`.
+
+### Burstable (95th-percentile) billing
+
+Every IP transit, CDN egress and DDoS-scrubbing contract settles the same way, and no
+other aggregator can express it. The provider samples throughput every five minutes,
+discards the top 5 % of the samples, and bills the highest one left — so a customer
+may burst above their committed rate for roughly 36 hours in a 30-day month and pay
+nothing extra. `MAX` would bill the single worst five-minute window of the month;
+`MEAN` would bill a rate the link never carried.
+
+```rust
+use billing::aggregation::{PercentileAggregator, UsageAggregator};
+use rust_decimal::{Decimal, dec};
+
+struct Sample { mbps: u32 }
+let mbps = |s: &Sample| Decimal::from(s.mbps);
+
+// Nineteen samples at 100 Mbps and one 900 Mbps burst.
+let mut samples: Vec<Sample> = (0..19).map(|_| Sample { mbps: 100 }).collect();
+samples.push(Sample { mbps: 900 });
+
+assert_eq!(PercentileAggregator::p95(mbps).aggregate(&samples)?, dec!(100));
+assert_eq!(PercentileAggregator::new(dec!(100), mbps)?.aggregate(&samples)?, dec!(900));
+```
+
+**Nearest-rank, never interpolated.** The samples are sorted ascending and the one at
+rank `ceil(p ÷ 100 × n)` is returned. With the conventional 8 640 five-minute samples
+in a 30-day month, "discard the top 5 %" removes 432 and the next highest is sample
+8 208 — exactly `ceil(0.95 × 8640)`. The other common percentile definition averages
+the two neighbouring samples, which would bill a throughput figure that never occurred
+on the link.
+
+`MEAN` is its evenly-spaced sibling: the average concurrent seats, the average daily
+storage. When the samples are *not* interchangeable — a VM that ran three hours beside
+one that ran a month — `WEIGHTED_SUM` is the aggregator that says so.
 
 ## The `PricingModel` trait
 
@@ -259,32 +333,10 @@ let doc = EegSettlement { payout_eur: 400 }.settle(meta)?;
 assert_eq!(doc.net_total(), Amount::<5>::parse("-400.00000")?);
 ```
 
-An earlier release had a **second trait** for this, with its own method names and a
-blanket impl. It saved one `type Usage = ();` line and one ignored parameter, and cost
-a second vocabulary (`positions` versus `line_items`, `settle` versus `bill`) plus a
-coherence hazard the documentation had to warn about: implementing both traits for one
-type was a compile error. One trait is the better trade, and 0.12.0 removed the second.
-
-## Why `PricingModel` and not `Tariff`
-
-Until 0.12.0 this trait was `Tariff`, and the rate table was `TariffSchedule`.
-
-*Tariff* is perfectly good English for a published schedule of rates — the sense is as
-old as the customs-duty one, both attested from the 1590s (Arabic `taʿrīf` → Italian
-`tariffa`), and UK primary legislation is titled the *Domestic Gas and Electricity
-(Tariff Cap) Act 2018*. The word was never the problem.
-
-Being the **neutral** word was. This crate advertises zero domain assumptions, and
-every other public name keeps that promise — `LineItem`, `Quantity`, `UnitPrice`,
-`TaxLayer`, `UsageAggregator`, `AllocationRule`, `RateLookup`. `Tariff*` were the only
-three exceptions out of roughly forty, and they carry the vocabulary of utilities and
-telecoms specifically. Two of the four worked examples are SaaS and cloud, where the
-word is *plan*, *pricing model* or *rate card* — and in American English the dominant
-sense of *tariff* is an import duty, which this crate has nothing to do with.
-
-`PricingModel` is the phrase all of those domains already use for "how we work out what
-to charge". `RateSchedule` and `RateBand` join `RateLookup` in a neutral family of rate
-tables.
+There is deliberately no second trait for this case. One would save a
+`type Usage = ();` line and one ignored parameter, at the cost of a second vocabulary
+(`positions` versus `line_items`, `settle` versus `bill`) and a coherence hazard:
+implementing both for one type is a compile error. One trait is the better trade.
 
 ## `PricingModel` is not `RateSchedule`
 

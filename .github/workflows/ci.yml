@@ -96,10 +96,10 @@ jobs:
       - name: Test — no default features
         run: cargo test --all-targets --no-default-features
       # Doctests need their own invocation: `--all-targets` silently EXCLUDES them
-      # (rust-lang/cargo#6669), and so does `--lib --tests`. Every step above uses
-      # one of the two, so until 0.13.0 nothing in CI ran them — while `src/lib.rs`
-      # ends with `#![doc = include_str!("../README.md")]` precisely so that every
-      # Rust example in the README is compiled and run, and the README promises it.
+      # (rust-lang/cargo#6669), and so does `--lib --tests` — which is every step
+      # above. Without this one nothing here runs them, while `src/lib.rs` ends with
+      # `#![doc = include_str!("../README.md")]` precisely so that every Rust example
+      # in the README is compiled and run, and the README promises it.
       - name: Test — doctests (includes the whole README)
         run: cargo test --doc --all-features
 

@@ -53,8 +53,7 @@ gross as `net + tax` rather than rounding it — rounding all three separately b
 
 #### Why not split the totals and correct the positions?
 
-That is the obvious construction, it was the one used until 0.13.0, and it quietly
-broke BR-S-08. The breakdown was split per `(category, rate)` group while the
+That is the obvious construction, and it quietly breaks BR-S-08. The breakdown was split per `(category, rate)` group while the
 positions were corrected in aggregate, so a group's BT-116 and the positions
 attributed to it could land a minor unit apart. On a two-rate document that happened
 for roughly **45 %** of recipients — every document internally exact, every one of

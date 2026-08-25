@@ -125,11 +125,11 @@ fn attributed_sum(
 ///
 /// That is the obvious construction — scale each position by the share, then apply
 /// one penny correction per recipient so the positions sum to a separately-computed
-/// total — and it was used until 0.13.0. It keeps (1)–(4) and quietly breaks (5):
-/// the VAT breakdown is split per `(category, rate)` group while the positions are
-/// corrected in aggregate, so a group's BT-116 and the positions attributed to it
-/// land a minor unit apart. On a two-rate document that happened for roughly **45 %**
-/// of recipients — each document internally exact, each one rejected by a validator.
+/// total. It keeps (1)–(4) and quietly breaks (5): the VAT breakdown is split per
+/// `(category, rate)` group while the positions are corrected in aggregate, so a
+/// group's BT-116 and the positions attributed to it land a minor unit apart. On a
+/// two-rate document that reaches roughly **45 %** of recipients — each document
+/// internally exact, each one rejected by a validator.
 ///
 /// The one case that cannot be fixed is the one that was already broken: where the
 /// *source* document does not satisfy BR-S-08 for a group — because it carries a
@@ -269,13 +269,12 @@ impl AllocationRule for ProportionalAllocation {
 
         // Every position is split EXACTLY, line by line, before any total exists.
         //
-        // The previous construction scaled each position by the share and then
-        // applied one penny correction per recipient to hit a separately-computed
-        // `net_total`. That kept the cross-recipient sums exact and broke EN 16931
-        // **BR-S-08**: the VAT breakdown was split per group while the positions
-        // were corrected in aggregate, so a group's BT-116 and the positions
-        // attributed to it could land a minor unit apart. On a two-rate document
-        // that happened for roughly 45 % of recipients.
+        // Scaling each position and then applying one penny correction per
+        // recipient to hit a separately-computed `net_total` keeps the
+        // cross-recipient sums exact and breaks EN 16931 **BR-S-08**: the breakdown
+        // is split per group while the positions are corrected in aggregate, so a
+        // group's BT-116 and the positions attributed to it land a minor unit apart
+        // — on a two-rate document, for roughly 45 % of recipients.
         //
         // Splitting each position exactly removes the aggregate correction
         // entirely: every total below is now a *sum of that recipient's own
@@ -304,9 +303,9 @@ impl AllocationRule for ProportionalAllocation {
         // Deriving is only sound where the source document already satisfies
         // BR-S-08 for that group. Where it does not — a document assembled without
         // VAT attribution, or one whose breakdown was set by hand — deriving would
-        // silently rewrite the base to zero. The fallback keeps the old behaviour,
-        // which is exactly as good as the input deserved: an allocated share now
-        // satisfies `verify_vat_attribution` **iff the document it came from did**.
+        // silently rewrite the base to zero. Splitting the stored figure instead is
+        // exactly as good as the input deserved: an allocated share satisfies
+        // `verify_vat_attribution` **iff the document it came from did**.
         let derivable: Vec<bool> = doc
             .tax_breakdown()
             .iter()

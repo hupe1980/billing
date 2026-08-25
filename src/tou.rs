@@ -85,8 +85,8 @@ impl TryFrom<TimeOfUsePricingRepr> for TimeOfUsePricing {
     type Error = BillingError;
     fn try_from(r: TimeOfUsePricingRepr) -> Result<Self, Self::Error> {
         // Routed through the builder so deserialisation cannot reach a state the
-        // constructor rejects — including the `unit`, which an assign-after-new
-        // shim used to skip.
+        // constructor rejects — including the `unit`, which an assign-after-new shim
+        // would skip.
         TimeOfUsePricingBuilder {
             bands: r.bands,
             unit: r.unit,
@@ -240,10 +240,10 @@ impl TimeOfUsePricing {
     /// # Unknown band names are an error
     ///
     /// A usage entry naming a band this schedule does not define returns
-    /// [`BillingError::InvalidInput`].  Earlier versions skipped such entries
-    /// silently, which meant a typo in a band name (`"HT "`, `"ht"`, a renamed
-    /// tariff) **dropped real consumption from the invoice** with no signal —
-    /// systematic under-billing that no test or validation step could detect.
+    /// [`BillingError::InvalidInput`] rather than being skipped. Skipping it means a
+    /// typo in a band name (`"HT "`, `"ht"`, a renamed tariff) **drops real
+    /// consumption from the invoice** with no signal — systematic under-billing that
+    /// no test or validation step can detect.
     ///
     /// Negative quantities return `Err` — a negative consumption reading
     /// is a data error, not a valid billing input.
@@ -471,34 +471,96 @@ impl DynamicPricing {
 
     /// Compute a single `LineItem` with the total charge.
     ///
-    /// `net = Σ(qty_i × price_i)`. The quantity field shows the total quantity.
-    /// The unit-price field shows the weighted average price (informational only —
-    /// `net_amount` is set directly from the exact accumulated total, not from
-    /// `total_quantity × average_price`, which would introduce rounding error).
+    /// `net = Σ(qty_i × price_i)`, accumulated **exactly** and rounded once at the
+    /// end. The quantity field shows the total quantity, and the unit-price field
+    /// the weighted average price.
+    ///
+    /// # Render the average, do not re-derive it
+    ///
+    /// The returned line is a *complete* position: the weighted average is already
+    /// on it, as the [`crate::UnitPrice`] labelled `"EUR/kWh (wtd avg)"`. That is
+    /// the figure to print next to the amount — §41a EnWG dynamic-tariff bills show
+    /// it, and the customer divides one by the other expecting to find it.
+    ///
+    /// Computing it yourself as `net_amount ÷ quantity` gives a *different* number,
+    /// and a worse one. `net_amount` has been rounded to the engine's five decimals;
+    /// dividing it is a second rounding of an already-rounded figure, which is the
+    /// one thing this crate never does (see
+    /// [`crate::AmountScale::apply_decimal`]). The average below is derived from the
+    /// **exact** accumulated total, so it is the price that actually reproduces the
+    /// interval sequence.
+    ///
+    /// The temptation is structural rather than careless: [`crate::RateSchedule`]
+    /// returns one line *per band*, so an aggregate here reads as a summary that a
+    /// caller then takes fields off piecemeal. It is not — it is one invoice line,
+    /// fully populated, and `PEPPOL-EN16931-R120` is checkable on it with
+    /// [`crate::LineItem::check_price_consistency`].
+    ///
+    /// # One rounding, not one per interval
+    ///
+    /// A day-ahead sequence is 24 intervals; a settled year is 8 760, and a
+    /// quarter-hourly one 35 040. Rounding each interval's product to the engine's
+    /// five decimals before adding it would bias the total by up to `5 × 10⁻⁶` per
+    /// interval *in the same direction*, because commercial rounding is not
+    /// unbiased on a repeated fractional part. Over 8 760 hourly intervals that is
+    /// up to `0.0438` — four whole cents on a two-decimal invoice, from arithmetic
+    /// alone.
+    ///
+    /// So the products are accumulated as exact [`Decimal`]s and reduced **once**,
+    /// which is the same rule [`crate::AmountScale::apply_decimal`] states for the
+    /// interchange boundary: two roundings are not one. Unlike a
+    /// [`crate::TimeOfUsePricing`] band or a [`crate::RateSchedule`] tier, an
+    /// interval is *not* a leaf — it never becomes its own invoice line, so there
+    /// is nothing at that level to round to.
+    ///
+    /// ```rust
+    /// use billing::{Amount, Currency, DynamicPricing};
+    /// use rust_decimal::dec;
+    ///
+    /// // Three intervals, each exactly half a smallest unit: 0.5 × 0.00001.
+    /// let dp = DynamicPricing::builder()
+    ///     .unit("kWh")
+    ///     .currency(Currency::EUR)
+    ///     .intervals(std::iter::repeat_n((dec!(0.5), Amount::parse("0.00001")?), 3))
+    ///     .build()?;
+    ///
+    /// // Exact total 0.000015 → 0.00002. Rounding each interval first would have
+    /// // taken every one of them up to 0.00001 and reported 0.00003.
+    /// assert_eq!(dp.calculate()?.net_amount, Amount::parse("0.00002")?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn calculate(&self) -> Result<LineItem, BillingError> {
-        // `checked_*` throughout: `Decimal`'s `+=` and `/` panic on overflow and
+        // `checked_*` throughout: `Decimal`'s `+`, `*` and `/` panic on overflow and
         // on division by zero, which would break this method's `Result` contract.
         let overflow = || BillingError::MonetaryOverflow {
             precision: 5,
             input_value: None,
         };
         let mut total_qty = Decimal::ZERO;
-        let mut total_net = Amount::<5>::ZERO;
+        let mut exact_net = Decimal::ZERO;
         for (qty, price) in &self.intervals {
             total_qty = total_qty.checked_add(*qty).ok_or_else(overflow)?;
-            total_net = total_net.checked_add(price.checked_mul_qty(*qty)?)?;
+            let product = price
+                .into_decimal()
+                .checked_mul(*qty)
+                .ok_or_else(overflow)?;
+            exact_net = exact_net.checked_add(product).ok_or_else(overflow)?;
         }
+        // The single rounding, from the exact sum.
+        let total_net = Amount::<5>::from_decimal_rounded(
+            exact_net,
+            crate::RoundingStrategy::MidpointAwayFromZero,
+        )?;
+        // Derived from the exact total too: an average taken from the rounded net
+        // would restate the rounding error as a price.
         let avg_price = if total_qty.is_zero() {
             Decimal::ZERO
         } else {
-            total_net
-                .into_decimal()
-                .checked_div(total_qty)
-                .ok_or_else(overflow)?
+            exact_net.checked_div(total_qty).ok_or_else(overflow)?
         };
         let price_unit = format!("{}/{} (wtd avg)", self.currency, self.unit);
-        // Use fixed_amount to set the net exactly from the accumulated total,
-        // not from total_qty × avg_price which may differ by a rounding unit.
+        // `fixed_amount` sets the net from the accumulated total, not from
+        // `total_qty × avg_price`, which would round a second time.
         LineItem::debit(format!("Dynamic pricing ({})", self.unit))
             .quantity(Quantity::new(total_qty, &self.unit))
             .unit_price(UnitPrice::new(avg_price, &price_unit))
@@ -553,6 +615,49 @@ mod tests {
         assert_eq!(item.quantity_value(), Some(dec!(300)));
         assert_eq!(item.unit_label(), Some("kWh"));
         assert_eq!(item.net_amount, Amount::parse("50.00000").unwrap());
+    }
+
+    /// A settled spot-price year is 8 760 hourly intervals. Rounding each
+    /// interval's product to the engine's five decimals before summing biases the
+    /// total in one direction — `0.0438` here, four cents on a two-decimal
+    /// invoice — because commercial rounding is not unbiased on a repeated
+    /// fractional part. The products are accumulated exactly and reduced once.
+    #[test]
+    fn dynamic_pricing_rounds_once_over_the_whole_sequence() {
+        let mut b = DynamicPricing::builder()
+            .unit("kWh")
+            .currency(Currency::EUR);
+        for _ in 0..8_760 {
+            b = b.interval(dec!(1.000005), Amount::parse("1.00000").unwrap());
+        }
+        let item = b.build().unwrap().calculate().unwrap();
+
+        // 8760 × 1.000005 = 8760.0438 exactly, which is representable at 5 dp.
+        assert_eq!(item.net_amount, Amount::parse("8760.04380").unwrap());
+        // Per-interval rounding would have produced this instead.
+        assert_ne!(item.net_amount, Amount::parse("8760.08760").unwrap());
+        assert_eq!(item.quantity_value(), Some(dec!(8760.043800)));
+    }
+
+    /// The weighted-average price is derived from the *exact* accumulated total,
+    /// not from the rounded net: deriving it from the rounded figure would restate
+    /// the rounding error as a price and make `quantity × unit_price` disagree with
+    /// the stated amount by more than one rounding.
+    #[test]
+    fn dynamic_pricing_average_price_comes_from_the_exact_total() {
+        let dp = DynamicPricing::builder()
+            .unit("kWh")
+            .intervals(std::iter::repeat_n(
+                (dec!(0.5), Amount::parse("0.00001").unwrap()),
+                3,
+            ))
+            .build()
+            .unwrap();
+        let item = dp.calculate().unwrap();
+        // Exact: 3 × 0.000005 = 0.000015 → 0.00002 at five decimals.
+        assert_eq!(item.net_amount, Amount::parse("0.00002").unwrap());
+        // 0.000015 / 1.5 = 0.00001 — the price actually quoted, not 0.0000133….
+        assert_eq!(item.unit_price.as_ref().unwrap().value, dec!(0.00001));
     }
 
     #[test]

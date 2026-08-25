@@ -7,27 +7,6 @@
 //! | [`PricingModel`] | you are adapting a domain to the engine — usage in, priced positions and layers out |
 //! | [`Billing`] | the outcome is "positions", "a document", **or** "nothing to bill, because …" |
 //!
-//! # Why "PricingModel" and not "Tariff"
-//!
-//! Until 0.12.0 this trait was `Tariff`, and the rate table was `TariffSchedule`.
-//! *Tariff* is perfectly good English for a published schedule of rates — the sense
-//! is as old as the customs-duty one, both from the 1590s, and UK primary legislation
-//! is titled the *Domestic Gas and Electricity (Tariff Cap) Act 2018*.
-//!
-//! It was still the wrong name **here**. This crate advertises zero domain
-//! assumptions, and every other public name keeps that promise:
-//! [`crate::LineItem`], [`crate::Quantity`], [`crate::UnitPrice`],
-//! [`crate::TaxLayer`], [`crate::UsageAggregator`], [`crate::AllocationRule`].
-//! *Tariff* is the vocabulary of utilities and telecoms specifically — a SaaS or
-//! marketplace developer says *plan*, *pricing model* or *rate card*, and in American
-//! English the word's dominant sense is an import duty, which this crate has nothing
-//! to do with. Naming the primary extension point after one domain cluster is exactly
-//! the assumption the crate says it does not make.
-//!
-//! `PricingModel` is the phrase every one of those domains already uses for "how we
-//! work out what to charge", and [`crate::RateSchedule`] / [`crate::RateBand`] join
-//! [`crate::RateLookup`] in a neutral family of rate tables.
-//!
 //! # `PricingModel` is not [`crate::RateSchedule`]
 //!
 //! They sit at different levels, and the similar names invite the wrong guess.
@@ -252,11 +231,10 @@ pub type Billed<R> = Billing<BillingDocument, R>;
 /// assert_eq!(doc.net_total(), Amount::<5>::parse("-400.00000").unwrap());
 /// ```
 ///
-/// An earlier release had a second trait for this case, with its own method names
-/// and a blanket impl. It removed one `type Usage = ();` line and one ignored
-/// parameter, and cost a second vocabulary (`positions` vs `line_items`,
-/// `settle` vs `bill`) plus a coherence hazard: implementing both traits for one
-/// type was a compile error the documentation had to warn about. One trait is the
+/// There is deliberately no second trait for this case. One would remove a
+/// `type Usage = ();` line and one ignored parameter, at the cost of a second
+/// vocabulary (`positions` vs `line_items`, `settle` vs `bill`) and a coherence
+/// hazard: implementing both for one type is a compile error. One trait is the
 /// better trade.
 ///
 /// # Example — SaaS platform

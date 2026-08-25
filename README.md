@@ -51,7 +51,8 @@ rather than looking something up.
 | [`TimeOfUsePricing`](#-time-of-use-and-dynamic-pricing) | N named bands (peak / off-peak / …); caller supplies pre-aggregated consumption |
 | [`tags`](#-design-invariants) | The engine's reserved tag namespace, protected against caller collisions |
 | [`DynamicPricing`](#-time-of-use-and-dynamic-pricing) | Per-interval price sequence (spot, real-time) |
-| [`UsageAggregator<E>`](#-usage-aggregation) | 6 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · LATEST · WEIGHTED_SUM — **fallible**, because raw events are the least trusted input |
+| [`UsageAggregator<E>`](#-usage-aggregation) | 8 built-in types: SUM · COUNT · UNIQUE_COUNT · MAX · MEAN · PERCENTILE · LATEST · WEIGHTED_SUM — **fallible**, because raw events are the least trusted input |
+| [`PercentileAggregator`](#burstable-95th-percentile-billing) | **95th-percentile / burstable billing** — nearest-rank, so every figure billed is a rate that actually occurred |
 | [`PricingModel`](#-implementing-pricingmodel) | The extension point: usage in, priced positions and layers out. **Not** a [`RateSchedule`](#pricingmodel-is-not-rateschedule) |
 | [`PricingModel::amount_scale`](#the-model-declares-the-precision-it-prices-for) | The model declares the interchange precision it prices for, so `bill` / `settle` produce an emittable document |
 | [`Billing<T, R>`](#-three-outcomes-billable-not-billable-error) | Three outcomes: billable, **not billable (with your reason)**, error |
@@ -61,7 +62,7 @@ rather than looking something up.
 | [`PercentageCharge`](#-percentage-charge) | % of invoice total with min/max guard (platform fee, commission) |
 | [`AllocationRule`](#-allocation-across-n-recipients) | Exact proportional / equal split of a document — `Σ(parts) == total`, penny-corrected |
 | [`proportional_split()`](#raw-quantity-split-proportional_split) | Penny-correct Hamilton split of a raw `Decimal` quantity (kWh, capacity, …) |
-| [`BillingDocument`](#-billingdocument) | Self-validating document: fifteen invariants, checked at build time and re-checked on deserialisation |
+| [`BillingDocument`](#-billingdocument) | Self-validating document: sixteen invariants, checked at build time and re-checked on deserialisation |
 | [`BillingDocument::taxable_total`](#the-totals-chain--bt-106--bt-107--bt-108--bt-109) | **BT-109** via BR-CO-13 — `net_total` is *not* BT-109 once a levy exists |
 | [`BillingDocument::allowance_total`](#the-totals-chain--bt-106--bt-107--bt-108--bt-109) | **BT-107** via BR-CO-11 — the allowance sum as the *positive magnitude* every syntax emits |
 | [`TaxBreakdownEntry`](#-vat-breakdown-en-16931-bg-23) | Per-rate VAT breakdown (EN 16931 BG-23) — **legally required** on any invoice |
@@ -79,7 +80,9 @@ rather than looking something up.
 | [`TaxBreakdownEntry::from_gross`](#-tax-inclusive-gross-pricing) | A lawful BG-23 from a tax-inclusive total, losing nothing |
 | [`PaymentTerms`](#-payment-terms-and-skonto-bt-20) | **BT-20** — free text plus structured early-payment discounts, rendered and parsed |
 | [`EarlyPaymentDiscount`](#-payment-terms-and-skonto-bt-20) | Skonto: `#SKONTO#TAGE=10#PROZENT=2.00#` (BR-DE-18), and what the buyer actually pays |
+| [`LatePaymentPenalty`](#late-payment-interest-the-other-half-of-bt-20) | Verzugszinsen: simple interest on the overdue amount plus the art. 6(1) recovery fee |
 | [`BillingDocument::unattributed_positions`](#per-position-vat-attribution) | Positions missing BT-151 / BT-95 / BT-102 — the other half of "may I emit this?" |
+| [`LineItem::check_price_consistency`](#bt-146-is-not-capped-and-rounding-it-is-fatal) | **`PEPPOL-EN16931-R120`** — BT-131 really is `BT-129 × (BT-146 ÷ BT-149)` ± 0.02 |
 | [`Amount::exact_to`](#-amountp--fixed-point-arithmetic) | Narrow precision **without rounding**, or fail — for interchange boundaries |
 | [`CashRounding`](#-cash-rounding-and-amount-due) | Rappenrundung / öresavrundning — tender-level rounding (BT-114) |
 | [`VatAccountingCurrency`](#-vat-in-the-accounting-currency-bt-6--bt-111) | **BT-6 / BT-111** — the VAT total restated in the currency the tax is reported in |
@@ -94,13 +97,15 @@ rather than looking something up.
 | [`DocumentMeta.labels`](https://docs.rs/billing/latest/billing/document/struct.DocumentMeta.html) | Key-value domain annotation bag (`malo_id`, `billing_year`, …) |
 | [`Note`](#-billingdocument) | **BG-1 INVOICE NOTE** — `0..n` notes, each with its UNCL 4451 subject code (BT-21 / BT-22) |
 | [`PartyIdentifier`](#-billingdocument) | **BT-29 / BT-46** — an identifier *and* its ISO 6523 ICD scheme, which `BR-CL-10` makes mandatory to state correctly |
+| [`PrecedingInvoice`](#a-credit-note-says-what-it-credits) | **BG-3 / BT-25 / BT-26** — what a credit note credits, filled in by `reverse` |
 | [`LineItem::scaled`](#-proration-and-period-merging) | Scale a position, keeping `quantity × unit_price == net_amount` consistent |
 | `LineItem::credit_for_usage` | Symmetric credit counterpart of `for_usage` (feed-in, refunds) |
 | [`LineItem::flat_fee`](#a-flat-charge-is-still-an-invoice-line) | A standing charge as a **complete** EN 16931 line — satisfies BR-22 / BR-23 / BR-26, which `fixed` cannot |
 | [`UnitPrice::per`](#-price-details-en-16931-bg-29) | **BT-149 / BT-150** — "EUR 12,00 per 100 pieces", the divisor in `PEPPOL-EN16931-R120` |
 | [`UnitPrice::discounted`](#-price-details-en-16931-bg-29) | **BT-147 / BT-148** — gross price less a price discount, deriving BT-146 (`R046`) |
 | `UnitPrice::rounded` | Pin a derived unit price to a scale with an explicit strategy |
-| [`minimum_charge()`](#minimum-charges-belong-before-the-tax-layers) | Minimum-spend shortfall, as a **complete** EN 16931 invoice line |
+| [`minimum_charge()`](#minimum-charges-belong-before-the-tax-layers) | Minimum-spend shortfall stated **net**, as a complete EN 16931 invoice line |
+| [`minimum_charge_gross()`](#a-mindestbetrag-is-quoted-brutto) | The same for a minimum quoted **gross** — with the rate it is agreed at *enforced*, not assumed |
 | [`merge_period_documents()`](#-proration-and-period-merging) | Merge two half-period documents (tariff change mid-period) |
 | [`prorate()`](#-proration-and-period-merging) | Scale a fixed charge to a partial period |
 
@@ -612,7 +617,7 @@ unsatisfiable for both groups.
 not decidable for every document the engine can hold: one assembled without VAT
 layers has no attribution to check against and passes vacuously. Run it on the
 document you are about to emit — including one that came out of an
-`AllocationRule`, which since 0.13.0 preserves BR-S-08 whenever its source had it.
+`AllocationRule`, which preserves BR-S-08 whenever its source had it.
 
 It also **passes vacuously** on a document with no attributions at all, which is
 the right behaviour — this crate bills things that are not invoices — but it means
@@ -900,10 +905,10 @@ XML-konformer Zeilenumbruch folgen"*), and KoSIT ships a fixture marked
 `schematron-invalid="xrcii:BR-DE-18"` titled *"Every skonto entry should end with a
 newline"*.
 
-Until 0.13.0 `Display` omitted it. It lives here rather than in a separate
-`to_bt20_xrechnung()` because the `#SKONTO#…#` micro-syntax **is** the German CIUS
-convention — there is no core EN 16931 form of it — so a rendering without the
-terminator is valid nowhere at all. A prose-only BT-20 is unchanged: the
+It lives in `Display` rather than in a separate `to_bt20_xrechnung()` because the
+`#SKONTO#…#` micro-syntax **is** the German CIUS convention — there is no core
+EN 16931 form of it — so a rendering without the terminator is valid nowhere at all.
+A prose-only BT-20 is unchanged: the
 `every … satisfies` is vacuously true when no line starts with `#`.
 
 ### The discount is not a discount on the invoice
@@ -948,6 +953,64 @@ the invoice cannot know, so this crate computes the payable figure and stops the
 > promotes early payment discounts and late-payment charges to structured fields of
 > their own. The arithmetic does not change with it — only where the numbers are
 > written — so these accessors are what a future serialiser maps from.
+
+### Late-payment interest: the other half of BT-20
+
+BT-20's definition ends *"(Including description of possible penalties)"*, so the
+penalty is squarely inside the field — but unlike a Skonto it has **no wire
+syntax**. `BR-DE-18` structures early-payment discounts and nothing else, so a
+penalty reaches the invoice only as prose, in your language. `LatePaymentPenalty`
+is therefore the arithmetic without the sentence:
+
+```rust
+use billing::{Amount, DayCountBasis, LatePaymentPenalty};
+use rust_decimal::dec;
+
+// §288 Abs. 2 BGB — 9 percentage points above the base rate, B2B — plus the
+// 40,00 € fixed sum of §288 Abs. 5 BGB / art. 6(1) of Directive 2011/7/EU.
+let penalty = LatePaymentPenalty::new(dec!(11.62))?
+    .with_recovery_fee(Amount::parse("40.00000")?)?;
+
+let overdue = Amount::parse("1190.00000")?;
+
+// Simple interest, never compounded: art. 2(6) of the directive says "simple
+// interest for late payment", and §289 BGB forbids interest on interest outright.
+assert_eq!(penalty.interest_on(overdue, 30)?, Amount::parse("11.36532")?);
+// The fixed sum is charged once, not per day.
+assert_eq!(penalty.total_on(overdue, 30)?, Amount::parse("51.36532")?);
+// Paying on the due date is free — the fixed sum is contingent on interest
+// having become payable at all.
+assert_eq!(penalty.total_on(overdue, 0)?, Amount::ZERO);
+
+// The day-count denominator is a convention, so it is explicit. The money-market
+// year is 1.4 % shorter than the calendar one, and earns that much more.
+assert!(penalty.with_day_count(DayCountBasis::Actual360).interest_on(overdue, 30)?
+        > penalty.interest_on(overdue, 30)?);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**It is not a field of `PaymentTerms`, on purpose.** Everything `PaymentTerms`
+holds, its `Display` writes and its `FromStr` reads back; a field with no
+representation in the syntax would vanish on the way out, silently. Write the
+sentence yourself and pass it to `PaymentTerms::text`.
+
+**It changes no total, for the same reason a Skonto does not.** The trigger is a
+payment event that has not happened when the invoice is issued. Default interest is
+also generally **outside the scope of VAT** — art. 63 of the VAT Directive ties the
+chargeable event to the supply, and interest compensates for delay rather than
+paying for anything supplied (CJEU C-222/81, *BAZ Bausystem*); the art. 6 recovery
+fee is the same. So a penalty billed later is its own document, typically carrying
+`TaxCategory::OutOfScope`, not a line on this one.
+
+| Jurisdiction | Rate | Fixed sum |
+|---|---|---|
+| EU floor — Directive 2011/7/EU art. 2(6), art. 6(1) | ECB reference rate **+ 8 pp** | **40 €** |
+| Germany — §288 Abs. 2, Abs. 5 BGB (B2B) | base rate **+ 9 pp** | 40 € |
+| Germany — §288 Abs. 1 BGB (consumer) | base rate **+ 5 pp** | — |
+
+The reference rate moves twice a year, which is why the type takes the *assembled*
+annual percentage rather than a spread over a base it would have to carry a stale
+copy of.
 
 ---
 
@@ -1209,6 +1272,59 @@ assert_eq!(invoice.meta.kind, DocumentKind::CommercialInvoice); // 380
 assert_eq!(credit.meta.kind,  DocumentKind::CreditNote);        // 381
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+### A credit note says what it credits
+
+`reverse()` also fills in **BG-3**, the preceding invoice reference, from the
+document being reversed — its number as **BT-25**, its issue date as **BT-26**. The
+engine holds that number already; making the caller copy it back by hand, out of a
+field the reversal has just consumed, is how it goes missing.
+
+```rust
+use billing::prelude::*;
+
+let invoice = BillingDocument::from_positions(
+    DocumentMeta {
+        invoice_number: "INV-2026-001".into(),
+        issue_date: Some("2026-06-30".into()),
+        currency: Currency::EUR,
+        ..Default::default()
+    },
+    vec![LineItem::fixed("Beratung", Amount::parse("1000.00000")?).build()?],
+    vec![], vec![],
+)?;
+
+let credit = invoice.reverse(DocumentMeta {
+    invoice_number: "CN-2026-001".into(), currency: Currency::EUR, ..Default::default()
+})?;
+
+assert_eq!(credit.meta.preceding[0].number(), "INV-2026-001");        // BT-25
+assert_eq!(credit.meta.preceding[0].issue_date(), Some("2026-06-30")); // BT-26
+
+// BG-3 is 0..n — a consolidated credit note states its own list, and keeps it.
+let consolidated = invoice.reverse(DocumentMeta {
+    invoice_number: "CN-2026-002".into(),
+    currency: Currency::EUR,
+    preceding: vec![PrecedingInvoice::new("INV-A")?, PrecedingInvoice::new("INV-B")?],
+    ..Default::default()
+})?;
+assert_eq!(consolidated.meta.preceding.len(), 2);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A credit note that does not say what it credits is an unexplained payment, and the
+rules agree without being uniform — which is why this is modelled rather than
+assumed:
+
+| Rule | Source | Says |
+|---|---|---|
+| **BR-55** | CEN, fatal | a BG-3 shall contain a BT-25 |
+| **`NL-R-001`** | Peppol, **fatal** | for a Dutch supplier, a credit note **MUST** carry BT-25 |
+| **`DE-R-026`** | Peppol, warning | a `384` corrected invoice *should* carry BG-3 at least once |
+
+BR-55 is satisfied by the **type**, not by a check: `PrecedingInvoice::number` is
+not an `Option`, and the constructor refuses a blank string — a BG-3 without a BT-25
+is not constructible. That is the same move `LineVat` makes for BR-S-05.
 
 ### The type code is not interchangeable
 
@@ -1534,8 +1650,8 @@ let block = RateSchedule::block()
 let b = block.split(dec!(35))?;
 assert_eq!(b[0].net_amount, Amount::parse("6.00000")?);    // 4 blocks × 1.50
 
-// ── Mode 4: Capacity — bill on PEAK value, not cumulative sum ───────────────
-// Use case: demand charge (peak kW), bandwidth (max Mbps), concurrent seats
+// ── Mode 4: Capacity — a single value selects the tier, not a cumulative sum ─
+// Use case: demand charge (peak kW), bandwidth (P95 or max Mbps), concurrent seats
 let capacity = RateSchedule::capacity()
     .unit("Mbps").currency(Currency::EUR)
     .band(RateBand::up_to(dec!(100), Amount::parse("50.00000")?))
@@ -1602,6 +1718,17 @@ assert_eq!(dp.calculate()?.net_amount, Amount::parse("50.00000")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+**One rounding over the whole sequence, not one per interval.** An interval is not
+a *leaf*: unlike a ToU band or a schedule tier it never becomes its own invoice
+line, so there is nothing at that level to round to. `Σ(qty × price)` is therefore
+accumulated as exact `Decimal` and reduced once at the end.
+
+The difference is not academic. A settled spot-price year is 8 760 hourly intervals
+(35 040 quarter-hourly), and commercial rounding is not unbiased on a repeated
+fractional part — so rounding each product to the engine's five decimals first
+drifts in *one* direction, by up to `5 × 10⁻⁶` per interval. Over a year that is
+`0.0438`: four whole cents on a two-decimal invoice, from arithmetic alone.
+
 ---
 
 ## 🔢 Usage aggregation
@@ -1610,8 +1737,8 @@ Before applying a pricing model, aggregate raw events to a scalar:
 
 ```rust
 use billing::{SumAggregator, CountAggregator, UniqueCountAggregator,
-              MaxAggregator, LatestAggregator, WeightedSumAggregator,
-              UsageAggregator};
+              MaxAggregator, MeanAggregator, PercentileAggregator,
+              LatestAggregator, WeightedSumAggregator, UsageAggregator};
 use rust_decimal::Decimal;
 use rust_decimal::dec;
 
@@ -1662,6 +1789,18 @@ assert_eq!(
     dec!(300)
 );
 
+// MEAN: average over evenly spaced samples — average seats, average daily storage
+assert_eq!(
+    MeanAggregator::new(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events)?,
+    dec!(200)
+);
+
+// PERCENTILE: burstable billing — see the next section
+assert_eq!(
+    PercentileAggregator::p95(|e: &ApiCall| Decimal::from(e.bytes)).aggregate(&events)?,
+    dec!(300)
+);
+
 // WEIGHTED_SUM: VM CPU-hours for VMs active only part of the period
 assert_eq!(
     WeightedSumAggregator::new(
@@ -1672,14 +1811,58 @@ assert_eq!(
 );
 
 // `aggregate` is fallible because this is the least trusted boundary in the
-// pipeline. `Decimal`'s `+` and `*` PANIC on overflow, so before 0.13.0 one
-// corrupt event aborted the whole batch run instead of reporting itself.
+// pipeline: `Decimal`'s `+` and `*` PANIC on overflow, so one corrupt event would
+// otherwise abort the whole batch run instead of reporting itself.
 assert!(SumAggregator::new(|_: &ApiCall| Decimal::MAX).aggregate(&events).is_err());
-// COUNT, UNIQUE_COUNT, MAX and LATEST select rather than accumulate, so they
-// never return Err — the uniform signature is what lets you write code that is
-// generic over `UsageAggregator`.
+// COUNT, UNIQUE_COUNT, MAX, PERCENTILE and LATEST select rather than accumulate,
+// so they never return Err — the uniform signature is what lets you write code
+// that is generic over `UsageAggregator`.
 # Ok::<(), billing::BillingError>(())
 ```
+
+### Burstable (95th-percentile) billing
+
+Every IP transit, CDN egress and DDoS-scrubbing contract settles the same way, and
+none of the other aggregators can express it. The provider samples throughput every
+five minutes, throws away the top 5 % of the samples, and bills the highest one
+left — so the customer may burst above their committed rate for roughly 36 hours in
+a 30-day month and pay nothing extra for it. `MAX` would bill the single worst
+five-minute window of the month; `MEAN` would bill a rate the link never carried.
+
+```rust
+use billing::{PercentileAggregator, UsageAggregator, RateSchedule, RateBand,
+              Amount, Currency};
+use rust_decimal::{Decimal, dec};
+
+struct Sample { mbps: u32 }
+let mbps = |s: &Sample| Decimal::from(s.mbps);
+
+// A month of five-minute samples: a flat 100 Mbps with a short 900 Mbps burst.
+let mut month: Vec<Sample> = (0..8_640 - 200).map(|_| Sample { mbps: 100 }).collect();
+month.extend((0..200).map(|_| Sample { mbps: 900 }));
+
+// 200 of 8 640 samples is 2.3 % — inside the 5 % that is discarded.
+let committed = PercentileAggregator::p95(mbps).aggregate(&month)?;
+assert_eq!(committed, dec!(100));
+
+// The tier is selected by the P95 figure, and a capacity charge is flat.
+assert_eq!(RateSchedule::capacity()
+    .unit("Mbps")
+    .currency(Currency::EUR)
+    .band(RateBand::over(dec!(0), Amount::parse("0.50000")?))
+    .build()?
+    .apply_peak(committed)?
+    .net_amount, Amount::parse("0.50000")?);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**Nearest-rank, never interpolated.** The samples are sorted ascending and the one
+at rank `ceil(p ÷ 100 × n)` is returned. With the conventional 8 640 five-minute
+samples, "discard the top 5 %" removes 432 and the next highest is sample 8 208 —
+which is exactly `ceil(0.95 × 8640)`. The other common percentile definition
+averages the two neighbouring samples, which would bill a throughput figure that
+never occurred on the link. Every figure this returns is a rate the customer really
+reached.
 
 ---
 
@@ -1688,38 +1871,19 @@ assert!(SumAggregator::new(|_: &ApiCall| Decimal::MAX).aggregate(&events).is_err
 The `PricingModel` trait is the primary extension point. Implement it once per
 pricing arrangement in *your* crate.
 
-### Why `PricingModel` and not `Tariff`
-
-Until 0.12.0 this was `Tariff`, and the rate table was `TariffSchedule`.
-
-*Tariff* is perfectly good English for a published schedule of rates — the sense is as
-old as the customs-duty one, both attested from the 1590s (Arabic `taʿrīf` → Italian
-`tariffa`), and UK primary legislation is titled the *Domestic Gas and Electricity
-(Tariff Cap) Act 2018*. The word was never the problem.
-
-Being the **neutral** word was. This crate advertises zero domain assumptions, and
-every other public name keeps that promise — `LineItem`, `Quantity`, `UnitPrice`,
-`TaxLayer`, `UsageAggregator`, `AllocationRule`, `RateLookup`. `Tariff*` were the only
-three exceptions out of roughly forty, and they carry the vocabulary of utilities and
-telecoms specifically. Two of the four examples here are SaaS and cloud, where the word
-is *plan*, *pricing model* or *rate card* — and in American English the dominant sense
-of *tariff* is an import duty, which this crate has nothing to do with.
-
-`PricingModel` is the phrase all of those domains already use. `RateSchedule` and
-`RateBand` join `RateLookup` in a neutral family of rate tables.
-
 ### PricingModel is not RateSchedule
 
-The old names also invited a wrong guess, which the new ones make harder — but it is
-worth stating outright: a **`RateSchedule` does not implement `PricingModel`**, and
-could not usefully.
+A **`RateSchedule` does not implement `PricingModel`**, and could not usefully. They
+sit at different levels: a [`RateSchedule`](#-rateschedule--four-pricing-modes) is a
+**rate table** — the banded prices themselves — alongside `RateLookup`,
+`TimeOfUsePricing` and `DynamicPricing`. A `PricingModel` is the **adapter** that
+decides which of those to consult, with what quantities, in what order, and which tax
+and discount layers apply. A schedule is something a model *uses*; it has nothing to
+say about tax layers.
 
-They sit at different levels. A [`RateSchedule`](#-rateschedule--four-pricing-modes)
-is a **rate table** — the banded prices themselves — alongside `RateLookup`,
-`TimeOfUsePricing` and `DynamicPricing`. A `PricingModel` is the **adapter** that decides
-which of those to consult, with what quantities, in what order, and which tax and
-discount layers apply. A schedule is something a model *uses*; it has nothing to say
-about tax layers.
+The names are deliberately domain-neutral, like every other public name here — a
+utility says *tariff*, a SaaS says *plan* or *rate card*, and the crate assumes
+neither.
 
 ### Usage-driven — `PricingModel`
 
@@ -1807,11 +1971,10 @@ assert_eq!(doc.net_total(), Amount::parse("-400.00000")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Until 0.12.0 this was a **second trait**, `ScalarTariff`, with a blanket impl. It
-saved one `type Usage = ();` line and one ignored parameter, and cost a second
-vocabulary (`positions` versus `line_items`, `settle` versus `bill`) plus a coherence
-hazard the documentation had to warn about: implementing both traits for one type was
-a compile error. One trait is the better trade.
+There is deliberately no second trait for this case. One would save a
+`type Usage = ();` line and one ignored parameter, at the cost of a second vocabulary
+(`positions` versus `line_items`, `settle` versus `bill`) and a coherence hazard:
+implementing both for one type is a compile error. One trait is the better trade.
 
 ### The model declares the precision it prices for
 
@@ -1861,8 +2024,8 @@ assert!(doc.fits_amount_scale(2));   // emittable, straight out of `settle`
 Without it, `bill` and `settle` could only ever assemble at the engine's five
 decimals, so the shortest path from a model to a document produced one that fails
 BR-DEC-23 — with no error anywhere. An explicit `amount_scale` on the builder still
-wins, so a caller can override the model's choice; forgetting to set one no longer
-silently produces an unemittable invoice.
+wins, so a call site can override the model's choice, but it does not have to
+remember to.
 
 ---
 
@@ -2216,7 +2379,7 @@ group's BT-116 and the positions attributed to it can land a minor unit apart. O
 two-rate document that happened for roughly **45 %** of recipients — each document
 internally exact, each one rejected by a validator.
 
-Since 0.13.0 each position is split exactly instead (`Σ(recipients) == the original
+So each position is split exactly instead (`Σ(recipients) == the original
 position`, line by line), and every total is derived by summing a recipient's own
 positions. Each group's taxable base is then read off the very positions BR-S-08
 checks it against, so:
@@ -2317,8 +2480,8 @@ and re-checked by `validate()` / `assert_valid()` and on deserialisation:
 **"At construction" means the constructor runs `validate()`**, not merely that it
 computes the totals. Computing them establishes checks 1–4 and nothing else — 12, 13
 and 14 are properties of the VAT breakdown, and an ordinary pair of tagged tax layers
-can violate them. Until 0.13.0 `from_positions` skipped the check and could hand back
-a document that failed its own `assert_valid()`.
+can violate them — so a constructor that only computed totals could hand back a
+document that failed its own `assert_valid()`.
 
 Two identities are deliberately **outside** this list, because `AllocationRule`
 cannot preserve them — it splits the positions and the breakdown with independent
@@ -2398,6 +2561,70 @@ That is why the currency is an argument: the generated BT-146 label is `"EUR"` /
 
 `with_extra_position` appends without re-running the tax layers, so it is refused
 on any document carrying a VAT breakdown.
+
+### A *Mindestbetrag* is quoted brutto
+
+`minimum_charge` compares against the **net**, which is what a B2B *Mindestumsatz*
+is. A consumer supply contract states the other one — *"Mindestbetrag 9,90 € brutto
+pro Monat"* — because that is the figure §1 PAngV makes the seller show and the one
+the customer agreed to. The two are different arithmetic, and deriving the second
+from the first by hand is where the money goes missing.
+
+```rust
+use billing::prelude::*;
+use billing::{FixedRateTax, TaxCategory};   // `minimum_charge_gross` is in the prelude
+use rust_decimal::dec;
+
+let positions = vec![
+    LineItem::fixed("Trinkwasser", Amount::parse("2.00000")?).tag("reduced").build()?,
+    LineItem::fixed("Grundpreis",  Amount::parse("2.00000")?).tag("full").build()?,
+];
+let layers = || -> Result<Vec<Box<dyn TaxLayer>>, BillingError> { Ok(vec![
+    FixedRateTax::new("MwSt 7 %",  dec!(0.07))?.with_tag("reduced").boxed(),
+    FixedRateTax::new("MwSt 19 %", dec!(0.19))?.with_tag("full").boxed(),
+])};
+let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+
+// 1. Price the period as it stands — WITH the tax layers, so BT-112 is real.
+let provisional = BillingDocument::from_positions(meta(), positions.clone(), layers()?, vec![])?;
+assert_eq!(provisional.gross_total(), Amount::parse("4.52000")?);
+
+// 2. Top up to 9,90 € brutto, at the rate the CONTRACT names.
+let mut positions = positions;
+if let Some(mut top_up) = minimum_charge_gross(
+    &provisional,
+    Amount::parse("9.90000")?,
+    LineVat::new(TaxCategory::Standard, dec!(0.19))?,
+    "Mindestbetrag",
+    Currency::EUR,
+)? {
+    top_up.tags.push("full".into());   // so the 19 % layer really covers it
+    positions.push(top_up);
+}
+
+// 3. Rebuild.
+let doc = BillingDocument::from_positions(meta(), positions, layers()?, vec![])?;
+assert_eq!(doc.gross_total(), Amount::parse("9.90000")?);
+doc.verify_vat_attribution()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**The rate cannot be inferred, and it is enforced rather than assumed.** A minimum
+charge is a *contractual* charge, so the contract names the rate. A Stadtwerk bill
+carrying 7 % Trinkwasser beside 19 % Energie has two, and "use the standard one" is
+wrong the moment the top-up lands in the other layer: on the document above, the
+by-hand version invoices **9,36 €** against a 9,90 € minimum — 0,54 € short, 5,5 % —
+with every total reconciling, the VAT breakdown exact, and `validate()` passing.
+
+The returned line therefore carries the `LineVat` you name, so the claim is checked.
+A layer covering it at a *different* rate is a `LayerError` at build time (BR-S-08:
+a position belongs to exactly one VAT group); no layer covering it at all is what
+`verify_vat_attribution()` reports. A zero rate is the degenerate case and is right
+by construction — under reverse charge the divisor is 1, so gross and net coincide.
+
+What is *not* promised: the net top-up is one rounding of an exact quotient, so BT-112
+lands within a rounding unit of the target rather than always exactly on it. Assert
+`doc.gross_total() >= minimum_gross` if the contract reads as a hard floor.
 
 ---
 
@@ -2518,14 +2745,71 @@ decimals gives `0.00`. So:
   and every Peppol access point then rejects the invoice. A position carrying an
   explicit `fixed_amount` is authoritative and is reduced verbatim.
 
-This is verified over ~24 000 boundary cases and 6 000 randomised multi-line
-documents, across all five rounding strategies and VAT rates with up to seven
+Each of those is a property test rather than a fixture — over randomised
+multi-line documents, all five rounding strategies, and VAT rates with up to seven
 decimals.
 
 > **Allocation breaks the scale, and cannot preserve it.** Splitting `100.00` three
 > ways is `33.333…`. `AllocationRule` keeps the split *exact* — the parts still sum
 > to the original — at the cost of precision. Re-check an allocated document with
 > `fits_amount_scale` before emitting. `reverse()` (credit notes) preserves it.
+
+### BT-146 is not capped, and rounding it is fatal
+
+The `BR-DEC` decimal limits stop at BT-131 (BR-DEC-23) and the BG-27 / BG-28 leaves
+(BR-DEC-24 … BR-DEC-28). **No rule caps a unit price** — not BT-146, BT-147, BT-148
+or BT-149 — so a twenty-eight-decimal price is lawful EN 16931, and `AmountScale`
+deliberately leaves prices alone while reducing every amount around them.
+
+That asymmetry is load-bearing rather than an oversight, because R120 multiplies the
+price by the **quantity** before comparing it to BT-131. A `DynamicPricing` line
+states the *weighted average* over its intervals, which is a long non-terminating
+decimal by construction — and rounding it "to be tidy" scales the error by the whole
+period's consumption:
+
+```rust
+use billing::prelude::*;
+use rust_decimal::dec;
+
+// A settled spot-price year: 8 760 hourly intervals.
+let mut b = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
+for i in 0..8_760 {
+    b = b.interval(dec!(1.0), Amount::from_raw_units(1_000 + (i % 7)));
+}
+let line = b.build()?.calculate()?;
+
+// As built, and after reduction to EN 16931's two decimals, R120 holds.
+line.check_price_consistency()?;
+let doc = BillingDocument::builder()
+    .currency(Currency::EUR)
+    .amount_scale(AmountScale::EN16931)
+    .positions(vec![line.clone()])
+    .build()?;
+assert_eq!(doc.price_inconsistent_positions().count(), 0);
+
+// Rounding BT-146 to two decimals moves the R120 expression by 0.26 — thirteen
+// times the fatal ±0.02 — while `validate()` still passes, because R120 is a
+// profile rule and not an arithmetic invariant.
+let mut tidied = line;
+tidied.unit_price = Some(tidied.unit_price.take().unwrap()
+    .rounded(2, RoundingStrategy::MidpointAwayFromZero));
+assert!(tidied.validate().is_ok());
+assert!(tidied.check_price_consistency().is_err());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`LineItem::check_price_consistency()` and `BillingDocument::price_inconsistent_positions()`
+are the third member of the *"may I emit this?"* family, beside
+`verify_vat_attribution()` and `unattributed_positions()`. They sit outside
+`validate()` for the same reason those do: R120's tolerance is **absolute**, so a
+document assembled at `AmountScale::new(0, …)` — legitimate for a zero-decimal
+currency, or for something that is not an invoice at all — can be perfectly
+self-consistent and still fall outside ±0.02.
+
+The same applies to `DynamicPricing`'s own output: **render the average it computed,
+do not re-derive it.** `net_amount ÷ quantity` divides an already-rounded total and
+gives a different, worse number; the line's `unit_price` is derived from the exact
+accumulated sum.
 
 ### What is still missing for a valid XRechnung
 
@@ -2569,8 +2853,10 @@ and corrective-invoice sequencing.
 
 Most of that is *syntax and identity* data, which is why it lands in
 [`en16931` / `en16931-formats`](#the-layer-above-en16931) rather than here. What
-touches arithmetic, this crate already computes: the early-payment discount above,
-and — for margin schemes and every tax-inclusive quote — the
+touches arithmetic, this crate already computes: the
+[early-payment discount](#-payment-terms-and-skonto-bt-20) and the
+[late-payment charge](#late-payment-interest-the-other-half-of-bt-20) above, and —
+for margin schemes and every tax-inclusive quote — the
 [gross split](#-tax-inclusive-gross-pricing). Where those numbers are *written*
 changes with the revision; what they are does not.
 
@@ -2729,7 +3015,7 @@ just test-all        # with --all-features
 just test-msrv       # verify Rust 1.85 compatibility
 just lint            # cargo clippy -D warnings
 just doc             # build & open docs
-just examples        # run all three examples
+just examples        # run all four examples
 just bench           # criterion benchmarks
 just mutants-gate    # full mutation sweep, pass/fail (slow — see below)
 just mutants-diff    # mutate only what your branch changed
@@ -2751,11 +3037,10 @@ Four levels, each answering a question the one before it cannot:
 
 > **`cargo test --all-targets` does not run doctests**
 > ([rust-lang/cargo#6669](https://github.com/rust-lang/cargo/issues/6669)), and
-> neither does `--lib --tests`. Every test invocation in this project's CI used one
-> of the two, so until 0.13.0 the third level above ran in nobody's pipeline — the
-> guarantee was real locally and unenforced remotely. `just test-doc` and a matching
-> CI step now run them explicitly, on stable, beta and the MSRV. It is worth checking
-> whether your own project has the same hole; the flag gives no warning.
+> neither does `--lib --tests`. A project whose CI uses only those runs the third
+> level above in nobody's pipeline — the guarantee real locally, unenforced remotely.
+> `just test-doc` and a matching CI step run them explicitly, on stable, beta and the
+> MSRV. Worth checking your own project for the same hole; the flag gives no warning.
 
 The fourth is the one that grades the other three. Coverage reports whether a line
 *ran*; mutation testing rewrites the line — flipping `<` to `<=`, replacing a
@@ -2764,18 +3049,18 @@ suite still accepts. In a billing engine that distinction is the whole game: a
 rounding rule, a tolerance bound or a comparison operator can be executed by every
 test in the suite and still be silently wrong.
 
-It is not a hypothetical. The `proportional_split` deficit bug fixed in 0.11.0 was
-found this way, under a comment asserting the branch was unreachable. The property
-test covering that function conserved the total and passed, because the function
-returned an error rather than a wrong answer — and "errors instead of splitting" is
-not something a conservation law can see.
+It is not a hypothetical. A `proportional_split` deficit bug was found this way,
+under a comment asserting the branch was unreachable. The property test covering that
+function conserved the total and passed, because the function returned an error
+rather than a wrong answer — and "errors instead of splitting" is not something a
+conservation law can see.
 
 It also grades the other three levels. That property test built its fractions to
-sum to *exactly* one, which is precisely the region where the bug cannot occur, so
-it could never have failed however long it ran; a second one drew allocation ratios
-from `1..1000`, so a recipient allocated nothing never appeared. Both generators
-were widened in 0.11.0. A property is only as strong as the inputs it is allowed to
-draw, and nothing but a deliberate look tells you which region it never reaches.
+sum to *exactly* one, which is precisely the region where the bug cannot occur, so it
+could never have failed however long it ran; a second drew allocation ratios from
+`1..1000`, so a recipient allocated nothing never appeared. A property is only as
+strong as the inputs it is allowed to draw, and nothing but a deliberate look tells
+you which region it never reaches.
 
 ```sh
 cargo install cargo-mutants --locked
@@ -2828,8 +3113,8 @@ Of the 13 recorded survivors, twelve are **provably equivalent** — `X::builder
 whose entire body *is* `Default::default()`, or a `<` → `<=` whose extra case
 assigns a value already there — and one sits in a branch no input reaches. That last
 one was checked against every construction path, including deserialisation, rather
-than assumed: an identical "unreachable" comment in `proportional_split` turned out
-to be wrong, and the bug it hid is in the 0.11.0 changelog.
+than assumed — an identical "unreachable" comment in `proportional_split` turned out
+to be wrong.
 
 ### Not a CI gate — an ad-hoc tool
 
@@ -2854,9 +3139,9 @@ doctests, `cargo-deny`, `cargo-semver-checks` and the benchmarks compiling.
 
 ### Making a sweep affordable
 
-A sweep pays every per-mutant cost a thousand times, so three settings carry almost all
-of the wall clock. Together they roughly halved it — measured on a fixed shard,
-**239 s → 122 s** — and none of them changes which mutants are caught:
+A sweep pays every per-mutant cost a thousand times, so three settings carry almost
+all of the wall clock. Together they roughly halve it, and none of them changes which
+mutants are caught:
 
 | Setting | Why |
 |---|---|
@@ -2864,12 +3149,10 @@ of the wall clock. Together they roughly halved it — measured on a fixed shard
 | `additional_cargo_test_args = ["--lib", "--tests"]` | doctests were **17 of the baseline's 18 test seconds**. They exist to show a reader how a call is written, so they exercise the happy path the unit and integration suites already cover |
 | the generated `tests/site_examples.rs` is deleted after use | otherwise every mutant rebuilds and reruns a test binary that checks *documentation* |
 
-Excluding doctests had one consequence worth stating, because it is the interesting
-one: a few mutants that used to be caught started surviving. Every single one was a
-function whose **only** test was a doctest — `LatestAggregator::aggregate` (the one
-aggregator of six with no unit test), `Amount::checked_div` (called by a property test
-that discarded the result) and `PaymentTerms::discounts`. Each got a real test. A
-function tested only by an example is a gap whether or not a sweep is what reveals it.
+Excluding doctests surfaces every function whose **only** test is a doctest: those
+mutants survive. That is a finding, not a false positive — a function tested only by
+an example is a gap whether or not a sweep is what reveals it — so the answer is a
+real test, never a baseline entry.
 
 `just test` and CI still run every doctest on the unmutated tree, which is where a
 broken example actually matters.
@@ -2902,7 +3185,7 @@ src/
 │                     LineAllowanceCharge (BG-27/28)
 ├── schedule.rs     — RateSchedule (graduated/volume/block/capacity)
 ├── tou.rs          — TimeOfUsePricing, TimeBand, DynamicPricing
-├── aggregation.rs  — UsageAggregator trait + 6 built-in implementations
+├── aggregation.rs  — UsageAggregator trait + 8 built-in implementations
 ├── tax.rs          — TaxLayer, DiscountLayer + built-in implementations
 ├── document.rs     — BillingDocument, BillingDocumentBuilder, DocumentMeta
 ├── allocation.rs   — AllocationRule, ProportionalAllocation, EqualAllocation
@@ -2912,7 +3195,8 @@ src/
 ├── vat.rs          — TaxCategory, TaxBreakdownEntry (EN 16931 BG-23)
 ├── advance.rs      — AdvancePayment, DocumentKind, residual_breakdown
 ├── settlement.rs   — CashRounding (BT-114), VatAccountingCurrency (BT-6/BT-111)
-├── terms.rs        — PaymentTerms, EarlyPaymentDiscount (BT-20 / Skonto)
+├── terms.rs        — PaymentTerms, EarlyPaymentDiscount (BT-20 / Skonto),
+│                     LatePaymentPenalty, DayCountBasis
 ├── pricing.rs      — PricingModel, Billing (three-way outcome)
 └── error.rs        — BillingError, ParseAmountError
 ```

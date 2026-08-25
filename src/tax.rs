@@ -1000,8 +1000,7 @@ impl TaxLayer for PercentageCharge {
         // contradicts the type's own invariant: `PercentageCharge::new` refuses a
         // negative rate precisely because "a negative charge is a discount", and
         // arriving at the same thing through the base rather than the rate is no
-        // different. `PercentageDiscount` has always clamped for the mirror-image
-        // reason; the two now agree.
+        // different. `PercentageDiscount` clamps for the mirror-image reason.
         let base = if base.is_negative() {
             Amount::<5>::ZERO
         } else {

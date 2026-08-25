@@ -1,16 +1,18 @@
-//! Regression tests for the v0.7.0 correctness audit.
+//! Regression tests, grouped by the invariant each one defends.
 //!
-//! Every test here pins a defect that was present in v0.6.0 and is now fixed.
-//! Each names the concrete failure mode, so a future refactor that reintroduces
-//! it fails with an explanation rather than a bare assertion.
+//! Every test here pins a concrete failure mode — a silent mispricing, a panic in a
+//! `Result`-returning path, a document that balances and is still unlawful — so a
+//! refactor that reintroduces one fails with an explanation rather than a bare
+//! assertion.
 
+use billing::TaxLayer as _;
 use billing::prelude::*;
 use billing::{FixedDiscount, FixedRateTax, PerUnitLevy, PercentageCharge, PercentageDiscount};
 use rust_decimal::Decimal;
 use rust_decimal::dec;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. `checked_*` APIs must never panic
+// `checked_*` APIs must never panic
 //
 // `rust_decimal`'s `Mul`/`Add`/`Div` operators PANIC on overflow rather than
 // saturating. Several APIs documented as fallible used them internally, so they
@@ -40,9 +42,9 @@ fn decimal_conversion_returns_err_instead_of_panicking() {
 
 /// The two conversion paths into `Amount` must agree on what is representable.
 ///
-/// `parse` has always rejected non-zero digits beyond `P`; `checked_from_decimal`
-/// used to round them away, so the same unrepresentable price was refused as text
-/// and silently altered as a `Decimal`.
+/// `parse` rejects non-zero digits beyond `P`. If `checked_from_decimal` rounded
+/// them away instead, the same unrepresentable price would be refused as text and
+/// silently altered as a `Decimal`.
 #[test]
 fn string_and_decimal_conversions_agree_on_representability() {
     for s in ["0.123456", "1.000011", "-0.000001"] {
@@ -97,10 +99,10 @@ fn dynamic_pricing_calculate_is_fallible_not_panicking() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Scaled positions stay internally consistent
+// Scaled positions stay internally consistent
 //
-// `prorate` and the allocation rules used to scale `net_amount` while leaving
-// `quantity` untouched, producing invoice lines that contradict themselves —
+// Scaling `net_amount` while leaving `quantity` untouched produces invoice lines
+// that contradict themselves —
 // "1000 kWh × 0.30 EUR/kWh = 150.00". An auditor recomputing the line from its
 // own quantity and price gets a different number than the line states.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +195,7 @@ fn allocated_positions_are_self_consistent() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Validation cannot be bypassed
+// Validation cannot be bypassed
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -359,7 +361,7 @@ fn tou_rejects_empty_duplicate_and_negative_bands() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Currency is explicit, never assumed
+// Currency is explicit, never assumed
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -419,7 +421,7 @@ fn currency_validation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Tax / discount layer semantics
+// Tax and discount layer semantics
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -436,8 +438,8 @@ fn invalid_layer_configuration_is_err_not_panic() {
 #[test]
 fn percentage_discount_on_negative_base_does_not_become_an_extra_credit() {
     // Sustained negative spot prices can drive the debit base below zero. A
-    // "10% discount" on a -200 base used to yield another -20 credit, increasing
-    // the amount owed to the customer.
+    // Without the clamp, a "10 % discount" on a -200 base yields another -20
+    // credit, increasing the amount owed to the customer.
     let positions = vec![
         LineItem::for_usage(
             "Spot",
@@ -484,7 +486,7 @@ fn discount_total_is_consistent_and_validated() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. serde: representation and validation-on-deserialise
+// serde: representation and validation-on-deserialise
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "serde")]
@@ -527,8 +529,8 @@ mod serde_tests {
 
     #[test]
     fn equal_allocation_with_zero_no_longer_deserialises_into_a_divide_by_zero() {
-        // `{"n":0}` used to deserialise fine and then panic with "Division by zero"
-        // inside allocate().
+        // `{"n":0}` must not deserialise: it panics with "Division by zero" inside
+        // allocate().
         assert!(serde_json::from_str::<EqualAllocation>(r#"{"n":0}"#).is_err());
         assert!(serde_json::from_str::<EqualAllocation>(r#"{"n":3}"#).is_ok());
     }
@@ -624,7 +626,7 @@ mod serde_tests {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. Defects found by the adversarial verification pass
+// Compounding layers, and splits that must not create or lose money
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -737,9 +739,9 @@ fn proportional_split_is_fallible_not_panicking() {
     // `Decimal::new(1, scale)` panics for scale > 28.
     assert!(proportional_split(dec!(100), &[dec!(1.0)], 29).is_err());
     assert!(proportional_split(dec!(100), &[dec!(1.0)], 28).is_ok());
-    // Summing caller-supplied fractions used to panic before any validation ran.
+    // Summing caller-supplied fractions, before any validation runs.
     assert!(proportional_split(dec!(1), &[Decimal::MAX, Decimal::MAX], 2).is_err());
-    // Intermediate products used to panic for a large total.
+    // Intermediate products, for a large total.
     assert!(proportional_split(Decimal::MAX, &[dec!(0.5), dec!(0.5)], 5).is_err());
 }
 
@@ -839,7 +841,7 @@ fn line_item_validate_catches_post_construction_mutation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Third-round audit findings
+// Hostile input, and documents that must survive being reshaped
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "serde")]
@@ -1034,7 +1036,7 @@ fn proportional_split_upholds_its_sum_guarantee_or_errors() {
         assert_eq!(sum, dec!(1000000000000000000), "guarantee must hold");
     }
 
-    // Shares summing to MORE than one used to return over-allocated parts.
+    // Shares summing to MORE than one must not return over-allocated parts.
     if let Ok(parts) = proportional_split(dec!(10000000000), &[dec!(0.5), dec!(0.5000000005)], 0) {
         let sum: Decimal = parts.iter().sum();
         assert_eq!(sum, dec!(10000000000));
@@ -1099,7 +1101,7 @@ fn for_usage_rounded_clamps_an_out_of_range_price_scale() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. Fourth-round audit findings
+// Reserved tags, rendering, and the checks a constructor must not skip
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1298,7 +1300,7 @@ fn proportional_split_absorbs_a_deficit_larger_than_one_unit_per_fraction() {
         vec![dec!(8333333.34), dec!(8333333.33), dec!(8333333.33)]
     );
 
-    // The whole band that used to fail. Every one of these must conserve the total
+    // The awkward band. Every one of these must conserve the total
     // exactly rather than error; `29_999_999` sits just under the point where the
     // tolerance check itself takes over and rejects the shares outright.
     for total in [
@@ -1406,7 +1408,7 @@ fn schedule_mode_deserialises_from_the_documented_lowercase_names() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 0.8.0 — API-shape corrections reported from downstream use
+// Unit labels, derived prices, and a reason that must not become an empty document
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// An empty unit label must not survive into a document.
@@ -2039,15 +2041,15 @@ fn no_public_path_produces_a_document_that_fails_its_own_validation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 16. The 0.13.0 audit — three silent defects the totals could not see
+// Silent defects the totals cannot see
 //
 // Every one of these produced a document that balanced, validated and rendered.
 // What each got wrong was a field no arithmetic check looks at, which is why
 // none of them surfaced as a failing total.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `.currency()` used to write straight into `meta`, so a later `.meta()` — which
-/// replaces the whole header — discarded it. The document then carried
+/// A `.currency()` that wrote straight into `meta` would be discarded by a later
+/// `.meta()`, which replaces the whole header. The document then carries
 /// `Currency::XXX`: ISO 4217 for "no currency involved", accepted by BR-CL-04, and
 /// printed on every line of the rendered invoice.
 ///
@@ -2084,15 +2086,15 @@ fn the_builder_currency_is_order_independent() {
     assert_eq!(
         before.currency(),
         Currency::EUR,
-        "`.currency()` before `.meta()` used to be silently discarded"
+        "`.currency()` before `.meta()` must not be silently discarded"
     );
     assert!(!before.currency().is_unset());
 }
 
-/// `minimum_charge` used to return `LineItem::fixed`, which states BT-131 and
-/// nothing else. A shortfall is an ordinary invoice line (BG-25), so BR-22, BR-23
-/// and BR-26 all apply to it — three *fatal* rules, on a position the engine itself
-/// produced, none of which changes an amount.
+/// `LineItem::fixed` states BT-131 and nothing else. A shortfall is an ordinary
+/// invoice line (BG-25), so BR-22, BR-23 and BR-26 all apply to it — three *fatal*
+/// rules, on a position the engine itself produced, none of which changes an
+/// amount.
 #[test]
 fn a_minimum_charge_shortfall_is_a_complete_invoice_line() {
     let doc = BillingDocument::from_positions(
@@ -2242,7 +2244,7 @@ fn a_well_formed_currency_is_not_necessarily_one_en16931_admits() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 17. The 0.13.0 audit, second pass — a rule the engine declined to check, a
+// Rules the engine owns: BR-B-02, BT-107, and a constructor's own promise; a
 //     term with no name, and the last unguarded panic on the untrusted path
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2251,7 +2253,7 @@ fn a_well_formed_currency_is_not_necessarily_one_en16931_admits() {
 /// the caller", but only BR-B-01 ("shall be a domestic Italian invoice") actually
 /// needs anything the engine cannot see. BR-B-02 is a property of the categories
 /// present — decidable here, and structurally identical to BR-O-11, which
-/// `validate()` has always checked.
+/// `validate()` checks.
 ///
 /// It matters because `merge_period_documents` can manufacture the forbidden
 /// combination out of two individually lawful documents, which is the same argument
@@ -2484,9 +2486,9 @@ fn an_aggregator_reports_a_corrupt_event_instead_of_aborting_the_run() {
 /// are properties of the *breakdown*, reachable with an ordinary combination of
 /// layers, and `assemble` never ran `validate()`.
 ///
-/// So the primary constructor handed back documents that failed their own
-/// `assert_valid()`. `merge_period_documents` and `AllocationRule` have always
-/// re-checked their outputs; the constructor now does too.
+/// A constructor that only computed totals would hand back documents failing their
+/// own `assert_valid()`. `merge_period_documents` and `AllocationRule` re-check
+/// their outputs, and so does the primary constructor.
 #[test]
 fn the_primary_constructor_returns_only_documents_that_pass_their_own_validate() {
     // BR-O-11: "not subject to VAT" cannot coexist with another breakdown group.
@@ -2547,7 +2549,7 @@ fn the_primary_constructor_returns_only_documents_that_pass_their_own_validate()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 18. The `en16931` adapter review — verified against KoSIT and CEN artefacts
+// Header terms with rules attached — verified against KoSIT and CEN artefacts
 //
 // Every claim below was re-derived from the primary artefacts before it was
 // acted on:
@@ -2731,12 +2733,11 @@ fn self_billing_is_a_predicate_not_a_comparison_against_389() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 19. Period rules the engine could decide and did not
+// Period rules the engine can decide
 //
-// `Period::is_ordered()` shipped in 0.12.0 and was called by nothing but its own
-// tests. BR-29, BR-30, PEPPOL-EN16931-R110 and R111 are all fatal and all
-// decidable from dates the engine already holds — the same argument that puts
-// BR-B-02 and BR-O-11 inside `validate()` rather than in a consumer's lap.
+// BR-29, BR-30, PEPPOL-EN16931-R110 and R111 are all fatal and all decidable from
+// dates the engine already holds — the same argument that puts BR-B-02 and BR-O-11
+// inside `validate()` rather than in a consumer's lap.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// BR-30: a line period whose end precedes its start is refused by the position
@@ -2851,7 +2852,7 @@ fn a_negative_lookup_parameter_is_an_error_not_the_cheapest_band() {
     let err = lookup.rate_for(dec!(-1)).unwrap_err();
     assert!(err.to_string().contains("non-negative"), "got: {err}");
 
-    // The sibling rate tables have always refused it, which is the point.
+    // The sibling rate tables refuse it too, which is the point.
     let schedule = RateSchedule::capacity()
         .unit("kW")
         .band(RateBand::over(dec!(0), Amount::parse("10.00000").unwrap()))
@@ -2866,5 +2867,356 @@ fn a_negative_lookup_parameter_is_an_error_not_the_cheapest_band() {
             .unwrap()
             .split(dec!(-1))
             .is_err()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rounding bias, formatter panics, and claims that must be enforced
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `UnitPrice::validate` re-derived `BT-148 − BT-147` with `Decimal`'s bare `-`,
+/// which **panics** on overflow. The fields are public and deserialisation routes
+/// through the same function, so a crafted JSON payload aborted the process inside
+/// a method whose whole contract is to return `Err`.
+#[cfg(feature = "serde")]
+#[test]
+fn unit_price_validate_reports_an_unrepresentable_difference_instead_of_panicking() {
+    let json = r#"{
+        "value": "0",
+        "unit": "EUR/kWh",
+        "gross_price":    "79228162514264337593543950335",
+        "price_discount": "-79228162514264337593543950335"
+    }"#;
+    let parsed: Result<UnitPrice, _> = serde_json::from_str(json);
+    let err = parsed.unwrap_err().to_string();
+    assert!(
+        err.contains("not representable"),
+        "expected a reported difference, got: {err}"
+    );
+}
+
+/// `DynamicPricing::calculate` rounded every interval's `qty × price` to the
+/// engine's five decimals before adding it. Commercial rounding is not unbiased on
+/// a repeated fractional part, so the error accumulated in **one** direction: over
+/// a settled spot-price year of 8 760 hourly intervals it reached `0.0438` — four
+/// cents on a two-decimal invoice — while the method's own documentation claimed
+/// the net was "the exact accumulated total".
+///
+/// An interval is not a leaf: it never becomes its own invoice line, so there is
+/// nothing at that level to round to.
+#[test]
+fn dynamic_pricing_does_not_accumulate_a_rounding_bias_across_intervals() {
+    let mut builder = DynamicPricing::builder()
+        .unit("kWh")
+        .currency(Currency::EUR);
+    for _ in 0..8_760 {
+        builder = builder.interval(dec!(1.000005), Amount::parse("1.00000").unwrap());
+    }
+    let net = builder.build().unwrap().calculate().unwrap().net_amount;
+
+    // 8760 × 1.000005 = 8760.0438, exactly representable at five decimals.
+    assert_eq!(net, Amount::parse("8760.04380").unwrap());
+    // The per-interval rounding this replaced.
+    assert_ne!(net, Amount::parse("8760.08760").unwrap());
+}
+
+/// `residual_breakdown` subtracted one lawful VAT breakdown from another and
+/// returned the result unchecked. `BR-CO-17` tolerates a ±1.00 disagreement
+/// between BT-117 and `BT-116 × rate`, so two groups that each sit just inside it
+/// can land 2.00 apart once one is taken from the other — outside the tolerance,
+/// on a breakdown the caller is about to invoice.
+#[test]
+fn a_residual_breakdown_is_checked_before_it_is_returned() {
+    use billing::advance::residual_breakdown;
+
+    let full = vec![TaxBreakdownEntry::new(
+        TaxCategory::Standard,
+        dec!(0.19),
+        Amount::parse("100.00000").unwrap(),
+        Amount::parse("19.80000").unwrap(), // 0.80 off — permitted
+    )];
+    let advances = vec![
+        AdvancePayment::new(vec![TaxBreakdownEntry::new(
+            TaxCategory::Standard,
+            dec!(0.19),
+            Amount::parse("50.00000").unwrap(),
+            Amount::parse("8.70000").unwrap(), // 0.80 off the other way — permitted
+        )])
+        .unwrap(),
+    ];
+    // The residual is 1.60 off, which is not.
+    let err = residual_breakdown(&full, &advances)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("BR-CO-17"), "got: {err}");
+}
+
+/// `PaymentTerms::discount_within` documented itself as returning "the most
+/// favourable qualifying discount" while comparing *percentages*. A percentage
+/// only orders discounts that share a base, and `with_base_amount` exists so that
+/// they need not — so the higher rate can be worth a seventh of the lower one.
+#[test]
+fn the_best_early_payment_discount_is_decided_on_money_not_on_percent() {
+    let terms = PaymentTerms::default()
+        .with_discount(
+            EarlyPaymentDiscount::new(10, dec!(3))
+                .unwrap()
+                .with_base_amount(Amount::parse("100.00000").unwrap())
+                .unwrap(),
+        )
+        .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
+    let due = Amount::<5>::parse("1000.00000").unwrap();
+
+    let by_percent = terms.discount_within(5).unwrap();
+    let by_money = terms.best_discount_within(5, due).unwrap().unwrap();
+
+    assert_eq!(
+        by_percent.discount_on(due).unwrap(),
+        Amount::parse("3.00000").unwrap()
+    );
+    assert_eq!(
+        by_money.discount_on(due).unwrap(),
+        Amount::parse("20.00000").unwrap()
+    );
+}
+
+/// `RateSchedule::apply_peak` rendered the peak into the line description with
+/// `{peak:.3}`. `rust_decimal`'s `Display` writes into a fixed-size buffer and
+/// `unwrap`s the result, so formatting a value with 27 or more integer digits *and*
+/// a precision aborts the process — inside a method documented as returning `Err`,
+/// on a number that arrives straight from a caller's meter.
+#[test]
+fn apply_peak_survives_a_peak_no_formatter_can_pad() {
+    let schedule = RateSchedule::capacity()
+        .unit("kW")
+        .currency(Currency::EUR)
+        .band(RateBand::over(dec!(0), Amount::parse("10.00000").unwrap()))
+        .build()
+        .unwrap();
+
+    // Formatting this with `{:.3}` panics inside `rust_decimal` 1.42.
+    let line = schedule.apply_peak(Decimal::MAX).unwrap();
+    assert!(line.description.starts_with("Capacity charge ("));
+    assert_eq!(line.net_amount, Amount::parse("10.00000").unwrap());
+
+    // The ordinary case still reads as a rounded measurement.
+    let line = schedule.apply_peak(dec!(112.83719)).unwrap();
+    assert!(
+        line.description.contains("112.837"),
+        "got: {}",
+        line.description
+    );
+}
+
+/// `minimum_charge` compares against BT-106 − BT-107, and a consumer contract states
+/// its *Mindestbetrag* **brutto**. Deriving the second by hand means grossing the
+/// shortfall down by a rate, and on a mixed-rate document — 7 % Trinkwasser beside
+/// 19 % Energie, an ordinary Stadtwerk bill — there is no principled rate to pick.
+///
+/// Picking the standard one because it is usually right left a 9,90 € minimum
+/// invoiced at **9,36 €**: 0,54 € short, 5,5 %, with every total reconciling, the VAT
+/// breakdown exact and `validate()` passing.
+#[test]
+fn a_gross_minimum_reaches_its_target_on_a_mixed_rate_document() {
+    use billing::{TaxCategory, minimum_charge_gross};
+
+    let positions = vec![
+        LineItem::fixed("Trinkwasser", Amount::parse("2.00000").unwrap())
+            .tag("reduced")
+            .build()
+            .unwrap(),
+        LineItem::fixed("Grundpreis", Amount::parse("2.00000").unwrap())
+            .tag("full")
+            .build()
+            .unwrap(),
+    ];
+    let layers = || -> Vec<Box<dyn TaxLayer>> {
+        vec![
+            FixedRateTax::new("MwSt 7", dec!(0.07))
+                .unwrap()
+                .with_tag("reduced")
+                .boxed(),
+            FixedRateTax::new("MwSt 19", dec!(0.19))
+                .unwrap()
+                .with_tag("full")
+                .boxed(),
+        ]
+    };
+    let meta = || DocumentMeta {
+        currency: Currency::EUR,
+        ..Default::default()
+    };
+
+    let provisional =
+        BillingDocument::from_positions(meta(), positions.clone(), layers(), vec![]).unwrap();
+    assert_eq!(provisional.gross_total(), Amount::parse("4.52000").unwrap());
+
+    let minimum = Amount::<5>::parse("9.90000").unwrap();
+    let mut top_up = minimum_charge_gross(
+        &provisional,
+        minimum,
+        LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+        "Mindestbetrag",
+        Currency::EUR,
+    )
+    .unwrap()
+    .unwrap();
+    top_up.tags.push("full".into());
+
+    let mut positions = positions;
+    positions.push(top_up);
+    let doc = BillingDocument::from_positions(meta(), positions, layers(), vec![]).unwrap();
+
+    assert_eq!(doc.gross_total(), minimum);
+    doc.verify_vat_attribution().unwrap();
+    assert_eq!(doc.price_inconsistent_positions().count(), 0);
+}
+
+/// `PEPPOL-EN16931-R120` is fatal and the crate computes every term of it, but
+/// nothing checked it: a unit price rounded "to be tidy" moved the expression by
+/// thirteen times the ±0.02 tolerance while `LineItem::validate` returned `Ok`.
+///
+/// The error is multiplied by the **quantity**, which is what makes a
+/// `DynamicPricing` line — whose price is a weighted average with a long
+/// non-terminating expansion — the natural victim. No `BR-DEC` rule caps a unit
+/// price, so the full expansion is lawful and `AmountScale` rightly leaves it alone.
+#[test]
+fn rounding_a_weighted_average_unit_price_is_now_reportable() {
+    let mut b = DynamicPricing::builder()
+        .unit("kWh")
+        .currency(Currency::EUR);
+    for i in 0..8_760 {
+        b = b.interval(dec!(1.0), Amount::from_raw_units(1_000 + (i % 7)));
+    }
+    let line = b.build().unwrap().calculate().unwrap();
+    line.check_price_consistency().unwrap();
+
+    // Assembling at EN 16931 stays inside the tolerance: the largest reduction a
+    // two-decimal scale can apply to BT-131 is 0.005.
+    let doc = BillingDocument::builder()
+        .currency(Currency::EUR)
+        .amount_scale(AmountScale::EN16931)
+        .positions(vec![line.clone()])
+        .build()
+        .unwrap();
+    assert_eq!(doc.price_inconsistent_positions().count(), 0);
+    assert!(doc.fits_amount_scale(2));
+
+    // Rounding BT-146 does not.
+    let mut tidied = line;
+    tidied.unit_price = Some(
+        tidied
+            .unit_price
+            .take()
+            .unwrap()
+            .rounded(2, RoundingStrategy::MidpointAwayFromZero),
+    );
+    assert!(tidied.validate().is_ok(), "validate() cannot see R120");
+    let err = tidied.check_price_consistency().unwrap_err().to_string();
+    assert!(err.contains("R120"), "got: {err}");
+
+    // …and the document-level sweep finds it, in every bucket it looks at.
+    let doc = BillingDocument::from_positions(
+        DocumentMeta {
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![tidied.clone()],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    doc.validate().unwrap();
+    let found: Vec<_> = doc.price_inconsistent_positions().collect();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0.description, tidied.description);
+    assert!(found[0].1.to_string().contains("R120"));
+}
+
+/// `reverse()` produced a credit note that did not say what it credited, while
+/// holding the answer: the source document's own invoice number, which the reversal
+/// had just consumed. The caller had to copy it back by hand into `labels`.
+///
+/// `NL-R-001` makes BT-25 **fatal** on a credit note from a Dutch supplier, and
+/// `DE-R-026` asks for BG-3 on a `384` corrected invoice. BR-55 makes BT-25
+/// mandatory *inside* BG-3, which `PrecedingInvoice` enforces by construction.
+#[test]
+fn a_reversal_records_what_it_credits() {
+    let inv = BillingDocument::from_positions(
+        DocumentMeta {
+            invoice_number: "INV-2026-001".into(),
+            issue_date: Some("2026-06-30".into()),
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("100.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let credit = inv
+        .reverse(DocumentMeta {
+            invoice_number: "CN-2026-001".into(),
+            currency: Currency::EUR,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(credit.meta.preceding.len(), 1);
+    assert_eq!(credit.meta.preceding[0].number(), "INV-2026-001"); // BT-25
+    assert_eq!(credit.meta.preceding[0].issue_date(), Some("2026-06-30")); // BT-26
+    credit.assert_valid();
+
+    // A caller who states their own list keeps it — BG-3 is 0..n, and a
+    // consolidated credit note references several invoices.
+    let consolidated = inv
+        .reverse(DocumentMeta {
+            invoice_number: "CN-2026-002".into(),
+            currency: Currency::EUR,
+            preceding: vec![
+                PrecedingInvoice::new("INV-A").unwrap(),
+                PrecedingInvoice::new("INV-B").unwrap(),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(consolidated.meta.preceding.len(), 2);
+
+    // BT-25 is what a remittance advice prints, so `Display` is the number alone —
+    // BT-26 qualifies the reference rather than being part of it — and it honours
+    // width and alignment like every other identifier-shaped type here.
+    let bg3 = &credit.meta.preceding[0];
+    assert_eq!(bg3.to_string(), "INV-2026-001");
+    assert_eq!(format!("{bg3:>14}"), "  INV-2026-001");
+    assert_eq!(format!("{bg3:.<14}"), "INV-2026-001..");
+
+    // A source document with no number contributes nothing rather than an empty
+    // BT-25, which BR-55 forbids.
+    let anonymous = BillingDocument::from_positions(
+        DocumentMeta {
+            currency: Currency::EUR,
+            ..Default::default()
+        },
+        vec![
+            LineItem::fixed("Service", Amount::parse("1.00000").unwrap())
+                .build()
+                .unwrap(),
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    assert!(
+        anonymous
+            .reverse(DocumentMeta::default())
+            .unwrap()
+            .meta
+            .preceding
+            .is_empty()
     );
 }

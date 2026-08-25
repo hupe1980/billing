@@ -148,6 +148,53 @@ assert_eq!(value, Amount::parse("356.80221")?);
 Do **not** respond to a `false` by rounding on the way out — that is the mistake this
 whole page is about. Rebuild with `amount_scale`.
 
+### BT-146 is not capped, and rounding it is fatal
+
+The `BR-DEC` decimal limits stop at BT-131 (`BR-DEC-23`) and the line allowance and
+charge leaves (`BR-DEC-24` … `BR-DEC-28`). **No rule caps a unit price** — not BT-146,
+BT-147, BT-148 or BT-149 — so a twenty-eight-decimal price is lawful, and
+`amount_scale` deliberately leaves prices alone while reducing every amount around
+them.
+
+That asymmetry is load-bearing, because `R120` multiplies the price by the
+**quantity** before comparing it to BT-131. A `DynamicPricing` line states the
+*weighted average* over its intervals, which is a long non-terminating decimal by
+construction — so rounding it "to be tidy" scales the error by the whole period's
+consumption. On a settled spot-price year of 8 760 hourly intervals, rounding BT-146
+to two decimals moves the expression by `0.26`: **thirteen times the fatal ±0.02**,
+on a document whose totals all still reconcile.
+
+```rust
+use billing::prelude::*;
+use rust_decimal::dec;
+
+let mut b = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
+for i in 0..8_760 {
+    b = b.interval(dec!(1.0), Amount::from_raw_units(1_000 + (i % 7)));
+}
+let line = b.build()?.calculate()?;
+line.check_price_consistency()?;                       // holds as built
+
+let mut tidied = line;
+tidied.unit_price = Some(tidied.unit_price.take().unwrap()
+    .rounded(2, RoundingStrategy::MidpointAwayFromZero));
+assert!(tidied.validate().is_ok());                    // arithmetic is fine …
+assert!(tidied.check_price_consistency().is_err());    // … the profile is not
+```
+
+`LineItem::check_price_consistency()` and
+`BillingDocument::price_inconsistent_positions()` are the third member of the *"may I
+emit this?"* family, beside `verify_vat_attribution()` and
+`unattributed_positions()`. They sit outside `validate()` for the same reason those
+do: `R120`'s tolerance is **absolute**, so a document assembled at
+`AmountScale::new(0, …)` — legitimate for a zero-decimal currency, or for something
+that is not an invoice at all — can be perfectly self-consistent and still fall
+outside ±0.02.
+
+The corollary for `DynamicPricing`: **render the average it computed, do not
+re-derive it.** `net_amount ÷ quantity` divides an already-rounded total and gives a
+different, worse number; the line's `unit_price` comes from the exact accumulated sum.
+
 ## What is still missing for a valid XRechnung
 
 Precision is the deepest gap but not the only one. To emit a document that passes the

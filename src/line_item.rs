@@ -252,6 +252,14 @@ impl AllowanceCharge {
     }
 }
 
+/// The tolerance `PEPPOL-EN16931-R120` states for the invoice line net amount —
+/// `u:slack($lineExtensionAmount, …, 0.02)` in the artefact.
+///
+/// The same figure `PEPPOL-EN16931-R040` allows an allowance or charge basis, and
+/// for the same reason: both are recomputed by a validator from values that were
+/// each rounded on the way out.
+const R120_SLACK: &str = "0.02";
+
 // ── Line allowances and charges (BG-27 / BG-28) ───────────────────────────────
 
 /// Which side of `cbc:ChargeIndicator` a [`LineAllowanceCharge`] is on.
@@ -904,8 +912,8 @@ impl LineItem {
     ///    [`crate::PerUnitLevy`] selects its base by matching `unit_label` — silently
     ///    excludes the position from every per-unit levy. An empty price unit
     ///    renders as `"EUR/"`. [`crate::RateSchedule`] and
-    ///    [`crate::TimeOfUsePricing`] have always rejected empty units in their
-    ///    builders; positions built by hand now get the same guarantee.
+    ///    [`crate::TimeOfUsePricing`] reject empty units in their builders, and a
+    ///    position built by hand gets the same guarantee here.
     /// 5. `vat`, where present, is category/rate-consistent — see
     ///    [`LineVat::validate`].
     /// 6. `allowance_charge`, where present, states a base amount and a percentage
@@ -969,6 +977,122 @@ impl LineItem {
         // them — see `Period::validate`.
         if let Some(period) = &self.period {
             period.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Check `PEPPOL-EN16931-R120` — that BT-131 really is the expression it
+    /// claims to be.
+    ///
+    /// > `[PEPPOL-EN16931-R120]` Invoice line net amount MUST equal (Invoiced
+    /// > quantity × (Item net price / item price base quantity)) + Sum of invoice
+    /// > line charge amount − sum of invoice line allowance amount
+    ///
+    /// — **fatal**, with a ±0.02 tolerance the artefact states explicitly
+    /// (`u:slack(…, 0.02)`).
+    ///
+    /// Vacuously true for a position with no BT-129 / BT-146 pair: the rule's
+    /// Schematron reads them out of `cac:Price`, and a line that states only an
+    /// amount has nothing for it to compare. That is why this returns `Ok` rather
+    /// than an error there — and why [`LineItem::flat_fee`] exists, since BR-22 /
+    /// BR-23 / BR-26 make such a line unemittable for a different reason.
+    ///
+    /// # Why this is not part of [`validate`](Self::validate)
+    ///
+    /// Because R120's tolerance is **absolute**, and this crate assembles documents
+    /// at scales EN 16931 never asks for. [`crate::AmountScale`] permits anything up
+    /// to five decimals: at two the largest reduction a line can suffer is `0.005`,
+    /// comfortably inside the slack, but at zero decimals it is `0.5` — twenty-five
+    /// times the limit — on a document that is perfectly well formed for whatever it
+    /// is that is not an EN 16931 invoice.
+    ///
+    /// So this joins [`crate::BillingDocument::verify_vat_attribution`] and
+    /// [`crate::BillingDocument::unattributed_positions`] in the "may I emit this?"
+    /// family rather than the "is this document self-consistent?" family. Run it on
+    /// the document you are about to serialise;
+    /// [`crate::BillingDocument::price_inconsistent_positions`] runs it over all
+    /// three buckets at once.
+    ///
+    /// # The failure mode it exists to catch
+    ///
+    /// A [`crate::DynamicPricing`] line states the **weighted average** price over
+    /// many intervals, which is a long non-terminating decimal by construction. No
+    /// `BR-DEC` rule caps a unit price — the decimal limits stop at BT-131 (BR-DEC-23)
+    /// and never reach BT-146 — so emitting all of it is lawful, and
+    /// [`crate::AmountScale`] deliberately leaves it alone.
+    ///
+    /// Rounding it anyway, because a 28-decimal price looks untidy, is where the
+    /// invoice dies: the error is multiplied by the **quantity**. Rounding BT-146 to
+    /// two decimals on a year of hourly intervals moves the R120 expression by
+    /// `0.26` — thirteen times the fatal limit — while every total still reconciles
+    /// and `validate()` passes.
+    ///
+    /// ```rust
+    /// use billing::{Amount, Currency, DynamicPricing, RoundingStrategy};
+    /// use rust_decimal::dec;
+    ///
+    /// let mut b = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
+    /// for i in 0..8_760 {
+    ///     b = b.interval(dec!(1.0), Amount::from_raw_units(1_000 + (i % 7)));
+    /// }
+    /// let line = b.build()?.calculate()?;
+    /// assert!(line.check_price_consistency().is_ok());
+    ///
+    /// // "Tidying" the weighted average to two decimals — still `validate()`-clean.
+    /// let mut tidied = line.clone();
+    /// tidied.unit_price = Some(
+    ///     tidied.unit_price.take().unwrap()
+    ///         .rounded(2, RoundingStrategy::MidpointAwayFromZero),
+    /// );
+    /// assert!(tidied.validate().is_ok());
+    /// assert!(tidied.check_price_consistency().is_err()); // …and fatally invalid
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// - [`BillingError::InvalidInput`] if the expression is outside the ±0.02
+    ///   tolerance.
+    /// - [`BillingError::MonetaryOverflow`] if the expression cannot be evaluated.
+    pub fn check_price_consistency(&self) -> Result<(), BillingError> {
+        let Some(expected) = exact_price_part(self.quantity.as_ref(), self.unit_price.as_ref())?
+        else {
+            return Ok(());
+        };
+        // The BG-27 / BG-28 leaves are part of the same expression, and are already
+        // `Amount<5>` — so only the price part carries excess precision.
+        let mut total = expected;
+        for lac in &self.line_allowances {
+            let signed = if lac.kind.charge_indicator() {
+                lac.amount.into_decimal()
+            } else {
+                -lac.amount.into_decimal()
+            };
+            total = total
+                .checked_add(signed)
+                .ok_or(BillingError::MonetaryOverflow {
+                    precision: 5,
+                    input_value: None,
+                })?;
+        }
+        // A credit position's stated amount is negated as a whole, exactly as
+        // `compose_bt131` negates the R120 sum rather than the price part alone.
+        if self.sign == Sign::Credit && total.is_sign_positive() {
+            total = -total;
+        }
+        let slack = Decimal::from_str_exact(R120_SLACK).unwrap_or_default();
+        let diff = match self.net_amount.into_decimal().checked_sub(total) {
+            Some(d) => d.abs(),
+            // Too large to represent is, of course, also outside the tolerance.
+            None => Decimal::MAX,
+        };
+        if diff > slack {
+            return Err(BillingError::InvalidInput {
+                reason: format!(
+                    "line {:?} states a net amount of {} but its quantity, unit price and \
+                     line allowances evaluate to {total}; PEPPOL-EN16931-R120 allows ±{R120_SLACK}",
+                    self.description, self.net_amount
+                ),
+            });
         }
         Ok(())
     }
@@ -1049,10 +1173,8 @@ impl LineItem {
     /// # Why the currency is an argument
     ///
     /// The price label is generated (`"EUR"`, `"CHF"`, …), and a generated label
-    /// cannot invent the currency. Earlier releases hardcoded `"EUR"` here, which
-    /// printed a euro price on every Swiss, sterling and dollar invoice — exactly
-    /// the silent mislabelling [`Currency`] was introduced to end, and the one
-    /// place in the crate that still did it. Pass [`Currency::XXX`] if the label
+    /// cannot invent the currency — hardcoding one prints a euro price on every
+    /// Swiss, sterling and dollar invoice. Pass [`Currency::XXX`] if the label
     /// genuinely does not matter; it renders as `XXX`, which reads as the bug it is.
     ///
     /// ```rust
@@ -1132,13 +1254,12 @@ impl LineItem {
     ///
     /// # Why [`Quantity`] and [`UnitPrice`] rather than four loose arguments
     ///
-    /// This constructor used to take the value and unit of each as separate
-    /// positional parameters — `(desc, qty, qty_unit, price, price_unit)` — which
-    /// put two free-form `&str` units side by side. Swapping them
-    /// (`"EUR/kWh"` for `"kWh"`) still compiled and still produced an invoice, just
-    /// a wrong one. Passing the pairs pre-assembled makes that transposition a type
-    /// error instead: [`Quantity`] and [`UnitPrice`] are distinct types, and each
-    /// keeps its value glued to the unit that describes it.
+    /// Taking the value and unit of each as separate positional parameters —
+    /// `(desc, qty, qty_unit, price, price_unit)` — puts two free-form `&str` units
+    /// side by side, and swapping them (`"EUR/kWh"` for `"kWh"`) still compiles and
+    /// still produces an invoice, just a wrong one. Passing the pairs pre-assembled
+    /// makes that transposition a type error: [`Quantity`] and [`UnitPrice`] are
+    /// distinct types, each keeping its value glued to the unit that describes it.
     ///
     /// # Example
     /// ```rust
@@ -1665,6 +1786,84 @@ mod tests {
         assert_eq!(item.net_amount, Amount::<5>::parse("8.50000").unwrap());
     }
 
+    // ── check_price_consistency (PEPPOL-EN16931-R120) ────────────────────────
+
+    /// A BG-27 allowance is **subtracted** from the price part. Getting the sign
+    /// wrong is invisible in the totals — `build` computes BT-131 correctly either
+    /// way — and shows up only as an R120 failure at the access point.
+    #[test]
+    fn r120_subtracts_a_line_allowance_and_adds_a_line_charge() {
+        let allowance = LineItem::debit("Arbeit")
+            .quantity(Quantity::new(dec!(10), "kWh"))
+            .unit_price(UnitPrice::new(dec!(1.00), "EUR/kWh"))
+            .line_allowance(LineAllowanceCharge::allowance(
+                Amount::parse("1.00000").unwrap(),
+                "Treuerabatt",
+            ))
+            .build()
+            .unwrap();
+        assert_eq!(allowance.net_amount, Amount::parse("9.00000").unwrap());
+        allowance.check_price_consistency().unwrap();
+
+        let charge = LineItem::debit("Arbeit")
+            .quantity(Quantity::new(dec!(10), "kWh"))
+            .unit_price(UnitPrice::new(dec!(1.00), "EUR/kWh"))
+            .line_allowance(LineAllowanceCharge::charge(
+                Amount::parse("1.00000").unwrap(),
+                "Eilzuschlag",
+            ))
+            .build()
+            .unwrap();
+        assert_eq!(charge.net_amount, Amount::parse("11.00000").unwrap());
+        charge.check_price_consistency().unwrap();
+    }
+
+    /// A credit position's amount is negated as a whole, exactly as `compose_bt131`
+    /// negates the R120 sum rather than the price part alone. Without that the
+    /// expression comes out at twice the amount, with the wrong sign.
+    #[test]
+    fn r120_holds_for_a_credit_position() {
+        let credit = LineItem::credit("EEG Einspeisung")
+            .quantity(Quantity::new(dec!(500), "kWh"))
+            .unit_price(UnitPrice::new(dec!(0.0832), "EUR/kWh"))
+            .build()
+            .unwrap();
+        assert_eq!(credit.net_amount, Amount::parse("-41.60000").unwrap());
+        credit.check_price_consistency().unwrap();
+    }
+
+    /// The artefact states the tolerance as `u:slack(…, 0.02)`, which admits a
+    /// difference *equal* to 0.02 and rejects anything above it. Off by one
+    /// comparison operator and a lawful line is refused.
+    #[test]
+    fn r120_admits_exactly_two_hundredths_and_no_more() {
+        let line = |amount: &str| {
+            LineItem::debit("Arbeit")
+                .quantity(Quantity::new(dec!(1), "kWh"))
+                .unit_price(UnitPrice::new(dec!(1.00), "EUR/kWh"))
+                .fixed_amount(Amount::parse(amount).unwrap())
+                .build()
+                .unwrap()
+        };
+        // Exactly on the boundary, both directions.
+        line("1.02000").check_price_consistency().unwrap();
+        line("0.98000").check_price_consistency().unwrap();
+        // One engine unit past it.
+        assert!(line("1.02001").check_price_consistency().is_err());
+        assert!(line("0.97999").check_price_consistency().is_err());
+    }
+
+    /// A position with no BT-129 / BT-146 pair has nothing for R120 to compare, so
+    /// the rule is vacuous rather than violated.
+    #[test]
+    fn r120_is_vacuous_without_a_quantity_and_price() {
+        LineItem::fixed("Grundpreis", Amount::parse("8.50000").unwrap())
+            .build()
+            .unwrap()
+            .check_price_consistency()
+            .unwrap();
+    }
+
     #[test]
     fn tag_filtering() {
         let item = LineItem::debit("Arbeit")
@@ -1762,7 +1961,7 @@ mod tests {
         assert_eq!(bare.percentage, None);
         bare.validate().unwrap();
         // With no stated pair there is nothing for R040 to contradict, so an
-        // amount the original basis would have rejected is now fine.
+        // amount the basis would have rejected passes.
         bare.check_amount(Amount::parse("73.41000").unwrap())
             .unwrap();
         assert!(

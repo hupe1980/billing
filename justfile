@@ -40,9 +40,8 @@ test-all:
 # Run the doctests — including the whole README.
 #
 # This needs its own recipe because `cargo test --all-targets` silently *excludes*
-# doctests (rust-lang/cargo#6669), and so does `--lib --tests`. Every test
-# invocation in this file and in `.github/workflows/ci.yml` used one of those two,
-# so until 0.13.0 the doctests ran in nobody's CI.
+# doctests (rust-lang/cargo#6669), and so does `--lib --tests`. A project whose test
+# invocations use only those two runs its doctests in nobody's CI.
 #
 # That is not a cosmetic gap. `src/lib.rs` ends with `#![doc = include_str!("../README.md")]`
 # specifically so that every Rust example in the README is compiled and run, and

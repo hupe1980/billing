@@ -752,6 +752,10 @@ impl Prepayment {
 ///   not contain.
 /// - [`BillingError::InvalidInput`] if the advances exceed `full` in any group.
 ///   Over-deduction would understate output tax on the supply.
+/// - [`BillingError::InvalidInput`] if a surviving group is not a lawful
+///   [`TaxBreakdownEntry`] — the result is checked with
+///   [`TaxBreakdownEntry::validate`] before it is returned, because subtraction
+///   does not preserve BR-CO-17 on its own.
 /// - [`BillingError::MonetaryOverflow`] on overflow.
 ///
 /// ```rust
@@ -811,6 +815,15 @@ pub fn residual_breakdown(
     }
 
     residual.retain(|e| !(e.taxable_base.is_zero() && e.tax_amount.is_zero()));
+    // The result is a VAT breakdown a caller is about to put on an invoice, and
+    // subtraction does not preserve BR-CO-17 for free: two entries that each satisfy
+    // it within the rule's tolerance can differ by twice that once one is taken from
+    // the other, and a group whose base is fully settled while its tax is not lands
+    // here rather than being dropped above. `TaxBreakdownEntry::new` is infallible,
+    // so `full` itself may never have been checked either.
+    for entry in &residual {
+        entry.validate()?;
+    }
     Ok(residual)
 }
 
@@ -904,6 +917,25 @@ mod tests {
         let wrong_rate =
             vec![AdvancePayment::new(vec![entry("0.07", "10.00000", "0.70000")]).unwrap()];
         assert!(residual_breakdown(&full, &wrong_rate).is_err());
+    }
+
+    /// Subtraction does not preserve BR-CO-17 on its own. The rule tolerates a
+    /// ±1.00 disagreement between BT-117 and `BT-116 × rate`, so two groups that
+    /// each sit *just* inside it can land 2.00 apart once one is taken from the
+    /// other — outside the tolerance, on a breakdown a caller is about to invoice.
+    #[test]
+    fn residual_refuses_a_group_that_stops_satisfying_br_co_17() {
+        // 100.00 × 19 % is 19.00; 19.80 is 0.80 off, which BR-CO-17 permits.
+        let full = vec![entry("0.19", "100.00000", "19.80000")];
+        // 50.00 × 19 % is 9.50; 8.70 is 0.80 off in the other direction.
+        let advances =
+            vec![AdvancePayment::new(vec![entry("0.19", "50.00000", "8.70000")]).unwrap()];
+        // The residual is 50.00 / 11.10 — 1.60 off, which it does not.
+        let err = residual_breakdown(&full, &advances).unwrap_err();
+        assert!(
+            err.to_string().contains("BR-CO-17"),
+            "expected a BR-CO-17 finding, got {err}"
+        );
     }
 
     #[test]

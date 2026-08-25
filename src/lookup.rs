@@ -109,8 +109,8 @@ impl RateLookup {
     /// would return the **lowest** band — the cheapest rate — for what is a data
     /// error: an installed capacity, a connected load or a peak demand cannot be
     /// less than nothing. That is the silent-under-billing shape
-    /// [`crate::RateSchedule::apply_peak`] and [`crate::RateSchedule::split`]
-    /// already refuse, and the three now agree.
+    /// [`crate::RateSchedule::apply_peak`] and [`crate::RateSchedule::split`] also
+    /// refuse.
     ///
     /// ```rust
     /// use billing::{Amount, RateLookup};
@@ -197,6 +197,33 @@ impl RateLookupBuilder {
     ///
     /// Sorts entries by `upper_bound` ascending so `rate_for` always finds
     /// the most specific (lowest) matching bound.
+    ///
+    /// # `.ok()` on a table written as literals is a bug swallower
+    ///
+    /// This returns `Result` because a rate table is often loaded from
+    /// configuration, where a bad ladder is a runtime condition. When the table is
+    /// **written in the source** — a statutory tier list, an EEG ladder, a
+    /// regulated fee schedule — a construction failure is an *authorship* bug that
+    /// cannot happen at runtime, and the two must not be spelled the same way:
+    ///
+    /// ```rust,ignore
+    /// // ✘ A non-contiguous ladder now returns the same answer as "no table for
+    /// //   this year", and the caller is told to look elsewhere rather than that
+    /// //   the table is wrong.
+    /// 2023..=2026 => RateLookup::builder().at_most(..).build().ok(),
+    ///
+    /// // ✔ The two states stay distinguishable. `expect` also lets the message
+    /// //   name the table, which a crate-supplied panic never could.
+    /// 2023..=2026 => Some(RateLookup::builder().at_most(..).build()
+    ///                     .expect("EEG 2023 hydro ladder is malformed")),
+    /// _ => None,
+    /// ```
+    ///
+    /// There is deliberately no `build_static()` doing this for you:
+    /// `.expect("…")` already is one, and it carries a message this crate could not
+    /// have written. The same reasoning applies to
+    /// [`crate::RateScheduleBuilder`] and to every other fallible builder in this
+    /// crate.
     ///
     /// # Errors
     /// [`BillingError::InvalidSchedule`] if:

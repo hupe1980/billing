@@ -2,12 +2,15 @@
 //!
 //! Demonstrates:
 //! - `WeightedSumAggregator` for CPU-hours (VMs active for fractions of period)
-//! - `MaxAggregator` + `RateSchedule::capacity()` for peak-bandwidth billing
+//! - `PercentileAggregator` + `RateSchedule::capacity()` for **burstable**
+//!   (95th-percentile) bandwidth billing, and what `MaxAggregator` would have cost
 //! - `DynamicPricing` with `.with_unit("GB")?` for spot-priced storage
 //! - `BillingDocument::builder()` with extra tax layer
 //! - Domain-specific unit labels (`"CPU-h"`, `"Mbps"`, `"GB"`)
 
-use billing::aggregation::{MaxAggregator, UsageAggregator, WeightedSumAggregator};
+use billing::aggregation::{
+    MaxAggregator, PercentileAggregator, UsageAggregator, WeightedSumAggregator,
+};
 use billing::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal::dec;
@@ -65,16 +68,32 @@ fn main() {
 
     let cpu_items = cpu_schedule.split(total_cpu_hours).unwrap();
 
-    // ── 2. Network billing: MAX aggregation → capacity pricing ───────────────
-    let bandwidth_samples = vec![
-        BandwidthSample { mbps: dec!(45.2) },
-        BandwidthSample { mbps: dec!(112.8) }, // peak
-        BandwidthSample { mbps: dec!(89.3) },
-        BandwidthSample { mbps: dec!(23.1) },
-    ];
+    // ── 2. Network billing: P95 aggregation → capacity pricing ───────────────
+    //
+    // Burstable billing, the way every transit and CDN contract settles: sample
+    // every five minutes, discard the top 5 %, bill the highest sample left. A
+    // 30-day month is 8 640 samples, so 432 of them are free.
+    //
+    // Here the link sits at 90 Mbps and spends about two hours of the month
+    // saturated at 950 — a backup window, a release, a scraped cache. That is 24
+    // samples out of 8 640, well inside the 5 % that is discarded.
+    let bandwidth_samples: Vec<BandwidthSample> = (0..8_640)
+        .map(|i| BandwidthSample {
+            mbps: if i % 360 == 0 {
+                dec!(950.0)
+            } else {
+                dec!(90.0)
+            },
+        })
+        .collect();
 
-    let peak_agg = MaxAggregator::new(|b: &BandwidthSample| b.mbps);
-    let peak_mbps = peak_agg.aggregate(&bandwidth_samples).unwrap();
+    let billed_mbps = PercentileAggregator::p95(|b: &BandwidthSample| b.mbps)
+        .aggregate(&bandwidth_samples)
+        .unwrap();
+    // What the same month would have cost on the peak — the tier above.
+    let peak_mbps = MaxAggregator::new(|b: &BandwidthSample| b.mbps)
+        .aggregate(&bandwidth_samples)
+        .unwrap();
 
     let bandwidth_schedule = RateSchedule::capacity()
         .unit("Mbps")
@@ -94,7 +113,9 @@ fn main() {
         .build()
         .unwrap();
 
-    let bandwidth_item = bandwidth_schedule.apply_peak(peak_mbps).unwrap();
+    let bandwidth_item = bandwidth_schedule.apply_peak(billed_mbps).unwrap();
+    let billed_bandwidth = bandwidth_item.net_amount;
+    let on_the_peak = bandwidth_schedule.apply_peak(peak_mbps).unwrap().net_amount;
 
     // ── 3. Storage billing: dynamic spot pricing ─────────────────────────────
     let storage_intervals: Vec<(Decimal, Amount<5>)> = vec![
@@ -131,7 +152,15 @@ fn main() {
     println!("=== Cloud Compute Invoice ===");
     println!();
     println!("  CPU-hours billed: {total_cpu_hours:.1}");
-    println!("  Peak bandwidth:   {peak_mbps:.1} Mbps");
+    println!("  Bandwidth billed: {billed_mbps:.1} Mbps (P95) — peak was {peak_mbps:.1} Mbps");
+    println!(
+        "    billing the peak instead: {} instead of {} ({}x)",
+        on_the_peak,
+        billed_bandwidth,
+        on_the_peak
+            .checked_div(billed_bandwidth.into_decimal())
+            .unwrap(),
+    );
     println!();
     // Iterate the *net* positions only. `all_positions()` also yields the tax
     // positions, so printing those here and the VAT again below reports it twice.

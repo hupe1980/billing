@@ -368,7 +368,21 @@ impl UnitPrice {
     pub fn validate(&self) -> Result<(), BillingError> {
         match (self.gross_price, self.price_discount) {
             (Some(gross), discount) => {
-                let expected = gross - discount.unwrap_or(Decimal::ZERO);
+                // `checked_sub`: `Decimal`'s `-` PANICS on overflow, and both
+                // operands are attacker-controlled — the fields are public and
+                // deserialisation routes through here. A `Result`-returning
+                // validator that aborts the process on a crafted payload is the one
+                // failure mode this crate refuses everywhere else. A difference too
+                // large to represent is, of course, also not equal to `value`.
+                let expected = gross
+                    .checked_sub(discount.unwrap_or(Decimal::ZERO))
+                    .ok_or_else(|| BillingError::InvalidInput {
+                        reason: format!(
+                            "item gross price {gross} (BT-148) less discount {} (BT-147) \
+                             is not representable",
+                            discount.unwrap_or(Decimal::ZERO)
+                        ),
+                    })?;
                 if self.value != expected {
                     return Err(BillingError::InvalidInput {
                         reason: format!(
@@ -467,6 +481,23 @@ impl UnitPrice {
     /// assert_eq!(p.value,          dec!(8.50)); // exactly 9.50 − 1.00, so R046 holds
     /// assert!(p.validate().is_ok());
     /// ```
+    ///
+    /// # Do not reach for this to tidy a weighted average
+    ///
+    /// A unit price is **not** capped by any `BR-DEC` rule — the decimal limits stop
+    /// at BT-131 (BR-DEC-23) and never reach BT-146, BT-147, BT-148 or BT-149 — so a
+    /// twenty-eight-decimal price is lawful EN 16931, and
+    /// [`crate::AmountScale`] deliberately leaves it alone.
+    ///
+    /// Rounding one anyway is not cosmetic, because the error is multiplied by the
+    /// **quantity** before `PEPPOL-EN16931-R120` compares it to BT-131. On a
+    /// [`crate::DynamicPricing`] line over a year of hourly intervals, rounding the
+    /// weighted average to two decimals moves the R120 expression by `0.26` —
+    /// thirteen times the rule's fatal ±0.02 tolerance — on a document whose totals
+    /// all still reconcile. Use this where a derived price is itself the *output*
+    /// (a published tariff figure, a quote), and check
+    /// [`crate::LineItem::check_price_consistency`] afterwards if the price is also
+    /// on an invoice line.
     ///
     /// # Panics
     /// If the re-derived `gross - discount` leaves [`Decimal`]'s range — see

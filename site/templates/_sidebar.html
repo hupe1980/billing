@@ -4,7 +4,10 @@
     crawlable, keyboard-navigable, and works before any script runs. On narrow
     screens the `<details>` collapses it without changing the markup. -#}
 {%- set docs = get_section(path="docs/_index.md") -%}
-{%- set here = page.permalink | default(value="") -%}
+{#- `current_url` is defined in page *and* section context; `page` is not, and
+    relying on `default` to swallow that only worked while the template engine
+    tolerated an undefined lookup inside a filter. -#}
+{%- set here = current_url | default(value="") -%}
 <details class="sidebar" open>
   <summary>Documentation</summary>
   {% include "_search.html" %}

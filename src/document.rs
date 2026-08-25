@@ -119,7 +119,6 @@ impl std::fmt::Display for Note {
 /// A GLN is `0088`; a SIRET is `0009`. A bare string does not say which, and a
 /// consumer that guesses produces an invoice that *validates* while identifying the
 /// wrong registry — the worst kind of failure, because nothing downstream notices.
-/// Until 0.13.0 these fields were `Option<String>` and could not be mapped at all.
 ///
 /// # The engine does not check membership, and one trap is worth naming
 ///
@@ -195,6 +194,151 @@ impl std::fmt::Display for PartyIdentifier {
     }
 }
 
+/// One EN 16931 **BG-3 PRECEDING INVOICE REFERENCE** — what this document corrects,
+/// credits or replaces.
+///
+/// | Field | EN 16931 | Cardinality |
+/// |---|---|---|
+/// | [`number`](Self::number) | **BT-25** Preceding Invoice reference | `1..1` |
+/// | [`issue_date`](Self::issue_date) | **BT-26** Preceding Invoice issue date | `0..1` |
+///
+/// # BR-55 is satisfied by the type, not by a check
+///
+/// > `[BR-55]` Each Preceding Invoice reference (BG-3) shall contain a Preceding
+/// > Invoice reference (BT-25).
+///
+/// So BT-25 is not an `Option`, and [`PrecedingInvoice::new`] refuses a blank
+/// string. A `BG-3` without a `BT-25` is simply not constructible, which is the
+/// same move [`crate::LineVat`] makes for BR-S-05 — a rule about presence is best
+/// enforced where absence cannot be spelled.
+///
+/// # Why the engine cares about a field that carries no amount
+///
+/// Because the engine knows it. [`BillingDocument::reverse`] produces a credit note
+/// of a document whose invoice number is right there, and the reversal is meaningless
+/// without it — a credit note that does not say what it credits is an unexplained
+/// payment.
+///
+/// The rules bear that out, and they are not uniform, which is why this is modelled
+/// rather than assumed:
+///
+/// | Rule | Source | Says |
+/// |---|---|---|
+/// | **BR-55** | CEN, fatal | a BG-3 shall contain BT-25 |
+/// | **`NL-R-001`** | Peppol, **fatal** | for a Dutch supplier, a credit note **MUST** carry BT-25 |
+/// | **`DE-R-026`** | Peppol, warning | a `384` corrected invoice *should* carry BG-3 at least once |
+///
+/// `reverse` therefore fills this in from the document being reversed unless the
+/// caller has already stated one. BG-3 is `0..n` in the standard — a consolidated
+/// credit note may reference several invoices — so this lives in a `Vec` on
+/// [`DocumentMeta`].
+///
+/// ```rust
+/// use billing::PrecedingInvoice;
+///
+/// let bg3 = PrecedingInvoice::new("INV-2026-001")?
+///     .with_issue_date("2026-06-30");
+/// assert_eq!(bg3.number(), "INV-2026-001");        // BT-25
+/// assert_eq!(bg3.issue_date(), Some("2026-06-30")); // BT-26
+///
+/// // BR-55: a reference to nothing is not a reference.
+/// assert!(PrecedingInvoice::new("   ").is_err());
+/// # Ok::<(), billing::BillingError>(())
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "PrecedingInvoiceRepr"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrecedingInvoice {
+    number: String,
+    issue_date: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct PrecedingInvoiceRepr {
+    number: String,
+    #[serde(default)]
+    issue_date: Option<String>,
+}
+
+/// Deserialisation goes through [`PrecedingInvoice::new`], so stored JSON cannot
+/// reintroduce the empty BT-25 that BR-55 forbids.
+#[cfg(feature = "serde")]
+impl TryFrom<PrecedingInvoiceRepr> for PrecedingInvoice {
+    type Error = BillingError;
+    fn try_from(r: PrecedingInvoiceRepr) -> Result<Self, Self::Error> {
+        let p = Self::new(r.number)?;
+        Ok(match r.issue_date {
+            Some(d) => p.with_issue_date(d),
+            None => p,
+        })
+    }
+}
+
+impl PrecedingInvoice {
+    /// Reference a preceding invoice by its number — **BT-25**.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidInput`] if `number` is empty or whitespace only.
+    /// BR-55 makes BT-25 mandatory inside BG-3, and a blank one satisfies the
+    /// element while satisfying nothing a human or a validator can follow.
+    pub fn new(number: impl Into<String>) -> Result<Self, BillingError> {
+        let number = number.into();
+        if number.trim().is_empty() {
+            return Err(BillingError::InvalidInput {
+                reason: "preceding invoice reference (BT-25) must not be empty; BR-55 makes it \
+                         mandatory inside BG-3"
+                    .into(),
+            });
+        }
+        Ok(Self {
+            number,
+            issue_date: None,
+        })
+    }
+
+    /// Attach the preceding invoice's issue date — **BT-26**.
+    ///
+    /// Optional in the core standard, and worth stating whenever invoice numbers
+    /// are only unique within a year.
+    #[must_use]
+    pub fn with_issue_date(mut self, date: impl Into<String>) -> Self {
+        self.issue_date = Some(date.into());
+        self
+    }
+
+    /// **BT-25** — the preceding invoice's number.
+    #[must_use]
+    pub fn number(&self) -> &str {
+        &self.number
+    }
+
+    /// **BT-26** — the preceding invoice's issue date, if stated.
+    #[must_use]
+    pub fn issue_date(&self) -> Option<&str> {
+        self.issue_date.as_deref()
+    }
+}
+
+impl std::fmt::Display for PrecedingInvoice {
+    /// The number alone — BT-26 qualifies the reference, it is not part of it.
+    ///
+    /// Honours width, fill and alignment, as [`Note`] and [`PartyIdentifier`] do,
+    /// so a reference lines up in a rendered remittance advice.
+    ///
+    /// ```rust
+    /// use billing::PrecedingInvoice;
+    ///
+    /// let bg3 = PrecedingInvoice::new("INV-1")?.with_issue_date("2026-06-30");
+    /// assert_eq!(bg3.to_string(), "INV-1");
+    /// assert_eq!(format!("{bg3:>10}"), "     INV-1");
+    /// # Ok::<(), billing::BillingError>(())
+    /// ```
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.number)
+    }
+}
+
 // ── DocumentMeta ──────────────────────────────────────────────────────────────
 
 /// Non-computed header fields for a billing document.
@@ -254,6 +398,15 @@ pub struct DocumentMeta {
     /// EN 16931 **BT-46** — the buyer identifier, with the registry it belongs to.
     #[cfg_attr(feature = "serde", serde(default))]
     pub recipient_id: Option<PartyIdentifier>,
+    /// EN 16931 **BG-3 PRECEDING INVOICE REFERENCE** — what this document corrects,
+    /// credits or replaces. `0..n`, as the standard has it.
+    ///
+    /// [`BillingDocument::reverse`] fills this in from the document being reversed
+    /// when the caller has not stated one, because a credit note that does not say
+    /// what it credits is an unexplained payment — and `NL-R-001` makes it *fatal*
+    /// for a Dutch supplier. See [`PrecedingInvoice`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub preceding: Vec<PrecedingInvoice>,
     /// EN 16931 **BG-1 INVOICE NOTE** — free-text remarks, each optionally carrying
     /// its UNCL 4451 subject code.
     ///
@@ -521,8 +674,8 @@ impl BillingDocument {
     /// the step that is easy to forget and impossible to see afterwards: an
     /// invoice stating `-20.00` where BR-CO-13 expects `20.00` fails by *twice* the
     /// allowance. This accessor is that negation, done once, under the term's own
-    /// name — so the totals chain now reads BT-106 … BT-115 with no gap and no
-    /// sign conversion left to the caller.
+    /// name, so the totals chain reads BT-106 … BT-115 with no sign conversion left
+    /// to the caller.
     ///
     /// ```rust
     /// use billing::prelude::*;
@@ -1208,10 +1361,9 @@ impl BillingDocument {
                     }
                     match item.vat {
                         // Two VAT layers claiming one position means it is taxed
-                        // twice: BR-S-08 cannot hold for either group, and the
-                        // document used to assemble silently. The same check catches
-                        // a caller-declared BT-151, or a charge layer's own `vat()`,
-                        // that contradicts the layer actually taxing the position.
+                        // twice, and BR-S-08 cannot hold for either group. The same
+                        // check catches a caller-declared BT-151, or a charge layer's
+                        // own `vat()`, contradicting the layer actually taxing it.
                         Some(prior) if prior != vat => {
                             return Err(BillingError::LayerError {
                                 reason: format!(
@@ -1354,11 +1506,10 @@ impl BillingDocument {
         // breakdown a caller can reach with an ordinary combination of layers, and
         // nothing here established them.
         //
-        // So `from_positions` used to hand back documents that failed their own
+        // Without this the constructor hands back documents that fail their own
         // `assert_valid()`: two `FixedRateTax` layers, one "not subject to VAT" and
-        // one standard-rated, is all it took. `merge_period_documents` and
-        // `AllocationRule` have always re-checked their outputs for exactly this
-        // reason; the primary constructor now does too, and the promise is true.
+        // one standard-rated, is all it takes. `merge_period_documents` and
+        // `AllocationRule` re-check their outputs for the same reason.
         doc.validate()?;
         Ok(doc)
     }
@@ -1647,8 +1798,24 @@ impl BillingDocument {
     /// Quantities are **not** negated — the reversal of "1000 kWh × 0.30" is
     /// "1000 kWh × −0.30", and [`LineItem::validate`] rejects negative quantities.
     ///
-    /// `meta` is the new document's header: a credit note needs its own number and
-    /// should reference the original (e.g. through `DocumentMeta::labels`).
+    /// `meta` is the new document's header: a credit note needs its own number.
+    ///
+    /// # The preceding invoice reference is filled in for you
+    ///
+    /// [`DocumentMeta::preceding`] (**BG-3**) is set from the document being
+    /// reversed — its [`invoice_number`](DocumentMeta::invoice_number) as **BT-25**
+    /// and its [`issue_date`](DocumentMeta::issue_date) as **BT-26** — whenever
+    /// `meta.preceding` is empty. A caller who has already stated one, or several,
+    /// keeps them: a consolidated credit note referencing three invoices is `0..n`
+    /// and the engine has no business overwriting it.
+    ///
+    /// This is not decoration. A credit note that does not say what it credits is an
+    /// unexplained payment, and `NL-R-001` makes BT-25 **fatal** on one from a Dutch
+    /// supplier. The engine holds the number already; making the caller copy it back
+    /// by hand, from a field the reversal has just consumed, is how it goes missing.
+    ///
+    /// If the source document's own number is blank, nothing is filled in rather
+    /// than a `BR-55`-violating empty BT-25 being manufactured.
     ///
     /// # The type code is set for you
     ///
@@ -1682,9 +1849,11 @@ impl BillingDocument {
     /// }).unwrap();
     ///
     /// assert_eq!(credit.net_total(), Amount::parse("-100.00000").unwrap());
-    /// // …and BT-3 is 381, not the 380 that was passed in.
+    /// // …BT-3 is 381, not the 380 that was passed in …
     /// assert_eq!(credit.meta.kind, DocumentKind::CreditNote);
     /// assert!(credit.meta.kind.is_credit_note());
+    /// // …and BG-3 says what it credits, without the caller copying it across.
+    /// assert_eq!(credit.meta.preceding[0].number(), "INV-1");
     /// credit.assert_valid();
     /// ```
     ///
@@ -1693,12 +1862,30 @@ impl BillingDocument {
     /// no positive counterpart.
     pub fn reverse(&self, meta: DocumentMeta) -> Result<Self, BillingError> {
         // BT-3 must come from the credit-note code list — see the doc above.
+        //
+        // BG-3 likewise: the number this reversal credits is `self.meta`'s, and the
+        // caller's `meta` is a *new* header that cannot know it. Filled in only when
+        // the caller stated none, so a consolidated credit note keeps its own list.
+        // `PrecedingInvoice::new` refuses a blank BT-25 (BR-55), and a source
+        // document with no number simply contributes nothing.
+        let preceding = if meta.preceding.is_empty() {
+            PrecedingInvoice::new(self.meta.invoice_number.clone())
+                .map(|p| match &self.meta.issue_date {
+                    Some(date) => p.with_issue_date(date),
+                    None => p,
+                })
+                .map(|p| vec![p])
+                .unwrap_or_default()
+        } else {
+            meta.preceding
+        };
         let meta = DocumentMeta {
             kind: if meta.kind.is_credit_note() {
                 meta.kind
             } else {
                 DocumentKind::CreditNote
             },
+            preceding,
             ..meta
         };
         fn flip(items: &[LineItem]) -> Result<Vec<LineItem>, BillingError> {
@@ -1854,8 +2041,8 @@ impl BillingDocument {
     /// it explicitly with
     /// [`verify_vat_attribution`](Self::verify_vat_attribution) on a document you
     /// are about to emit — including one that came out of an
-    /// [`crate::AllocationRule`], which since 0.13.0 preserves it whenever the
-    /// document it split had it.
+    /// [`crate::AllocationRule`], which preserves it whenever the document it split
+    /// had it.
     ///
     /// All documents built by this library satisfy these invariants at
     /// construction time. Call this after any external mutation to verify
@@ -2237,20 +2424,14 @@ impl BillingDocument {
     /// [`LineItem::vat`] names the group — discounts already being negative, so the
     /// sum is over all three buckets directly.
     ///
-    /// Positions with no attribution at all are ignored, so a document assembled
-    /// without VAT layers passes vacuously. Positions tagged [`crate::tags::VAT`]
-    /// are excluded: they *are* the BG-23 the identity is being checked against.
+    /// Positions tagged [`crate::tags::VAT`] are excluded: they *are* the BG-23 the
+    /// identity is being checked against.
     ///
-    /// This is separate from [`validate`](Self::validate) because it is not
-    /// decidable for every document the engine can hold: one assembled without VAT
-    /// layers has no attribution to check, and passes vacuously rather than
-    /// failing. Run it on the document you are about to emit.
-    ///
-    /// It is **not** separate because allocation breaks it. Until 0.13.0 that was
-    /// the stated reason and it was true — allocation split the breakdown per group
-    /// while correcting the positions in aggregate, and the two landed a minor unit
-    /// apart for roughly 45 % of recipients on a two-rate document.
-    /// [`crate::ProportionalAllocation`] now splits each *position* exactly and
+    /// Separate from [`validate`](Self::validate) because it is not decidable for
+    /// every document the engine can hold — one assembled without VAT layers has no
+    /// attribution to check and passes vacuously. Run it on the document you are
+    /// about to emit, including one that came out of an
+    /// [`crate::ProportionalAllocation`]: that splits each *position* exactly and
     /// derives each group's base from those positions, so an allocated share
     /// satisfies this check whenever its source did.
     ///
@@ -2387,10 +2568,9 @@ impl BillingDocument {
         // only fires for `tax_breakdown.len() > 1`, so a single-entry `O` breakdown
         // reaches here unchecked.
 
-        // BR-CO-14: BT-110 = Σ BT-117, exactly. `validate` cannot demand this — an
-        // allocated document splits the VAT positions and the breakdown with
-        // independent penny corrections until 0.13.0 — but a document about to be emitted must
-        // satisfy it, because a validator recomputes the sum.
+        // BR-CO-14: BT-110 = Σ BT-117, exactly. `validate` cannot demand it of every
+        // document the engine can hold, but one about to be emitted must satisfy it,
+        // because a validator recomputes the sum.
         let breakdown_tax = Amount::checked_sum(self.tax_breakdown.iter().map(|e| e.tax_amount))?;
         let vat_total = self.vat_total()?;
         if vat_total != breakdown_tax {
@@ -2449,6 +2629,46 @@ impl BillingDocument {
         self.all_positions()
             .filter(|p| !p.has_tag(crate::tags::VAT))
             .filter(|p| p.vat.is_none())
+    }
+
+    /// Every position whose stated net amount is not the `PEPPOL-EN16931-R120`
+    /// expression — the third member of the "may I emit this?" family.
+    ///
+    /// Runs [`LineItem::check_price_consistency`] over the net, discount and tax
+    /// buckets and yields each position that fails, paired with the finding. Empty
+    /// means every line's BT-131 is reproducible from its BT-129, BT-146, BT-149 and
+    /// BG-27 / BG-28 leaves, which is what a validator recomputes.
+    ///
+    /// Like [`verify_vat_attribution`](Self::verify_vat_attribution) and
+    /// [`unattributed_positions`](Self::unattributed_positions), and unlike
+    /// [`validate`](Self::validate), this is a *profile* question rather than an
+    /// arithmetic one: R120's tolerance is an absolute ±0.02, and a document
+    /// assembled at a coarser [`AmountScale`] than EN 16931's two decimals can be
+    /// entirely self-consistent and still fall outside it. See
+    /// [`LineItem::check_price_consistency`] for the failure mode that motivates it.
+    ///
+    /// ```rust
+    /// use billing::prelude::*;
+    /// use rust_decimal::dec;
+    ///
+    /// let doc = BillingDocument::builder()
+    ///     .currency(Currency::EUR)
+    ///     .amount_scale(AmountScale::EN16931)
+    ///     .positions(vec![LineItem::for_usage(
+    ///         "Arbeit",
+    ///         Quantity::new(dec!(1234.567), "kWh"),
+    ///         UnitPrice::new(dec!(0.28901), "EUR/kWh"),
+    ///     ).build()?])
+    ///     .build()?;
+    ///
+    /// assert_eq!(doc.price_inconsistent_positions().count(), 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn price_inconsistent_positions(
+        &self,
+    ) -> impl Iterator<Item = (&LineItem, BillingError)> + '_ {
+        self.all_positions()
+            .filter_map(|p| p.check_price_consistency().err().map(|e| (p, e)))
     }
 
     /// Assert full arithmetic correctness — panics on failure.
@@ -2637,12 +2857,11 @@ impl BillingDocumentBuilder {
     /// This wins over `meta.currency` regardless of where it appears in the chain,
     /// because it is recorded separately and applied when the document is built.
     ///
-    /// Until 0.13.0 it wrote straight into the header, so `.currency(EUR).meta(m)`
-    /// silently discarded the euro and produced a document labelled `XXX` — a
-    /// method-ordering accident with no error, no failing total, and a wrong
-    /// currency on every rendered invoice. That is precisely the class of silent
-    /// mislabelling [`Currency`] exists to prevent, so the ordering hazard is gone
-    /// rather than documented.
+    /// Writing straight into the header instead would make `.currency(EUR).meta(m)`
+    /// discard the euro and produce a document labelled `XXX` — a method-ordering
+    /// accident with no error, no failing total, and a wrong currency on every
+    /// rendered invoice. That is the class of silent mislabelling [`Currency`] exists
+    /// to prevent, so the hazard is removed rather than documented.
     ///
     /// ```rust
     /// use billing::{Amount, BillingDocument, Currency, DocumentMeta, LineItem};
@@ -2744,9 +2963,8 @@ impl BillingDocumentBuilder {
         self.tax_layers = model.tax_layers();
         self.discount_layers = model.discount_layers();
         // A model that declares the interchange precision it prices for gets it.
-        // An explicit `amount_scale` already set on the builder wins, so a caller
-        // can still override — but forgetting to set one no longer silently
-        // produces a document the model's own target format rejects.
+        // An explicit `amount_scale` already set on the builder wins, so a call site
+        // can override — but does not have to remember to.
         if self.amount_scale.is_none() {
             self.amount_scale = model.amount_scale();
         }
@@ -3059,10 +3277,9 @@ mod tests {
     /// applied when the document is built, so a later `.meta()` — which replaces
     /// the whole header — cannot silently drop it.
     ///
-    /// Until 0.13.0 the setter wrote straight into `meta`, and this exact
-    /// chain produced a document labelled `XXX`. Nothing failed: the totals were
-    /// right, `validate()` passed, and every rendered invoice carried the wrong
-    /// currency.
+    /// A setter writing straight into `meta` makes this exact chain produce a
+    /// document labelled `XXX`, and nothing fails: the totals are right, `validate()`
+    /// passes, and every rendered invoice carries the wrong currency.
     #[test]
     fn the_currency_survives_a_later_meta_call() {
         let build = |b: BillingDocumentBuilder| {

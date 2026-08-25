@@ -15,7 +15,7 @@
 //! | [`RateSchedule`] | Graduated / volume / block / capacity pricing |
 //! | [`TimeOfUsePricing`] | N-band time-of-use pricing (peak / off-peak / …) |
 //! | [`DynamicPricing`] | Per-interval price sequence (spot, real-time) |
-//! | [`UsageAggregator`] | Pre-billing event aggregation (SUM / MAX / COUNT / …) |
+//! | [`UsageAggregator`] | Pre-billing event aggregation (SUM / MAX / MEAN / PERCENTILE / …) |
 //! | [`TaxLayer`] | Composable tax and surcharge overlays |
 //! | [`DiscountLayer`] | Composable discount overlays |
 //! | [`PricingModel`] | The extension point: usage in, priced positions and layers out |
@@ -25,7 +25,9 @@
 //! | [`VatAccountingCurrency`] | EN 16931 BT-6 / BT-111 — the VAT total in the reporting currency |
 //! | [`PaymentTerms`] | EN 16931 BT-20 — free text plus structured early-payment discounts |
 //! | [`EarlyPaymentDiscount`] | Skonto: the BR-DE-18 `#SKONTO#…#` syntax, and what the buyer pays |
+//! | [`LatePaymentPenalty`] | Verzugszinsen: simple interest plus the art. 6 recovery fee |
 //! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
+//! | [`PrecedingInvoice`] | EN 16931 BG-3 — what a credit note credits, filled in by `reverse` |
 //! | [`LineVat`] | Per-position VAT category + rate (EN 16931 BT-151/152, BT-95/96, BT-102/103) |
 //! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
 //! | [`proportional_split`] | Penny-correct Hamilton split of a raw `Decimal` quantity |
@@ -82,6 +84,10 @@
 //!   on a document assembled at an interchange scale the choice cannot change a
 //!   single emitted digit. Where a derived price is itself the output, name the
 //!   strategy with [`UnitPrice::rounded`].
+//!
+//!   An aggregate over many terms is reduced **once**, from the exact sum —
+//!   [`DynamicPricing::calculate`] over a year of spot intervals, where rounding
+//!   each product first biases the total in one direction.
 //! - **Comparisons are total** — [`Amount::within_tolerance_ppm`] returns `bool`, so
 //!   a tolerance check can never degrade into a spurious finding via `unwrap_or`.
 //! - **"Nothing to bill" is not an error and not an empty list** — [`Billing`]
@@ -96,8 +102,10 @@
 //! - **Every position the engine generates is emittable as an invoice line** —
 //!   BR-22, BR-23 and BR-26 make BT-129, BT-130 and BT-146 mandatory on *every*
 //!   line, and none of them changes an amount, so nothing in the totals would
-//!   notice their absence. [`RateSchedule::apply_peak`] and [`minimum_charge`]
-//!   therefore build through [`LineItem::flat_fee`], not [`LineItem::fixed`].
+//!   notice their absence. Every generator therefore builds through
+//!   [`LineItem::flat_fee`] rather than [`LineItem::fixed`], and satisfies
+//!   `PEPPOL-EN16931-R120` — checkable with
+//!   [`LineItem::check_price_consistency`].
 //! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
 //!   [`BillingDocument::assert_valid`] panics on failure (convenient for tests).
 //! - **Allocation is exact** — [`ProportionalAllocation`] guarantees
@@ -129,10 +137,8 @@
 //! ## README
 //!
 //! The crate README is included below so that **every Rust example in it is
-//! compiled and run as a doctest**. Before this was wired up, several README
-//! snippets had drifted into code that did not compile (missing semicolons,
-//! undefined identifiers, constructors whose signatures had changed). Keeping it
-//! here makes that class of documentation rot impossible.
+//! compiled and run as a doctest**, which makes a snippet that no longer compiles a
+//! build failure rather than a reader's problem.
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 // Warnings are promoted to errors in CI via RUSTFLAGS="-D warnings".
@@ -161,29 +167,31 @@ pub mod vat;
 
 pub use advance::{AdvancePayment, DocumentKind, Prepayment, residual_breakdown};
 pub use aggregation::{
-    CountAggregator, LatestAggregator, MaxAggregator, SumAggregator, UniqueCountAggregator,
-    UsageAggregator, WeightedSumAggregator,
+    CountAggregator, LatestAggregator, MaxAggregator, MeanAggregator, PercentileAggregator,
+    SumAggregator, UniqueCountAggregator, UsageAggregator, WeightedSumAggregator,
 };
 pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
 pub use amount::{Amount, AmountScale, RoundingStrategy};
 pub use currency::Currency;
-pub use document::{BillingDocument, BillingDocumentBuilder, DocumentMeta, Note, PartyIdentifier};
+pub use document::{
+    BillingDocument, BillingDocumentBuilder, DocumentMeta, Note, PartyIdentifier, PrecedingInvoice,
+};
 pub use error::{BillingError, ParseAmountError};
 pub use line_item::{
     AllowanceCharge, AllowanceKind, LineAllowanceCharge, LineItem, LineItemBuilder, Sign,
 };
 pub use lookup::{RateLookup, RateLookupBuilder};
-pub use minimum::minimum_charge;
+pub use minimum::{minimum_charge, minimum_charge_gross};
 pub use period::{Period, merge_period_documents, prorate, prorate_amount};
 pub use pricing::{Billed, Billing, Positions, PricingModel};
 pub use quantity::{Quantity, UnitPrice};
-pub use schedule::{RateBand, RateSchedule};
+pub use schedule::{RateBand, RateSchedule, RateScheduleBuilder};
 pub use settlement::{CashRounding, VatAccountingCurrency};
 pub use tax::{
     DiscountLayer, FixedDiscount, FixedRateTax, PerUnitLevy, PercentageCharge, PercentageDiscount,
     TaxLayer,
 };
-pub use terms::{EarlyPaymentDiscount, PaymentTerms};
+pub use terms::{DayCountBasis, EarlyPaymentDiscount, LatePaymentPenalty, PaymentTerms};
 pub use tou::{
     DynamicPricing, DynamicPricingBuilder, TimeBand, TimeOfUsePricing, TimeOfUsePricingBuilder,
 };
@@ -292,14 +300,16 @@ pub mod prelude {
     pub use crate::{
         AdvancePayment, AllocationRule, AllowanceCharge, Amount, AmountScale, Billed, Billing,
         BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
-        Currency, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing, EarlyPaymentDiscount,
-        EqualAllocation, FixedDiscount, FixedRateTax, LatestAggregator, LineAllowanceCharge,
-        LineItem, LineVat, MaxAggregator, Note, ParseAmountError, PartyIdentifier, PaymentTerms,
-        PerUnitLevy, PercentageCharge, PercentageDiscount, Period, Positions, Prepayment,
+        Currency, DayCountBasis, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing,
+        EarlyPaymentDiscount, EqualAllocation, FixedDiscount, FixedRateTax, LatePaymentPenalty,
+        LatestAggregator, LineAllowanceCharge, LineItem, LineVat, MaxAggregator, MeanAggregator,
+        Note, ParseAmountError, PartyIdentifier, PaymentTerms, PerUnitLevy, PercentageCharge,
+        PercentageDiscount, PercentileAggregator, Period, Positions, PrecedingInvoice, Prepayment,
         PricingModel, ProportionalAllocation, Quantity, RateBand, RateLookup, RateLookupBuilder,
-        RateSchedule, RoundingStrategy, Sign, SumAggregator, TaxBreakdownEntry, TaxCategory,
-        TaxLayer, TimeBand, TimeOfUsePricing, UNIT_CODE_ONE, UniqueCountAggregator, UnitPrice,
-        UsageAggregator, VatAccountingCurrency, WeightedSumAggregator, merge_period_documents,
-        minimum_charge, proportional_split, prorate, prorate_amount, residual_breakdown,
+        RateSchedule, RateScheduleBuilder, RoundingStrategy, Sign, SumAggregator,
+        TaxBreakdownEntry, TaxCategory, TaxLayer, TimeBand, TimeOfUsePricing, UNIT_CODE_ONE,
+        UniqueCountAggregator, UnitPrice, UsageAggregator, VatAccountingCurrency,
+        WeightedSumAggregator, merge_period_documents, minimum_charge, minimum_charge_gross,
+        proportional_split, prorate, prorate_amount, residual_breakdown,
     };
 }

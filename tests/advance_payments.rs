@@ -247,9 +247,9 @@ fn residual_of_a_fully_settled_supply_is_empty() {
 
 #[test]
 fn a_final_invoice_can_be_reversed_into_a_valid_credit_note() {
-    // The case that used to be impossible: an invoice carrying advances could not
-    // be Storno'd, because reverse() produced a negative BT-113 that validate()
-    // rejected.
+    // Carrying the settlement figures across would give the credit note a negative
+    // BT-113, which validate() rejects — so an invoice with advances could not be
+    // Storno'd at all. They are dropped instead.
     let doc = full_supply("END-8")
         .with_advances(vec![advance("AB-1", "375.00000", "71.25000")])
         .unwrap();

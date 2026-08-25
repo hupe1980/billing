@@ -107,12 +107,65 @@ the crate computes the payable figure and stops there. What it deliberately does
 do is rewrite the breakdown for you, because whether the discount was taken is
 information that arrives days later, from a bank statement.
 
+## The other half of BT-20
+
+The field's definition ends *"(Including description of possible penalties)"*, so the
+penalty is squarely inside it — but unlike a Skonto it has **no wire syntax**.
+`BR-DE-18` structures early-payment discounts and nothing else, so a penalty reaches
+the invoice only as prose, in your language. `LatePaymentPenalty` is therefore the
+arithmetic without the sentence:
+
+```rust
+use billing::{Amount, DayCountBasis, LatePaymentPenalty};
+use rust_decimal::dec;
+
+// §288 Abs. 2 BGB — 9 percentage points above the base rate, B2B — plus the
+// 40,00 € fixed sum of §288 Abs. 5 BGB / art. 6(1) of Directive 2011/7/EU.
+let penalty = LatePaymentPenalty::new(dec!(11.62))?
+    .with_recovery_fee(Amount::parse("40.00000")?)?;
+
+let overdue = Amount::parse("1190.00000")?;
+
+// Simple interest, never compounded: art. 2(6) of the directive says "simple
+// interest for late payment", and §289 BGB forbids interest on interest outright.
+assert_eq!(penalty.interest_on(overdue, 30)?, Amount::parse("11.36532")?);
+// The fixed sum is charged once, not per day …
+assert_eq!(penalty.total_on(overdue, 30)?, Amount::parse("51.36532")?);
+// … and only when the payment is actually late.
+assert_eq!(penalty.total_on(overdue, 0)?, Amount::ZERO);
+
+// The day-count denominator is a convention, so it is explicit.
+assert!(penalty.with_day_count(DayCountBasis::Actual360).interest_on(overdue, 30)?
+        > penalty.interest_on(overdue, 30)?);
+```
+
+It is **not a field of `PaymentTerms`**, on purpose: everything that type holds, its
+`Display` writes and its `FromStr` reads back, and a field with no representation in
+the syntax would vanish on the way out silently. Write the sentence yourself and pass
+it to `PaymentTerms::text`.
+
+It changes no total either, for the same reason a Skonto does not. Default interest is
+also generally **outside the scope of VAT** — art. 63 of the VAT Directive ties the
+chargeable event to the supply, and interest compensates for delay rather than paying
+for anything supplied (CJEU C-222/81, *BAZ Bausystem*); the art. 6 recovery fee is the
+same. A penalty billed later is its own document, typically carrying
+`TaxCategory::OutOfScope`, not a line on this one.
+
+| Jurisdiction | Rate | Fixed sum |
+|---|---|---|
+| EU floor — Directive 2011/7/EU art. 2(6), art. 6(1) | ECB reference rate **+ 8 pp** | **40 €** |
+| Germany — §288 Abs. 2, Abs. 5 BGB (B2B) | base rate **+ 9 pp** | 40 € |
+| Germany — §288 Abs. 1 BGB (consumer) | base rate **+ 5 pp** | — |
+
+The reference rate moves twice a year, which is why the type takes the *assembled*
+annual percentage rather than a spread over a base it would have to carry a stale copy
+of.
+
 ## Where this is heading
 
 The revision of EN 16931 approved by CEN in October 2025 and published in 2026 promotes
 early payment discounts and late-payment charges to **structured fields of their own**.
 
 The arithmetic above does not change with it — only where the numbers are written. The
-accessors (`days()`, `percent()`, `rate()`, `base_amount()`) are what a future
-serialiser maps from, and the `#SKONTO#` rendering remains what current XRechnung and
-ZUGFeRD validators expect.
+accessors on both types are what a future serialiser maps from, and the `#SKONTO#`
+rendering remains what current XRechnung and ZUGFeRD validators expect.

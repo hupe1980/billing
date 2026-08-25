@@ -44,24 +44,22 @@ exact value. Counterexamples are persisted and replayed forever after.
 
 **Doctests** answer *"is the documentation true?"* The entire README is included into
 the crate with `#![doc = include_str!]`, so every Rust example in it is compiled and
-run. Before that was wired up, several snippets had drifted into code that did not
-compile.
+run — a snippet that stops compiling is a build failure, not a reader's problem.
 
 **Mutation testing** answers the one none of the others can: *"would anything fail if
 the code did something else?"* `cargo-mutants` rewrites the source — flipping `<` to
 `<=`, deleting a guard, replacing a computed amount with its default — and reports
 every rewrite the suite still accepts.
 
-That fourth layer is the one that finds the gaps. The first sweep generated 958
-rewrites, of which 737 compiled, and **124 survived**: code that could be changed, in
-ways that alter what an invoice says, without a single test failing. One was a bug; the
-rest were holes in the suite.
+That fourth layer is the one that finds the gaps — code that can be changed, in ways
+that alter what an invoice says, without a single test failing. On a suite that passes
+every other level, a first sweep routinely surfaces dozens: mostly holes in the tests,
+occasionally a bug.
 
-It keeps earning its keep. Two of the three fixes in 0.12.0's test suite came from
-mutants that survived the *new* code — `PaymentTerms::discount_within` returned the
-first qualifying discount rather than the best one when the larger was declared second,
-and a merge test could not tell a currency mismatch from an unstated BT-111 because it
-only asserted `is_err()`.
+It keeps earning its keep, most often on *new* code: a `discount_within` that
+returned the first qualifying discount rather than the best one when the larger was
+declared second, and a merge test that could not tell a currency mismatch from an
+unstated BT-111 because it only asserted `is_err()`.
 
 ### Not a CI gate — an ad-hoc tool
 
@@ -71,15 +69,14 @@ pull request buys a signal that changes rarely, and waiting for it is the fastes
 to make people stop reading it. It is run by hand — after writing tests for a tricky
 invariant, before a release, or when a survivor is suspected.
 
-Three settings roughly halved the per-mutant cost (measured on a fixed shard,
-**239 s → 122 s**) without changing which mutants are caught: a build profile with no
-debuginfo and no incremental state, excluding doctests from the sweep, and not leaving
-the generated site-example harness in `tests/`.
+Three settings roughly halve the per-mutant cost without changing which mutants are
+caught: a build profile with no debuginfo and no incremental state, excluding doctests
+from the sweep, and not leaving the generated site-example harness in `tests/`.
 
-Excluding doctests had one consequence worth stating. A few mutants that used to be
-caught started surviving — and every one was a function whose **only** test was a
-doctest. Each got a real test. A function tested only by an example is a gap whether or
-not a sweep is what reveals it.
+Excluding doctests surfaces every function whose **only** test is a doctest: those
+mutants survive. That is a finding, not a false positive, so the answer is a real test
+— never a baseline entry. A function tested only by an example is a gap whether or not
+a sweep is what reveals it.
 
 ### The survivor baseline
 

@@ -307,8 +307,8 @@ pub fn merge_period_documents(
     // back a document that fails `validate()`. Two individually lawful halves do
     // not always compose into a lawful whole: merging an "outside the scope of
     // VAT" document with a taxed one produces a breakdown that BR-O-11 forbids,
-    // and only the combined document can show it. `AllocationRule` has always
-    // re-checked its outputs for the same reason.
+    // and only the combined document can show it. `AllocationRule` re-checks its
+    // outputs for the same reason.
     merged.validate().map_err(|e| BillingError::InvalidInput {
         reason: format!("merging produced an inconsistent document: {e}"),
     })?;

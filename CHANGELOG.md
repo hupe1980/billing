@@ -26,8 +26,247 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.13.0"`) if you need to schedule migrations yourself;
-`"0.13"` will pick up `0.13.x` patch fixes only.
+Pin exactly (`billing = "=0.14.0"`) if you need to schedule migrations yourself;
+`"0.14"` will pick up `0.14.x` patch fixes only.
+
+## [0.14.0]
+
+Three defects the arithmetic could not see, two panics reachable from untrusted input,
+one documented claim that was false, and five things the engine could not say.
+
+Every previous release was audited by asking *"do the totals add up?"* and then
+*"which mandatory field does no total depend on?"*. This one asked two more:
+**where does the engine round more than once, where does a `Result` lie** — and, from
+an integrator's review, **which correct answer did the caller have to derive by
+hand?** All three turned up something. The worst was worth 5,5 % of a consumer's
+monthly minimum charge, on an invoice that validated cleanly.
+
+### Fixed
+
+- **`DynamicPricing::calculate` accumulated a rounding bias across intervals.**
+  ⚠️ **silent** — the totals were self-consistent and the document validated.
+
+  Each interval's `qty × price` was reduced to the engine's five decimals *before*
+  being added. Commercial rounding is not unbiased on a repeated fractional part, so
+  the error accumulated in one direction: up to `5 × 10⁻⁶` per interval, which over a
+  settled spot-price year of 8 760 hourly intervals is `0.0438` — **four whole cents
+  on a two-decimal invoice, from arithmetic alone**, and `0.175` at quarter-hourly
+  resolution. The method's own documentation claimed the net was "the exact
+  accumulated total".
+
+  An interval is not a *leaf*: unlike a time-of-use band or a schedule tier it never
+  becomes its own invoice line, so there is nothing at that level to round to. The
+  products are now accumulated as exact `Decimal` and reduced **once**, which is the
+  rule `AmountScale::apply_decimal` already stated for the interchange boundary. The
+  weighted-average unit price is derived from the exact total too, rather than
+  restating the rounding error as a price.
+
+- **`UnitPrice::validate` panicked on crafted input.** It re-derived `BT-148 − BT-147`
+  with `Decimal`'s bare `-`, which aborts the process on overflow. The fields are
+  public and deserialisation routes through the same function, so a JSON payload
+  could take down a batch run from inside a method whose entire contract is to return
+  `Err`. Now `checked_sub`, reported as `InvalidInput`.
+
+- **`RateSchedule::apply_peak` panicked on a large peak.** It rendered the peak into
+  the line description with `{peak:.3}`; `rust_decimal`'s `Display` writes into a
+  fixed-size buffer and `unwrap`s the result, so a value with 27 or more integer
+  digits aborted — again inside a `Result`-returning method, on a number arriving
+  straight from a caller's meter. The peak is rounded first and `Display` chooses its
+  own width.
+
+- **`residual_breakdown` returned an unchecked VAT breakdown.** `BR-CO-17` tolerates a
+  ±1.00 disagreement between BT-117 and `BT-116 × rate`, so two groups that each sit
+  just inside it can land 2.00 apart once one is subtracted from the other. Every
+  surviving group is now checked with `TaxBreakdownEntry::validate` before it is
+  returned.
+
+- **`WeightedSumAggregator` documented a `# Panics` section it does not have.** The
+  implementation has been fully checked since 0.13.0; the doc still told callers it
+  would abort, and pointed at `SumAggregator` — which does not panic either.
+
+### Added
+
+- **`minimum_charge_gross` — a *Mindestbetrag* is quoted brutto.** `minimum_charge`
+  compares against BT-106 − BT-107, which is what a B2B *Mindestumsatz* is. A consumer
+  supply contract states the other one, because §1 PAngV makes the seller show the
+  gross figure — and deriving it by hand means grossing the shortfall down by a rate.
+
+  On a mixed-rate document there is no principled rate to pick: a Stadtwerk bill
+  carries 7 % Trinkwasser beside 19 % Energie. Using the standard rate because it is
+  usually right invoices **9,36 €** against a 9,90 € minimum — 0,54 € short, **5,5 %**
+  — with every total reconciling, the VAT breakdown exact and `validate()` passing.
+
+  The rate is therefore an argument, and it is a `LineVat` rather than a bare
+  `Decimal` so that it is **enforced**: the returned line carries it, so a layer
+  taxing the shortfall at a different rate is a `LayerError` at build time (BR-S-08),
+  and no layer covering it at all is what `verify_vat_attribution()` reports. A zero
+  rate is correct by construction — the divisor is 1, so gross and net coincide.
+
+- **`LineItem::check_price_consistency` and
+  `BillingDocument::price_inconsistent_positions` — `PEPPOL-EN16931-R120`.** The rule
+  is *fatal*, the crate computes every term of it, and nothing checked it.
+
+  No `BR-DEC` rule caps a unit price — the decimal limits stop at BT-131 (BR-DEC-23)
+  and never reach BT-146 — so a long price is lawful and `AmountScale` rightly leaves
+  it alone. But R120 multiplies the price by the **quantity**, so rounding a
+  `DynamicPricing` line's weighted average "to be tidy" moves the expression by
+  `0.26` over a year of hourly intervals: thirteen times the ±0.02 tolerance, while
+  `LineItem::validate` returns `Ok`.
+
+  These join `verify_vat_attribution` and `unattributed_positions` in the *"may I emit
+  this?"* family rather than going into `validate()`, because R120's tolerance is
+  absolute: a document assembled at `AmountScale::new(0, …)` can be entirely
+  self-consistent and still fall outside it. A property test now pins the crate's own
+  design invariant — *every position the engine generates is emittable as an invoice
+  line* — across all four schedule modes, time-of-use, dynamic pricing and both
+  minimum-charge helpers.
+
+- **`PrecedingInvoice` — EN 16931 **BG-3**, and `reverse` fills it in.** A credit
+  note that does not say what it credits is an unexplained payment, and the engine
+  held the answer: the source document's own invoice number, which the reversal had
+  just consumed. The caller had to copy it back by hand into `labels`.
+
+  `DocumentMeta::preceding` is a `Vec<PrecedingInvoice>` (BG-3 is `0..n`, for a
+  consolidated credit note), and `reverse` populates it from the reversed document —
+  number as **BT-25**, issue date as **BT-26** — unless the caller stated one.
+
+  **BR-55** ("each BG-3 shall contain a BT-25") is satisfied by the *type*: the
+  number is not an `Option` and the constructor refuses a blank string, so a BG-3
+  without a BT-25 is not constructible. The rules that make this matter are not
+  uniform, which is why it is modelled rather than assumed — `NL-R-001` makes BT-25
+  **fatal** on a credit note from a Dutch supplier, while `DE-R-026` only asks for
+  BG-3 on a `384` corrected invoice as a warning.
+
+- **`PercentileAggregator` — 95th-percentile (burstable) billing.** The settlement
+  model every IP transit, CDN egress and DDoS-scrubbing contract uses, and the one
+  shape none of the existing aggregators could express: sample every five minutes,
+  discard the top 5 %, bill the highest sample left. `MAX` bills the single worst
+  window of the month; `MEAN` bills a rate the link never carried.
+
+  **Nearest-rank, never interpolated** — the value at rank `ceil(p ÷ 100 × n)` of the
+  ascending samples. With the conventional 8 640 five-minute samples in a 30-day
+  month, "discard the top 5 %" removes 432 and the next highest is sample 8 208,
+  which is exactly `ceil(0.95 × 8640)`. The interpolating definition most statistics
+  libraries default to would invent a throughput figure that never occurred on the
+  link, and bill for it.
+
+  `PercentileAggregator::p95(value_fn)` is infallible; `new(percent, value_fn)` takes
+  any percentile in `[0, 100]`, stated in percent.
+
+- **`MeanAggregator`** — the average over evenly spaced samples: average concurrent
+  seats, average daily storage. Where the samples are *not* interchangeable —
+  a VM that ran three hours beside one that ran a month — `WeightedSumAggregator` is
+  still the aggregator that says so.
+
+- **`LatePaymentPenalty` and `DayCountBasis` — the other half of BT-20.** The term's
+  own definition ends *"(Including description of possible penalties)"*, and the
+  engine computed the reward for paying early while having nothing to say about the
+  cost of paying late.
+
+  Simple interest — art. 2(6) of Directive 2011/7/EU says *"simple interest for late
+  payment"* and §289 BGB forbids the alternative outright — plus the fixed recovery
+  fee of art. 6(1) / §288 Abs. 5 BGB, charged once and only when the payment is
+  actually late. The day-count denominator is explicit (`Actual/365`, `Actual/366`,
+  `Actual/360`), because the same rate over the same days differs by 1.4 % between
+  the extremes.
+
+  It is **not** a field of `PaymentTerms`, deliberately: `BR-DE-18` gives a Skonto a
+  syntax and gives a penalty none, and everything `PaymentTerms` holds its `Display`
+  writes and its `FromStr` reads back. A field with no representation in the syntax
+  would vanish on the way out, silently. It changes no total either, for the same
+  reason a Skonto does not — and default interest is generally outside the scope of
+  VAT (art. 63 of the VAT Directive; CJEU C-222/81 *BAZ Bausystem*), so a penalty
+  billed later is its own document.
+
+- **`PaymentTerms::best_discount_within(days, amount_due)`** — see below.
+
+- **`RateScheduleBuilder` is re-exported at the crate root.** It was the one builder
+  that was not, while being the return type of `RateSchedule::graduated()` and its
+  three siblings.
+
+- **A JSON round-trip property test.** `from_str(to_string(doc)) == doc` for a
+  document carrying every header and settlement field, asserting that each one is
+  actually *on the wire* first — comparing two values that both lost the same field
+  to a `#[serde(default)]` would otherwise pass. Almost every type here deserialises
+  through `#[serde(try_from = …)]` and re-runs its constructor, which is what keeps
+  an invalid document out of the process and also what makes a silently-dropped
+  field look exactly like a working one.
+
+### Changed — cosmetic
+
+- **A capacity charge no longer calls its selector "peak".** The line
+  `RateSchedule::apply_peak` generates now reads `Capacity charge (90 Mbps)` rather
+  than `Capacity charge (peak 90 Mbps)`. The argument is whatever selects the tier,
+  and under burstable settlement that is a P95 figure with the real peak an order of
+  magnitude above it — so the word was false on the invoice line of every such
+  contract. The amount is unchanged.
+
+### Changed — semantics
+
+- **`PaymentTerms::discount_within` no longer claims to return the most favourable
+  discount.** ⚠️ **silent** — the behaviour is unchanged, the documentation was
+  wrong. It compares *percentages*, and a percentage only orders discounts that share
+  a base. `EarlyPaymentDiscount::with_base_amount` exists precisely so that they need
+  not: `3 %` of a stated `BASISBETRAG` of 100,00 is 3,00, while `2 %` of a 1 000,00
+  amount due is 20,00 — the lower rate is worth nearly seven times as much.
+
+  `best_discount_within(days, amount_due)` is the accessor that compares the money,
+  and is what a buyer deciding when to pay actually asks.
+
+### Documentation
+
+Four gaps an integrator hit in production, each one a correct API that could not be
+found from where they were standing:
+
+- **`Amount::parse` now names the `Decimal` conversions.** It documented its own
+  excess-precision refusal in detail and linked neither `checked_from_decimal` nor
+  `from_decimal_rounded`, so a caller converting a derived rate reached for
+  `to_string()` and a `format!("{:.5}", …)` fallback — a round trip through text with
+  a second rounding bolted on. There is now a three-row routing table on `parse` and
+  on `FromStr`. (`checked_from_decimal` already linked it; only `parse` did not.)
+
+- **`RateLookupBuilder::build` warns about `.ok()`.** A fallible builder consumed by
+  an `Option`-returning signature turns a *misconfigured ladder* into *no table for
+  this year*. There is deliberately no `build_static()`: `.expect("…")` already is
+  one, and it carries a message this crate could not have written. `RateSchedule`'s
+  builder points at the same note.
+
+- **`UnitPrice::rounded` says what it costs.** See `check_price_consistency` above.
+
+- **`DynamicPricing::calculate` says to render its weighted average, not re-derive
+  it.** `net_amount ÷ quantity` divides an already-rounded total; the line's
+  `unit_price` comes from the exact accumulated sum, and after this release those are
+  no longer the same number.
+
+And one that surprised the crate's own test suite:
+
+- **`PaymentTerms` has two representations, and neither renders the other.**
+  `Display`/`FromStr` produce and consume the BT-20 *field* — prose plus `#SKONTO#…#`
+  lines — because that is what a validator reads. serde persists the *structure*, so
+  a stored term survives a change to the micro-syntax. Expect `"days": 10` in JSON,
+  not `#SKONTO#TAGE=10#`.
+
+One reported item was **declined**: that `Amount::MAX` does not work its bound out for
+`P = 5`. It does, in four places — the range table, the prose (*"tops out around 92
+trillion"*), the `MAX` constant's own doc (*"For `Amount<5>` this is
+`92_233_720_368_547.75807`"*) and the site. Nothing was added.
+
+### Migration
+
+| 0.13.0 | 0.14.0 |
+|---|---|
+| `terms.discount_within(days)` where any entry states a `BASISBETRAG` | `terms.best_discount_within(days, amount_due)?` |
+| grossing a minimum down by hand | `minimum_charge_gross(&doc, minimum_gross, vat, …)?` |
+| `meta.labels["credits"]` on a credit note | `meta.preceding` — `reverse` fills it in |
+| — | `doc.price_inconsistent_positions()` before emitting |
+| — | `PercentileAggregator::p95(value_fn)` for burstable billing |
+| — | `MeanAggregator::new(value_fn)` |
+| — | `LatePaymentPenalty::new(annual_percent)?` |
+
+No signature changed and nothing was removed, so an existing build compiles
+untouched. The two entries worth acting on are `DynamicPricing` — whose totals will
+now differ, correctly, from those of 0.13.0 on any multi-interval sequence — and
+`discount_within`, whose documentation you may have believed.
 
 ## [0.13.0]
 

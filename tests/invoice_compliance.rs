@@ -667,9 +667,10 @@ fn exemption_reason_codes_merge_conflict_and_carry_over_like_the_texts() {
 
 #[test]
 fn reversing_a_negative_debit_does_not_mint_an_invalid_credit_line() {
-    // A Debit with a NEGATIVE net (negative spot price, or VAT on a negative base)
-    // used to flip to a Credit with a POSITIVE net — a state LineItem::validate
-    // rejects, so the document passed assert_valid() but could not be persisted.
+    // Blindly swapping Debit↔Credit turns a Debit with a NEGATIVE net (negative
+    // spot price, or VAT on a negative base) into a Credit with a POSITIVE net — a
+    // state LineItem::validate rejects, so the document passes assert_valid() and
+    // cannot be persisted.
     let doc = BillingDocument::from_positions(
         meta("INV-X3"),
         vec![
@@ -698,9 +699,9 @@ fn reversing_a_negative_debit_does_not_mint_an_invalid_credit_line() {
 
 #[test]
 fn changing_prepaid_after_cash_rounding_recomputes_the_adjustment() {
-    // The rounding is a function of gross − prepaid. Applying the rule first and
-    // then the prepayment used to leave a stale adjustment and an amount_due that
-    // was not a tenderable multiple.
+    // The rounding is a function of gross − prepaid, so applying the rule first and
+    // the prepayment second must not leave a stale adjustment and an amount_due that
+    // is not a tenderable multiple.
     let rule = CashRounding::new(
         Amount::parse("0.05000").unwrap(),
         RoundingStrategy::MidpointAwayFromZero,
@@ -731,7 +732,7 @@ fn changing_prepaid_after_cash_rounding_recomputes_the_adjustment() {
         .with_cash_rounding(rule)
         .unwrap();
 
-    // Order no longer matters, and the result is genuinely tenderable.
+    // Order does not matter, and the result is genuinely tenderable.
     assert_eq!(
         rounding_first.amount_due().unwrap(),
         prepaid_first.amount_due().unwrap()
@@ -778,7 +779,7 @@ fn allocation_splits_prepaid_and_rounding_instead_of_dropping_them() {
 
 #[test]
 fn allocation_penny_correction_cannot_flip_a_credit_line_positive() {
-    // A correction that pushes a tiny credit across zero used to leave
+    // A correction that pushes a tiny credit across zero must not leave
     // Sign::Credit on a positive amount.
     let positions = vec![
         LineItem::fixed("Charge", Amount::parse("100.00000").unwrap())
@@ -2303,8 +2304,8 @@ fn reverse_sets_a_credit_note_type_code() {
         .unwrap();
     assert_eq!(inv.meta.kind, DocumentKind::CommercialInvoice); // 380
 
-    // The obvious spelling — `..Default::default()` — used to leave BT-3 at 380
-    // on a document with negative totals.
+    // The obvious spelling — `..Default::default()` — carries BT-3 = 380 in, and
+    // must not leave it there on a document with negative totals.
     let credit = inv.reverse(meta("CN-K")).unwrap();
     assert_eq!(credit.meta.kind, DocumentKind::CreditNote); // 381
     assert!(credit.meta.kind.is_credit_note());
@@ -2481,7 +2482,7 @@ fn a_half_stated_percentage_basis_is_rejected() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Stating BT-93 / BT-94 is a claim a validator recomputes, so the base has to
-/// follow the amount through every transform. Allocation used to leave it behind.
+/// follow the amount through every transform, allocation included.
 #[test]
 fn allocation_keeps_the_allowance_basis_consistent() {
     use billing::{AllocationRule, EqualAllocation};
@@ -2717,10 +2718,10 @@ fn an_invoice_line_cannot_carry_document_level_allowance_detail() {
     );
 }
 
-/// Reversing a document that carried **any** discount used to produce a document
-/// that failed its own `assert_valid()`: every amount is negated, so the
-/// allowances become positive, and check 9 tested against zero rather than
-/// against the document's own direction.
+/// Reversing a document that carries **any** discount must not produce one that
+/// fails its own `assert_valid()`. Every amount is negated, so the allowances become
+/// positive — which is why check 9 tests against the document's own direction rather
+/// than against zero.
 #[test]
 fn a_document_with_discounts_can_be_reversed() {
     for scale in [None, Some(AmountScale::EN16931)] {

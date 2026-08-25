@@ -124,7 +124,7 @@ enum Mode {
 /// | `graduated`| each tier at its own price           |
 /// | `volume`   | all units at the top tier reached    |
 /// | `block`    | rounded-up blocks × price            |
-/// | `capacity` | peak value selects tier; flat charge |
+/// | `capacity` | one value selects the tier; flat charge |
 ///
 /// # Domain-agnostic unit labels
 ///
@@ -214,7 +214,13 @@ impl RateSchedule {
         }
     }
 
-    /// Capacity — bill on the MAXIMUM (peak) value in the period.
+    /// Capacity — one value in the period selects the tier, and a flat charge is
+    /// billed.
+    ///
+    /// That value is usually the maximum ([`crate::MaxAggregator`]), which is what
+    /// a demand charge is. Under **burstable** settlement it is a
+    /// [`crate::PercentileAggregator`] figure instead — the tier is chosen by the
+    /// P95, not by the peak — and the charge is flat either way.
     #[must_use]
     pub fn capacity() -> RateScheduleBuilder {
         RateScheduleBuilder {
@@ -264,9 +270,13 @@ impl RateSchedule {
         }
     }
 
-    /// Apply peak-based pricing. Returns a single flat-fee `LineItem`.
+    /// Apply capacity pricing. Returns a single flat-fee `LineItem`.
     ///
-    /// The `peak` value selects the tier; only valid on `capacity` schedules.
+    /// The `peak` value selects the tier and is not itself billed; only valid on
+    /// `capacity` schedules. It need not literally be a maximum — under burstable
+    /// settlement it is the [`crate::PercentileAggregator`] figure, which is
+    /// exactly what makes a burst free — so the generated description states the
+    /// number without calling it a peak.
     ///
     /// The result is a **complete** EN 16931 invoice line — one unit
     /// ([`crate::UNIT_CODE_ONE`]) at a unit price equal to the whole charge, as
@@ -295,8 +305,18 @@ impl RateSchedule {
                      (RateBand::over) to cover values above the highest bound"
                 ),
             })?;
+        // `{peak:.3}` is the obvious rendering and a live panic: `rust_decimal`'s
+        // `Display` writes into a fixed-size buffer and `unwrap`s the result, so
+        // formatting a 27-digit value *with a precision* aborts — inside a method
+        // documented as returning `Err`, on a value straight from a caller's meter.
+        // Rounding first and letting `Display` pick its own width is panic-free.
+        //
+        // The label does not say "peak": the argument is whatever selects the tier,
+        // and under burstable settlement that is a `PercentileAggregator` figure
+        // with the real peak an order of magnitude above it.
+        let selector = peak.round_dp(3);
         LineItem::flat_fee(
-            format!("Capacity charge (peak {peak:.3} {})", self.unit),
+            format!("Capacity charge ({selector} {})", self.unit),
             price,
             self.currency,
         )
@@ -410,12 +430,11 @@ impl RateSchedule {
     /// price. Returns `None` when `quantity` exceeds every finite bound and no
     /// open-ended band exists — i.e. the schedule does not cover the value.
     ///
-    /// The trailing `self.bands.last()` fallback that used to sit here made this
-    /// function total, which silently priced anything above a bounded top band at
-    /// the top-band rate and rendered the "no tier covers …" errors in
-    /// [`RateSchedule::split`] and [`RateSchedule::apply_peak`] unreachable.
-    /// `graduated` mode already errored on the same input; the three modes now
-    /// agree.
+    /// Deliberately partial. A trailing `self.bands.last()` fallback would make it
+    /// total, silently pricing anything above a bounded top band at the top-band rate
+    /// and rendering the "no tier covers …" errors in [`RateSchedule::split`] and
+    /// [`RateSchedule::apply_peak`] unreachable — while `graduated` mode errors on
+    /// the same input. All three modes agree instead.
     fn find_tier_price(&self, quantity: Decimal) -> Option<Amount<5>> {
         for band in &self.bands {
             match band.upper {
@@ -457,6 +476,11 @@ impl RateScheduleBuilder {
     }
 
     /// Validate and build the [`RateSchedule`].
+    ///
+    /// Fallible because a schedule is often loaded from configuration. When yours
+    /// is written as literals, prefer `.expect("…")` over `.ok()` — see
+    /// [`RateLookupBuilder::build`](crate::RateLookupBuilder::build) for why the
+    /// difference matters.
     ///
     /// # Errors
     /// - Zero bands.
@@ -547,9 +571,9 @@ impl RateScheduleBuilder {
                 // Upper bounds must be strictly increasing.
                 //
                 // The declared-`lower` check above cannot catch this on its own:
-                // `RateBand::up_to` and `free_up_to` leave `lower` as `None`, so a
-                // schedule like `[up_to(100), up_to(50)]` used to build successfully
-                // and then either mis-price or fail late inside `split()` with a
+                // `RateBand::up_to` and `free_up_to` leave `lower` as `None`, so
+                // without this a schedule like `[up_to(100), up_to(50)]` builds and
+                // then either mis-prices or fails late inside `split()` with a
                 // misleading "quantity exceeds coverage" error.
                 if let Some(u) = band.upper {
                     if u <= expected_lower {
