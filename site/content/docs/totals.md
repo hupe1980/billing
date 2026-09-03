@@ -190,6 +190,57 @@ What is **not** promised: the net top-up is one rounding of an exact quotient, s
 BT-112 lands within a rounding unit of the target rather than always exactly on it.
 Assert `doc.gross_total() >= minimum_gross` if the contract reads as a hard floor.
 
+## Maximum charges: the cap is the same line pointed the other way
+
+A *Preisobergrenze* on a supply contract, an OCPI `max_price` on a charging
+session, a *"maximal 29,90 € im Monat"* on a flat rate — each is the minimum's
+mirror, and `maximum_charge` / `maximum_charge_gross` are built the same way. The
+excess over the cap enters the document as a complete EN 16931 **credit** line
+(`credit_flat_fee`: BT-129 = 1, BT-130 = `C62`, BT-146 = the excess), tagged
+`tags::MAXIMUM_CHARGE`, and is settled *before* the tax layers so the VAT base is
+the capped one.
+
+```rust
+use billing::prelude::*;
+use billing::{FixedRateTax, TaxCategory};
+use rust_decimal::dec;
+
+// 42,5 kWh at 0,49580 €/kWh net → 25,07509 € gross at 19 %; the tariff caps a
+// session at 24,90 € gross.
+let positions = vec![
+    LineItem::for_usage("Energie", Quantity::new(dec!(42.5), "kWh"),
+                        UnitPrice::new(dec!(0.49580), "EUR/kWh")).tag("full").build()?,
+];
+let layers = || -> Result<Vec<Box<dyn TaxLayer>>, BillingError> {
+    Ok(vec![FixedRateTax::new("MwSt 19 %", dec!(0.19))?.with_tag("full").boxed()])
+};
+let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+
+let provisional = BillingDocument::from_positions(meta(), positions.clone(), layers()?, vec![])?;
+assert_eq!(provisional.gross_total(), Amount::parse("25.07509")?);
+
+let mut positions = positions;
+if let Some(mut credit) = maximum_charge_gross(
+    &provisional,
+    Amount::parse("24.90000")?,
+    LineVat::new(TaxCategory::Standard, dec!(0.19))?,   // the rate the tariff names
+    "Preisobergrenze",
+    Currency::EUR,
+)? {
+    credit.tags.push("full".into());
+    positions.push(credit);
+}
+
+let doc = BillingDocument::from_positions(meta(), positions, layers()?, vec![])?;
+assert_eq!(doc.gross_total(), Amount::parse("24.90000")?);
+doc.verify_vat_attribution()?;
+```
+
+The rate is an argument and is enforced exactly as on the minimum: a layer taxing
+the credit at another rate is a `LayerError` at build time, and a credit no layer
+covers is what `verify_vat_attribution()` reports. With `minimum ≤ maximum` on one
+document, at most one of the two fires.
+
 ## `BR-CO-25` does not exist
 
 It is widely cited — *"if the amount due is positive, either the payment due date

@@ -1,6 +1,7 @@
-//! [`minimum_charge`] and [`minimum_charge_gross`] — guaranteed minimum spend.
+//! Spend bounds — [`minimum_charge`] / [`minimum_charge_gross`] for a guaranteed
+//! minimum, [`maximum_charge`] / [`maximum_charge_gross`] for a cap.
 //!
-//! # Two functions, because contracts are written both ways
+//! # Two functions each, because contracts are written both ways
 //!
 //! A B2B supply agreement states a *Mindestumsatz* **netto**; a consumer supply
 //! contract states a *Mindestbetrag* **brutto**, because that is the figure on the
@@ -11,9 +12,13 @@
 //! |---|---|---|
 //! | "Mindestumsatz 100,00 € netto" | [`minimum_charge`] | [`BillingDocument::net_total`] |
 //! | "Mindestbetrag 9,90 € brutto" | [`minimum_charge_gross`] | [`BillingDocument::gross_total`] (BT-112) |
+//! | "Preisobergrenze 500,00 € netto" | [`maximum_charge`] | [`BillingDocument::net_total`] |
+//! | "maximal 29,90 € brutto" (a session cap, an OCPI `max_price`) | [`maximum_charge_gross`] | [`BillingDocument::gross_total`] (BT-112) |
 //!
-//! Deriving the second from the first by hand is where the money goes missing —
-//! see [`minimum_charge_gross`] for the mixed-rate case that motivated it.
+//! Deriving the second row from the first by hand is where the money goes missing —
+//! see [`minimum_charge_gross`] for the mixed-rate case that motivated it. A cap is
+//! the same shape pointed the other way: the excess enters the document as a
+//! **credit** line, so the same rate argument and the same enforcement apply.
 use rust_decimal::Decimal;
 
 use crate::amount::Amount;
@@ -206,22 +211,168 @@ pub fn minimum_charge_gross(
         return Ok(None);
     }
     let shortfall_gross = minimum_gross.checked_sub(doc.gross_total())?;
-    // `1 + rate` is at least 1 — `LineVat::new` refuses a negative rate — so the
-    // division is always defined, and degenerates to the identity at a zero rate.
-    // `checked_add`: `Decimal`'s `+` panics on overflow rather than saturating.
-    let divisor = Decimal::ONE
-        .checked_add(vat.rate)
-        .ok_or(BillingError::MonetaryOverflow {
-            precision: 5,
-            input_value: Some(vat.rate),
-        })?;
     // One rounding of the exact quotient, at the engine's five decimals.
-    let net = shortfall_gross.checked_div(divisor)?;
+    let net = shortfall_gross.checked_div(gross_divisor(vat.rate)?)?;
     Ok(Some(
         shortfall_line(description, net, currency)
             .vat(vat)
             .build()?,
     ))
+}
+
+/// Apply a maximum charge if `doc.net_total() > maximum` — the mirror of
+/// [`minimum_charge`].
+///
+/// Returns `Ok(None)` when the total is within the cap, and
+/// `Ok(Some(excess_credit))` — a **credit** line for exactly the excess — when it
+/// is not. The returned line is tagged [`crate::tags::MAXIMUM_CHARGE`].
+///
+/// A cap is consideration given back, so it is a credit invoice line (BG-25 with a
+/// negative BT-131, which EN 16931 permits), not a document level allowance: it
+/// reduces BT-106 the way the minimum's shortfall raises it, and it is taxed at
+/// whatever the tax layers apply to it. Like the shortfall it is a *complete* line
+/// — BT-129, BT-130 and BT-146 through [`LineItem::credit_flat_fee`], so BR-22,
+/// BR-23 and BR-26 hold and `1 × excess` reproduces the amount with nothing
+/// rounded.
+///
+/// Settle it the same way as the minimum — against the untaxed net, before the
+/// layers run:
+///
+/// ```rust
+/// use billing::{Amount, BillingDocument, Currency, DocumentMeta, FixedRateTax,
+///               LineItem, TaxLayer, maximum_charge};
+/// use rust_decimal::dec;
+///
+/// let mut positions = vec![
+///     LineItem::fixed("Verbrauch", Amount::parse("640.00000")?).build()?,
+/// ];
+/// let net_only = BillingDocument::from_positions(
+///     DocumentMeta::default(), positions.clone(), vec![], vec![])?;
+/// if let Some(excess) = maximum_charge(
+///     &net_only, Amount::parse("500.00000")?, "Preisobergrenze", Currency::EUR)?
+/// {
+///     positions.push(excess);
+/// }
+/// let taxes: Vec<Box<dyn TaxLayer>> = vec![Box::new(FixedRateTax::new("MwSt", dec!(0.19))?)];
+/// let doc = BillingDocument::from_positions(
+///     DocumentMeta { currency: Currency::EUR, ..Default::default() },
+///     positions, taxes, vec![])?;
+///
+/// assert_eq!(doc.net_total(), Amount::parse("500.00000")?);
+/// assert_eq!(doc.tax_total(), Amount::parse("95.00000")?);   // 500 × 19 %, not 640 × 19 %
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// A minimum and a maximum can be settled on the same document; with
+/// `minimum ≤ maximum` at most one of them fires.
+pub fn maximum_charge(
+    doc: &BillingDocument,
+    maximum: Amount<5>,
+    description: &str,
+    currency: Currency,
+) -> Result<Option<LineItem>, BillingError> {
+    if doc.net_total() <= maximum {
+        return Ok(None);
+    }
+    let excess = doc.net_total().checked_sub(maximum)?;
+    Ok(Some(excess_line(description, excess, currency).build()?))
+}
+
+/// The excess position both cap helpers return: a complete **credit** line carrying
+/// the reserved [`crate::tags::MAXIMUM_CHARGE`] tag.
+fn excess_line(description: &str, net: Amount<5>, currency: Currency) -> LineItemBuilder {
+    LineItem::credit_flat_fee(description, net, currency).tag(crate::tags::MAXIMUM_CHARGE)
+}
+
+/// Apply a maximum charge stated **gross** — `doc.gross_total() > maximum_gross`.
+///
+/// The mirror of [`minimum_charge_gross`], and the shape of a consumer-facing cap:
+/// an EV session's OCPI `max_price`, a *"maximal 29,90 € im Monat"* on a flat-rate
+/// contract, a fare cap. The figure is quoted inclusive of VAT (§1 PAngV), the
+/// totals chain is net, so the excess enters the document as a net **credit**:
+///
+/// ```text
+/// net credit = (BT-112 so far − BT-112 cap) ÷ (1 + rate)
+/// ```
+///
+/// The rate is an argument for the same reason as on the minimum: a cap is a
+/// contractual term, the contract names its rate, and a document with two rates
+/// cannot tell you which. The returned line carries the [`LineVat`] you name and
+/// the claim is enforced the same way — a layer covering it at another
+/// `(category, rate)` fails assembly with [`BillingError::LayerError`], and no layer
+/// covering it is what [`BillingDocument::verify_vat_attribution`] reports.
+///
+/// ```rust
+/// use billing::prelude::*;
+/// use billing::{FixedRateTax, TaxCategory, TaxLayer};
+/// use rust_decimal::dec;
+///
+/// // A charging session: 42,5 kWh at 0,59 €/kWh gross, capped at 24,90 € gross.
+/// let positions = vec![
+///     LineItem::for_usage("Energie", Quantity::new(dec!(42.5), "kWh"),
+///                         UnitPrice::new(dec!(0.49580), "EUR/kWh")).tag("full").build()?,
+/// ];
+/// let layers = || -> Result<Vec<Box<dyn TaxLayer>>, BillingError> {
+///     Ok(vec![FixedRateTax::new("MwSt 19 %", dec!(0.19))?.with_tag("full").boxed()])
+/// };
+/// let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+///
+/// let provisional = BillingDocument::from_positions(meta(), positions.clone(), layers()?, vec![])?;
+/// assert_eq!(provisional.gross_total(), Amount::parse("25.07509")?);
+///
+/// let mut positions = positions;
+/// if let Some(mut credit) = maximum_charge_gross(
+///     &provisional,
+///     Amount::parse("24.90000")?,
+///     LineVat::new(TaxCategory::Standard, dec!(0.19))?,   // the rate the tariff names
+///     "Preisobergrenze",
+///     Currency::EUR,
+/// )? {
+///     credit.tags.push("full".into());
+///     positions.push(credit);
+/// }
+///
+/// let doc = BillingDocument::from_positions(meta(), positions, layers()?, vec![])?;
+/// assert_eq!(doc.gross_total(), Amount::parse("24.90000")?);
+/// doc.verify_vat_attribution()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// As on the minimum, the net credit is one rounding of an exact quotient, so BT-112
+/// lands within a rounding unit of the cap rather than always exactly on it. Assert
+/// `doc.gross_total() <= maximum_gross` if the contract reads as a hard ceiling.
+///
+/// # Errors
+/// - [`BillingError::MonetaryOverflow`] if the excess or the quotient leaves the
+///   representable range.
+/// - [`BillingError::InvalidInput`] from [`LineItem::credit_flat_fee`]'s own checks.
+pub fn maximum_charge_gross(
+    doc: &BillingDocument,
+    maximum_gross: Amount<5>,
+    vat: LineVat,
+    description: &str,
+    currency: Currency,
+) -> Result<Option<LineItem>, BillingError> {
+    if doc.gross_total() <= maximum_gross {
+        return Ok(None);
+    }
+    let excess_gross = doc.gross_total().checked_sub(maximum_gross)?;
+    let net = excess_gross.checked_div(gross_divisor(vat.rate)?)?;
+    Ok(Some(
+        excess_line(description, net, currency).vat(vat).build()?,
+    ))
+}
+
+/// `1 + rate` — at least 1, because [`LineVat::new`] refuses a negative rate, so a
+/// division by it is always defined and degenerates to the identity at a zero rate.
+/// `checked_add`: `Decimal`'s `+` panics on overflow rather than saturating.
+fn gross_divisor(rate: Decimal) -> Result<Decimal, BillingError> {
+    Decimal::ONE
+        .checked_add(rate)
+        .ok_or(BillingError::MonetaryOverflow {
+            precision: 5,
+            input_value: Some(rate),
+        })
 }
 
 #[cfg(test)]
@@ -536,5 +687,244 @@ mod tests {
                 .net_amount,
             Amount::parse("0.52000").unwrap()
         );
+    }
+
+    // ── maximum_charge / maximum_charge_gross ────────────────────────────────
+
+    #[test]
+    fn maximum_not_triggered_within_and_at_the_cap() {
+        for amount in ["400.00000", "500.00000"] {
+            let d = doc(amount);
+            assert!(
+                maximum_charge(
+                    &d,
+                    Amount::parse("500.00000").unwrap(),
+                    "Cap",
+                    Currency::EUR
+                )
+                .unwrap()
+                .is_none(),
+                "{amount} must be within a 500 cap"
+            );
+        }
+    }
+
+    /// The excess is a complete EN 16931 *credit* line: negative BT-131, BT-129 =
+    /// 1, BT-130 = C62, BT-146 = the excess in the document's currency.
+    #[test]
+    fn the_excess_is_a_complete_credit_line_for_exactly_the_excess() {
+        let d = doc("640.00000");
+        let item = maximum_charge(
+            &d,
+            Amount::parse("500.00000").unwrap(),
+            "Preisobergrenze",
+            Currency::CHF,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(item.sign, crate::line_item::Sign::Credit);
+        assert_eq!(item.net_amount, Amount::parse("-140.00000").unwrap());
+        assert!(item.has_tag(crate::tags::MAXIMUM_CHARGE));
+        let qty = item.quantity.as_ref().expect("BR-22 wants BT-129");
+        assert_eq!(qty.value, Decimal::ONE);
+        assert_eq!(qty.code.as_deref(), Some(crate::UNIT_CODE_ONE));
+        let price = item.unit_price.as_ref().expect("BR-26 wants BT-146");
+        assert_eq!(price.value, Decimal::from(140u32));
+        assert_eq!(price.unit, "CHF");
+        item.validate().unwrap();
+        item.check_price_consistency().unwrap();
+    }
+
+    /// Settled before the layers, the cap reduces the VAT base: 500 × 19 %, not
+    /// 640 × 19 %.
+    #[test]
+    fn a_net_cap_is_taxed_on_the_capped_base() {
+        let mut positions = vec![
+            LineItem::fixed("Verbrauch", Amount::parse("640.00000").unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let net_only = BillingDocument::from_positions(
+            DocumentMeta::default(),
+            positions.clone(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        positions.push(
+            maximum_charge(
+                &net_only,
+                Amount::parse("500.00000").unwrap(),
+                "Cap",
+                Currency::EUR,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let doc = BillingDocument::from_positions(
+            meta(),
+            positions,
+            vec![FixedRateTax::new("MwSt", dec!(0.19)).unwrap().boxed()],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(doc.net_total(), Amount::parse("500.00000").unwrap());
+        assert_eq!(doc.tax_total(), Amount::parse("95.00000").unwrap());
+        assert_eq!(doc.gross_total(), Amount::parse("595.00000").unwrap());
+        doc.assert_valid();
+    }
+
+    #[test]
+    fn a_gross_cap_is_met_exactly_when_the_named_rate_is_the_one_applied() {
+        // 42,5 kWh × 0,49580 = 21,0715 net → 25,07508 gross at 19 %.
+        let positions = vec![
+            LineItem::for_usage(
+                "Energie",
+                crate::quantity::Quantity::new(dec!(42.5), "kWh"),
+                crate::quantity::UnitPrice::new(dec!(0.49580), "EUR/kWh"),
+            )
+            .tag("full")
+            .build()
+            .unwrap(),
+        ];
+        let full_layer = || {
+            vec![
+                FixedRateTax::new("MwSt 19", dec!(0.19))
+                    .unwrap()
+                    .with_tag("full")
+                    .boxed(),
+            ]
+        };
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), full_layer(), vec![])
+                .unwrap();
+        assert_eq!(
+            provisional.gross_total(),
+            Amount::parse("25.07509").unwrap()
+        );
+
+        let mut credit = maximum_charge_gross(
+            &provisional,
+            Amount::parse("24.90000").unwrap(),
+            LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+            "Preisobergrenze",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(credit.has_tag(crate::tags::MAXIMUM_CHARGE));
+        assert_eq!(credit.sign, crate::line_item::Sign::Credit);
+        // 0,17509 / 1,19 = 0,147134… → −0,14713
+        assert_eq!(credit.net_amount, Amount::parse("-0.14713").unwrap());
+
+        credit.tags.push("full".into());
+        let mut positions = positions;
+        positions.push(credit);
+        let doc = BillingDocument::from_positions(meta(), positions, full_layer(), vec![]).unwrap();
+        assert_eq!(doc.gross_total(), Amount::parse("24.90000").unwrap());
+        doc.verify_vat_attribution().unwrap();
+        doc.assert_valid();
+    }
+
+    /// The same enforcement as on the minimum: priced for 19 %, taxed at 7 % is a
+    /// build-time layer conflict, not a quietly wrong cap.
+    #[test]
+    fn a_gross_cap_priced_at_one_rate_and_taxed_at_another_is_an_error() {
+        let positions = vec![
+            LineItem::fixed("Grundpreis", Amount::parse("40.00000").unwrap())
+                .tag("full")
+                .build()
+                .unwrap(),
+            LineItem::fixed("Trinkwasser", Amount::parse("40.00000").unwrap())
+                .tag("reduced")
+                .build()
+                .unwrap(),
+        ];
+        let provisional =
+            BillingDocument::from_positions(meta(), positions.clone(), mixed_layers(), vec![])
+                .unwrap();
+        let mut credit = maximum_charge_gross(
+            &provisional,
+            Amount::parse("80.00000").unwrap(),
+            LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+            "Cap",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        credit.tags.push("reduced".into());
+        let mut positions = positions;
+        positions.push(credit);
+        let err =
+            BillingDocument::from_positions(meta(), positions, mixed_layers(), vec![]).unwrap_err();
+        assert!(matches!(err, BillingError::LayerError { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_gross_cap_already_respected_credits_nothing() {
+        let doc =
+            BillingDocument::from_positions(meta(), mixed_positions(), mixed_layers(), vec![])
+                .unwrap();
+        // Gross is 4,52; a cap of 4,52 is respected (≤), so nothing is credited.
+        assert!(
+            maximum_charge_gross(
+                &doc,
+                Amount::parse("4.52000").unwrap(),
+                LineVat::new(TaxCategory::Standard, dec!(0.19)).unwrap(),
+                "Cap",
+                Currency::EUR,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    /// Under a zero rate the divisor is 1: the gross cap *is* the net cap.
+    #[test]
+    fn a_zero_rate_makes_the_gross_cap_a_net_cap() {
+        let d = doc("160.00000");
+        let credit = maximum_charge_gross(
+            &d,
+            Amount::parse("100.00000").unwrap(),
+            LineVat::new(TaxCategory::ReverseCharge, Decimal::ZERO).unwrap(),
+            "Cap",
+            Currency::EUR,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(credit.net_amount, Amount::parse("-60.00000").unwrap());
+    }
+
+    /// A floor and a ceiling on one document: at most one fires, and the
+    /// engine's own labels tell them apart.
+    #[test]
+    fn a_minimum_and_a_maximum_on_one_document_are_exclusive() {
+        let lo = Amount::<5>::parse("100.00000").unwrap();
+        let hi = Amount::<5>::parse("500.00000").unwrap();
+        for (amount, expect_min, expect_max) in [
+            ("50.00000", true, false),
+            ("300.00000", false, false),
+            ("900.00000", false, true),
+        ] {
+            let d = doc(amount);
+            let min = minimum_charge(&d, lo, "min", Currency::EUR).unwrap();
+            let max = maximum_charge(&d, hi, "max", Currency::EUR).unwrap();
+            assert_eq!(min.is_some(), expect_min, "{amount}: minimum");
+            assert_eq!(max.is_some(), expect_max, "{amount}: maximum");
+            if let Some(m) = min {
+                assert!(m.has_tag(crate::tags::MINIMUM_CHARGE));
+            }
+            if let Some(m) = max {
+                assert!(m.has_tag(crate::tags::MAXIMUM_CHARGE));
+            }
+        }
+    }
+
+    /// The tag is in the engine's reserved namespace, so a time-of-use band of that
+    /// name is refused like every other engine tag (see `tou`).
+    #[test]
+    fn the_maximum_charge_tag_is_reserved() {
+        assert!(crate::tags::is_reserved(crate::tags::MAXIMUM_CHARGE));
+        assert!(crate::tags::RESERVED.contains(&crate::tags::MAXIMUM_CHARGE));
     }
 }

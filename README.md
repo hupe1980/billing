@@ -29,7 +29,7 @@ for UBL, CII, XRechnung and ZUGFeRD / Factur-X — see
 > [`eInvoicing-EN16931`](https://github.com/ConnectingEurope/eInvoicing-EN16931) at
 > tag `validation-1.3.16` (`BR-*`, `BR-CO-*`, `BR-CL-*`, `BR-DEC-*`) and
 > [`peppol-bis-invoice-3`](https://github.com/OpenPEPPOL/peppol-bis-invoice-3) at
-> `master` (`PEPPOL-EN16931-*`, `P01xx`). The target edition is
+> tag `v3.0.20` (`PEPPOL-EN16931-*`, `P01xx`). The target edition is
 > **EN 16931-1:2017+A1:2019** — the one every deployed CIUS implements. On
 > [EN 16931-1:2026](#the-2026-revision), see below.
 
@@ -106,6 +106,8 @@ rather than looking something up.
 | `UnitPrice::rounded` | Pin a derived unit price to a scale with an explicit strategy |
 | [`minimum_charge()`](#minimum-charges-belong-before-the-tax-layers) | Minimum-spend shortfall stated **net**, as a complete EN 16931 invoice line |
 | [`minimum_charge_gross()`](#a-mindestbetrag-is-quoted-brutto) | The same for a minimum quoted **gross** — with the rate it is agreed at *enforced*, not assumed |
+| [`maximum_charge()`](#a-cap-is-the-same-line-pointed-the-other-way) | The excess over a cap stated **net**, credited as a complete EN 16931 line — the mirror of the minimum |
+| [`maximum_charge_gross()`](#a-cap-is-the-same-line-pointed-the-other-way) | The same for a cap quoted **gross** — an OCPI `max_price`, a monthly *"maximal …"* — at the rate the contract names, enforced |
 | [`merge_period_documents()`](#-proration-and-period-merging) | Merge two half-period documents (tariff change mid-period) |
 | [`prorate()`](#-proration-and-period-merging) | Scale a fixed charge to a partial period |
 
@@ -2626,6 +2628,58 @@ What is *not* promised: the net top-up is one rounding of an exact quotient, so 
 lands within a rounding unit of the target rather than always exactly on it. Assert
 `doc.gross_total() >= minimum_gross` if the contract reads as a hard floor.
 
+### A cap is the same line pointed the other way
+
+A *Preisobergrenze* on a supply contract, an OCPI `max_price` on a charging session,
+a *"maximal 29,90 € im Monat"* on a flat rate: each is the minimum's mirror, and
+`maximum_charge` / `maximum_charge_gross` are built the same way. The excess over the
+cap enters the document as a complete EN 16931 **credit** line — BT-129 = 1,
+BT-130 = `C62`, BT-146 = the excess, so BR-22 / BR-23 / BR-26 hold and `1 × excess`
+reproduces the amount with nothing rounded — tagged `tags::MAXIMUM_CHARGE`, and is
+settled *before* the tax layers so the VAT base is the capped one.
+
+```rust
+use billing::prelude::*;
+use billing::{FixedRateTax, TaxCategory};
+use rust_decimal::dec;
+
+// 42,5 kWh at 0,49580 €/kWh net → 25,07509 € gross at 19 %; the tariff caps a
+// session at 24,90 € gross.
+let positions = vec![
+    LineItem::for_usage("Energie", Quantity::new(dec!(42.5), "kWh"),
+                        UnitPrice::new(dec!(0.49580), "EUR/kWh")).tag("full").build()?,
+];
+let layers = || -> Result<Vec<Box<dyn TaxLayer>>, BillingError> {
+    Ok(vec![FixedRateTax::new("MwSt 19 %", dec!(0.19))?.with_tag("full").boxed()])
+};
+let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
+
+let provisional = BillingDocument::from_positions(meta(), positions.clone(), layers()?, vec![])?;
+assert_eq!(provisional.gross_total(), Amount::parse("25.07509")?);
+
+let mut positions = positions;
+if let Some(mut credit) = maximum_charge_gross(
+    &provisional,
+    Amount::parse("24.90000")?,
+    LineVat::new(TaxCategory::Standard, dec!(0.19))?,   // the rate the tariff names
+    "Preisobergrenze",
+    Currency::EUR,
+)? {
+    credit.tags.push("full".into());
+    positions.push(credit);
+}
+
+let doc = BillingDocument::from_positions(meta(), positions, layers()?, vec![])?;
+assert_eq!(doc.gross_total(), Amount::parse("24.90000")?);
+doc.verify_vat_attribution()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The rate is an argument and is enforced exactly as on the minimum: a layer taxing the
+credit at another rate is a `LayerError` at build time, and a credit no layer covers is
+what `verify_vat_attribution()` reports. With `minimum ≤ maximum` on one document, at
+most one of the two fires.
+
 ---
 
 ## 📤 E-invoicing: EN 16931, XRechnung, ZUGFeRD
@@ -3019,6 +3073,7 @@ just examples        # run all four examples
 just bench           # criterion benchmarks
 just mutants-gate    # full mutation sweep, pass/fail (slow — see below)
 just mutants-diff    # mutate only what your branch changed
+just check-citations # every cited BR-* / PEPPOL-* rule id exists in the pinned artefacts
 just release 0.7.0   # create an annotated git tag
 ```
 
@@ -3116,14 +3171,19 @@ one was checked against every construction path, including deserialisation, rath
 than assumed — an identical "unreachable" comment in `proportional_split` turned out
 to be wrong.
 
-### Not a CI gate — an ad-hoc tool
+### The full sweep is not a CI gate — the diff is
 
-Mutation testing is **not wired into CI**, on purpose. A sweep is ~1 000 mutants; even
-after the tuning below it is tens of minutes on a laptop and considerably worse on a
+The full sweep is **not wired into CI**, on purpose. It is ~1 000 mutants; even after
+the tuning below it is tens of minutes on a laptop and considerably worse on a
 four-core runner. Paying that on every pull request buys a signal that changes rarely,
 and waiting for it is the fastest way to make people stop reading it.
 
-So it is run **by hand, when it is worth running** — after writing tests for a tricky
+What *is* wired in is the **diff-scoped** run: a pull request mutates only the lines
+it changed — usually a few dozen mutants, a few minutes — and fails on any survivor
+the baseline does not record. It is the same `just mutants-diff-gate` recipe a
+developer runs before pushing, so the two cannot drift.
+
+The full sweep is run **by hand, when it is worth running** — after writing tests for a tricky
 invariant, before a release, or when a survivor is suspected:
 
 ```sh
@@ -3133,9 +3193,9 @@ just mutants-file src/vat.rs # one file, while writing the tests to kill its sur
 just mutants-shard 1 12      # one slice, if you want to spread it over several runs
 ```
 
-What CI *does* enforce is everything that is fast and deterministic: formatting,
-clippy with `-D warnings`, the full test suite on three platforms, the MSRV build,
-doctests, `cargo-deny`, `cargo-semver-checks` and the benchmarks compiling.
+Everything else CI enforces is fast and deterministic: formatting, clippy with
+`-D warnings`, the full test suite on three platforms, the MSRV build, doctests,
+`cargo-deny`, `cargo-semver-checks` and the benchmarks compiling.
 
 ### Making a sweep affordable
 
@@ -3190,7 +3250,8 @@ src/
 ├── document.rs     — BillingDocument, BillingDocumentBuilder, DocumentMeta
 ├── allocation.rs   — AllocationRule, ProportionalAllocation, EqualAllocation
 ├── period.rs       — Period, merge_period_documents(), prorate(), prorate_amount()
-├── minimum.rs      — minimum_charge()
+├── minimum.rs      — minimum_charge(), minimum_charge_gross(),
+│                     maximum_charge(), maximum_charge_gross()
 ├── lookup.rs       — RateLookup, RateLookupBuilder
 ├── vat.rs          — TaxCategory, TaxBreakdownEntry (EN 16931 BG-23)
 ├── advance.rs      — AdvancePayment, DocumentKind, residual_breakdown

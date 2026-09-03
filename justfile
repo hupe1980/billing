@@ -373,9 +373,10 @@ semver:
 
 # Run every gate that CI runs: format → lint → docs → tests → examples.
 #
-# Deliberately excludes mutation testing, which is not wired into CI at all — a
-# sweep is ~1 000 mutants and tens of minutes, which on the pull-request path is a
-# queue rather than a gate. `just mutants-diff` is the quick pre-push check;
+# Deliberately excludes mutation testing. The full sweep is not wired into CI — it
+# is ~1 000 mutants and tens of minutes, which on the pull-request path is a queue
+# rather than a gate. CI runs only the diff-scoped `mutants-diff-gate` on pull
+# requests; `just mutants-diff` is the same check before pushing, and
 # `just mutants-gate` is the full sweep, run before a release.
 ci: fmt-check lint doc-build test-all test-doc test-no-features test-msrv bench-check examples site-check site-verify
     @echo ""
@@ -419,3 +420,125 @@ outdated:
 # Expand macros for a specific file (requires `cargo install cargo-expand`).
 expand FILE:
     cargo expand --lib {{ FILE }}
+
+# ── Primary sources ───────────────────────────────────────────────────────────
+
+# Download the standards, validation artefacts, EU directives, German statutes
+# and code lists this crate cites into specs/ (gitignored; specs/README.md is
+# the index). Existing files are kept, so a re-run only fills gaps.
+#
+# EUR-Lex answers non-browser clients with an empty `202 Accepted` for hours at
+# a time. Those files are retried and, if they still do not arrive, listed at the
+# end for a browser download into specs/eu/ — the index names each URL.
+specs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+    missing=""
+    # fetch DIR FILE URL [ALT_URL]
+    fetch() {
+        mkdir -p "specs/$1"
+        if [ -s "specs/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
+        for url in "$3" "${4:-}"; do
+            [ -n "$url" ] || continue
+            if curl -fsSL -A "$ua" --retry 3 --retry-delay 5 --max-time 900 \
+                    -o "specs/$1/$2.part" "$url" && [ -s "specs/$1/$2.part" ]; then
+                mv "specs/$1/$2.part" "specs/$1/$2"; echo "fetched  $1/$2"; return 0
+            fi
+            rm -f "specs/$1/$2.part"
+        done
+        echo "MISSING  $1/$2  <- $3" >&2
+        missing="$missing  $1/$2  <- $3"$'\n'
+        return 0
+    }
+    # standard/ — EN 16931-1:2017+A1:2019, the English text via ÚNMS SR (free)
+    fetch standard stn-en-16931-1-a1-en.pdf \
+        'https://www.normoff.gov.sk/files/docs/e-fakturacia-stn-en-16931-1-a1-614d692fbcaa2.pdf'
+    # cen/ — the validation artefacts every citation is checked against
+    fetch cen eInvoicing-EN16931-validation-1.3.16.zip \
+        'https://github.com/ConnectingEurope/eInvoicing-EN16931/archive/refs/tags/validation-1.3.16.zip'
+    fetch cen peppol-bis-invoice-3-v3.0.20.zip \
+        'https://github.com/OpenPEPPOL/peppol-bis-invoice-3/archive/refs/tags/v3.0.20.zip'
+    fetch cen xrechnung-3.0.2-schematron-2.6.0.zip \
+        'https://github.com/itplr-kosit/xrechnung-schematron/releases/download/v2.6.0/xrechnung-3.0.2-schematron-2.6.0.zip'
+    fetch cen xrechnung-3.0.2-validator-configuration-2026-08-31.zip \
+        'https://github.com/itplr-kosit/validator-configuration-xrechnung/releases/download/v2026-08-31/xrechnung-3.0.2-validator-configuration-2026-08-31.zip'
+    fetch cen kosit-validator-1.6.3.zip \
+        'https://github.com/itplr-kosit/validator/releases/download/v1.6.3/validator-1.6.3.zip'
+    # eu/ — the directives and the decision behind EN 16931
+    fetch eu vat-directive-2006-112-en.pdf \
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32006L0112' \
+        'https://eur-lex.europa.eu/eli/dir/2006/112/oj/eng/pdf'
+    fetch eu late-payment-directive-2011-7-en.pdf \
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32011L0007' \
+        'https://eur-lex.europa.eu/eli/dir/2011/7/oj/eng/pdf'
+    fetch eu einvoicing-directive-2014-55-en.pdf \
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32014L0055' \
+        'https://eur-lex.europa.eu/eli/dir/2014/55/oj/eng/pdf'
+    fetch eu decision-2017-1870-en16931-reference-en.pdf \
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32017D1870' \
+        'https://eur-lex.europa.eu/eli/dec_impl/2017/1870/oj/eng/pdf'
+    # law/ — German statutes (gesetze-im-internet.de, consolidated)
+    fetch law ustg.pdf     'https://www.gesetze-im-internet.de/ustg_1980/UStG.pdf'
+    fetch law ustdv.pdf    'https://www.gesetze-im-internet.de/ustdv_1980/UStDV.pdf'
+    fetch law pangv.pdf    'https://www.gesetze-im-internet.de/pangv_2022/PAngV.pdf'
+    fetch law bgb.pdf      'https://www.gesetze-im-internet.de/bgb/BGB.pdf'
+    fetch law erechv.pdf   'https://www.gesetze-im-internet.de/erechv/ERechV.pdf'
+    fetch law eeg-2023.pdf 'https://www.gesetze-im-internet.de/eeg_2014/EEG_2023.pdf'
+    fetch law stromstg.pdf 'https://www.gesetze-im-internet.de/stromstg/StromStG.pdf'
+    fetch law kav.pdf      'https://www.gesetze-im-internet.de/kav/KAV.pdf'
+    # codelists/ — ISO 4217 as SIX publishes it (the UN/ECE and UNTDID lists
+    # travel inside the Peppol artefact; see specs/README.md)
+    fetch codelists iso-4217-list-one.xml \
+        'https://www.six-group.com/dam/download/financial-information/data-center/iso-currrency/lists/list-one.xml'
+    # market/ — the Rust neighbour the comparison table names
+    fetch market rusty_money-master.zip \
+        'https://github.com/varunsrin/rusty_money/archive/refs/heads/master.zip'
+    if [ -n "$missing" ]; then
+        printf '\nNot fetched (download in a browser, keep the file name):\n%s' "$missing" >&2
+    fi
+
+# Assert that every EN 16931, Peppol and XRechnung rule id cited anywhere in this
+# crate — `src/`, the README, the site, the tests, the examples — exists in the
+# pinned validation artefacts. A citation nobody can find in the artefact is the
+# one thing the pinning exists to prevent, and this makes the pin a build-time
+# fact rather than a README sentence.
+#
+# Reads specs/cen/ when present and otherwise fetches the three artefacts into
+# target/citations/ (about 6 MB), so CI can run it without the specs corpus.
+check-citations:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=target/citations; mkdir -p "$dir"
+    artefact() { # NAME URL → path of a local copy
+        if [ -s "specs/cen/$1" ]; then echo "specs/cen/$1"; return; fi
+        [ -s "$dir/$1" ] || curl -fsSL --retry 3 -o "$dir/$1" "$2"
+        echo "$dir/$1"
+    }
+    cen=$(artefact eInvoicing-EN16931-validation-1.3.16.zip \
+        https://github.com/ConnectingEurope/eInvoicing-EN16931/archive/refs/tags/validation-1.3.16.zip)
+    peppol=$(artefact peppol-bis-invoice-3-v3.0.20.zip \
+        https://github.com/OpenPEPPOL/peppol-bis-invoice-3/archive/refs/tags/v3.0.20.zip)
+    kosit=$(artefact xrechnung-3.0.2-schematron-2.6.0.zip \
+        https://github.com/itplr-kosit/xrechnung-schematron/releases/download/v2.6.0/xrechnung-3.0.2-schematron-2.6.0.zip)
+    {
+        unzip -p "$cen" '*/ubl/schematron/abstract/EN16931-model.sch' \
+                        '*/ubl/schematron/abstract/EN16931-syntax.sch' \
+                        '*/ubl/schematron/codelist/EN16931-UBL-codes.sch'
+        unzip -p "$peppol" '*/rules/sch/PEPPOL-EN16931-UBL.sch'
+        unzip -p "$kosit" 'schematron/ubl/XRechnung-UBL-validation.sch'
+    } | grep -oE 'id="[^"]+"' | sed 's/^id="//; s/"$//' | sort -u > "$dir/known.txt"
+    grep -rhoE '\b(BR-(CO|CL|DEC|DE|S|Z|E|AE|K|G|O|L|M|B)-[0-9]+|BR-[0-9]+|PEPPOL-EN16931-[RP][0-9]+)\b' \
+        src README.md site/content tests examples | sort -u > "$dir/cited.txt"
+    # Ids the documentation cites precisely because they do NOT exist — `B` is the one
+    # category without a rate rule, a zero-tax rule or a reason rule, and the README
+    # explains why there is no `BR-CO-25`. Anything else absent is a broken citation.
+    printf '%s\n' BR-B-05 BR-B-09 BR-B-10 BR-CO-25 | sort > "$dir/absent.txt"
+    missing=$(comm -23 "$dir/cited.txt" "$dir/known.txt" | comm -23 - "$dir/absent.txt" || true)
+    if [ -n "$missing" ]; then
+        echo "Cited rule ids not found in the pinned artefacts:" >&2
+        echo "$missing" | sed 's/^/  /' >&2
+        echo "$missing" | while read -r id; do grep -rn --include='*.rs' --include='*.md' -m1 "$id" src README.md site/content tests examples | head -1 | sed 's/^/    /' >&2; done
+        exit 1
+    fi
+    echo "✓ $(wc -l < "$dir/cited.txt" | tr -d ' ') cited rule ids, every one present in the pinned artefacts (CEN validation-1.3.16, Peppol v3.0.20, XRechnung 2.6.0)"

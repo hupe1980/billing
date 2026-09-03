@@ -26,8 +26,75 @@ means under semver, and this crate uses it. In exchange:
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.14.0"`) if you need to schedule migrations yourself;
-`"0.14"` will pick up `0.14.x` patch fixes only.
+Pin exactly (`billing = "=0.15.0"`) if you need to schedule migrations yourself;
+`"0.15"` will pick up `0.15.x` patch fixes only.
+
+## [0.15.0]
+
+One gap a consumer found, and two guards this repository documented without running.
+
+The gap is a **cap**: `minimum_charge` had no mirror, so every consumer with a
+*Preisobergrenze*, an OCPI `max_price` or a monthly *"maximal …"* was clamping totals by
+hand — and a clamp destroys the line that says what was consumed. The guards are the
+diff-scoped mutation run, which the justfile has described as "the pre-push check CI also
+runs" while no workflow ran it, and the artefact pins, which were a sentence in the README
+that nothing checked.
+
+### Added
+
+- **`maximum_charge` and `maximum_charge_gross` — the cap, as the mirror of the minimum.**
+  A *Preisobergrenze* netto, an OCPI `max_price`, a *"maximal 29,90 € im Monat"* brutto:
+  the excess over the cap enters the document as a complete EN 16931 **credit** line
+  (BR-22 / BR-23 / BR-26 satisfied, `1 × excess` reproducing the amount), tagged with the
+  new reserved `tags::MAXIMUM_CHARGE`, settled before the tax layers so the VAT base is
+  the capped one. The gross variant takes the `LineVat` the contract names and enforces it
+  the way `minimum_charge_gross` does — a layer taxing the credit at another rate is a
+  build-time `LayerError`, an uncovered credit is what `verify_vat_attribution` reports.
+  Requested by `emob` for session caps.
+
+### Changed
+
+- **`just check-citations`, and a CI job running it.** Every `BR-*`, `BR-CO-*`, `BR-CL-*`,
+  `BR-DEC-*`, `BR-DE-*` and `PEPPOL-EN16931-*` id cited in `src/`, the README, the site,
+  the tests and the examples — 119 today — must exist as a rule id in the pinned
+  artefacts (CEN `validation-1.3.16`, Peppol `v3.0.20`, XRechnung Schematron 2.6.0), which
+  the recipe reads from `specs/cen/` or fetches. The four ids the documentation cites
+  *because* they do not exist (`BR-B-05`, `BR-B-09`, `BR-B-10`, `BR-CO-25`) are allow-listed.
+  Until now the pins were a sentence in the README that nothing checked.
+
+- **The diff-scoped mutation run is a CI job.** The justfile has called `just mutants-diff`
+  "the pre-push check CI also runs" since 0.12, and no workflow ran it. A pull request
+  now mutates only the lines it changed and fails on any survivor the baseline does not
+  record, through the same `mutants-diff-gate` recipe. The full sweep stays local, as
+  documented.
+
+### Changed — ⚠️ silent — one more reserved tag
+
+`tags::MAXIMUM_CHARGE` (`"maximum-charge"`) joins the engine's reserved namespace, so
+`tags::RESERVED` has seven entries rather than six. A `TimeOfUsePricing` band named
+`"maximum-charge"` was accepted before and is refused now, with the same diagnostic every
+other reserved name produces. It compiles either way — the refusal is an `Err` from
+`build()`, not a type error — which is what makes it silent. Rename the band.
+
+### Documentation
+
+- **The Peppol artefact is pinned to a release.** Every `PEPPOL-EN16931-*` citation was
+  checked against `OpenPEPPOL/peppol-bis-invoice-3` at `master`, which moves. It is now
+  pinned at tag `v3.0.20` (16.03.2026), whose `PEPPOL-EN16931-UBL.sch` is byte-identical
+  to the `master` the citations were verified against, and every rule this crate cites —
+  R002, R005, R040 … R046, R051, R055, R110, R111, R120, R121, R130, P0100, P0112 — was
+  re-checked to be present there under the same `test`. The CEN artefact stays at
+  `validation-1.3.16`, still the newest tag.
+
+### Migration
+
+| 0.14.0 | 0.15.0 |
+|---|---|
+| clamping `net_total` / `gross_total` by hand at a ceiling | `maximum_charge(&doc, cap, …)?` / `maximum_charge_gross(&doc, cap, vat, …)?` |
+| a `TimeOfUsePricing` band named `"maximum-charge"` | rename it; the name is reserved |
+
+No signature changed and nothing was removed, so an existing build compiles untouched.
+The band name is the only entry that can change what an existing call returns.
 
 ## [0.14.0]
 

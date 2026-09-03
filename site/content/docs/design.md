@@ -36,6 +36,11 @@ Four layers, each answering a question the previous one cannot.
 **Example tests** answer *"does the code do what I expect?"* — around 700 of them,
 including a suite of regressions named after the audit finding that produced each one.
 
+Beside the four layers sits one check on the *citations*: `just check-citations` — a CI
+job — asserts that every `BR-*`, `BR-DE-*` and `PEPPOL-EN16931-*` rule id cited in the
+code, the README or this site exists in the pinned validation artefacts, so a pin that
+moves to a release that renamed a rule fails the build rather than the reader.
+
 **Property tests** answer *"does the law hold for inputs I did not think of?"*
 `proptest` searches for counterexamples to the algebraic statements: parse/display
 round-trips exactly, splitting conserves the total, rounding is idempotent and bounded,
@@ -61,13 +66,17 @@ returned the first qualifying discount rather than the best one when the larger 
 declared second, and a merge test that could not tell a currency mismatch from an
 unstated BT-111 because it only asserted `is_err()`.
 
-### Not a CI gate — an ad-hoc tool
+### The full sweep is not a CI gate — the diff is
 
-Mutation testing is **not wired into CI**, on purpose. A sweep is ~1 000 mutants: tens
-of minutes on a laptop, considerably worse on a shared runner. Paying that on every
-pull request buys a signal that changes rarely, and waiting for it is the fastest way
-to make people stop reading it. It is run by hand — after writing tests for a tricky
+The full sweep is **not wired into CI**, on purpose. It is ~1 000 mutants: tens of
+minutes on a laptop, considerably worse on a shared runner. Paying that on every pull
+request buys a signal that changes rarely, and waiting for it is the fastest way to
+make people stop reading it. It is run by hand — after writing tests for a tricky
 invariant, before a release, or when a survivor is suspected.
+
+What *is* wired in is the **diff-scoped** run: a pull request mutates only the lines
+it changed and fails on any survivor the baseline does not record — the same
+`just mutants-diff-gate` recipe a developer runs before pushing.
 
 Three settings roughly halve the per-mutant cost without changing which mutants are
 caught: a build profile with no debuginfo and no incremental state, excluding doctests

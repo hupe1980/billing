@@ -44,7 +44,7 @@
 //! | Source | Pinned at | Supplies |
 //! |---|---|---|
 //! | `ConnectingEurope/eInvoicing-EN16931` | tag `validation-1.3.16` | `BR-*`, `BR-CO-*`, `BR-CL-*`, `BR-DEC-*` |
-//! | `OpenPEPPOL/peppol-bis-invoice-3` | `master` | `PEPPOL-EN16931-*`, the `P01xx` profile rules |
+//! | `OpenPEPPOL/peppol-bis-invoice-3` | tag `v3.0.20` | `PEPPOL-EN16931-*`, the `P01xx` profile rules |
 //!
 //! Where the two disagree with a plain reading of the standard, the artefact wins,
 //! because it is what a validator runs — and where an artefact's own expression of
@@ -181,7 +181,7 @@ pub use line_item::{
     AllowanceCharge, AllowanceKind, LineAllowanceCharge, LineItem, LineItemBuilder, Sign,
 };
 pub use lookup::{RateLookup, RateLookupBuilder};
-pub use minimum::{minimum_charge, minimum_charge_gross};
+pub use minimum::{maximum_charge, maximum_charge_gross, minimum_charge, minimum_charge_gross};
 pub use period::{Period, merge_period_documents, prorate, prorate_amount};
 pub use pricing::{Billed, Billing, Positions, PricingModel};
 pub use quantity::{Quantity, UnitPrice};
@@ -258,9 +258,19 @@ pub mod tags {
     pub const DISCOUNT: &str = "discount";
     /// Applied to a [`crate::minimum_charge`] shortfall position.
     pub const MINIMUM_CHARGE: &str = "minimum-charge";
+    /// Applied to a [`crate::maximum_charge`] excess-credit position.
+    pub const MAXIMUM_CHARGE: &str = "maximum-charge";
 
     /// Every reserved tag, for diagnostics.
-    pub const RESERVED: &[&str] = &[TAX, VAT, LEVY, PERCENTAGE_CHARGE, DISCOUNT, MINIMUM_CHARGE];
+    pub const RESERVED: &[&str] = &[
+        TAX,
+        VAT,
+        LEVY,
+        PERCENTAGE_CHARGE,
+        DISCOUNT,
+        MINIMUM_CHARGE,
+        MAXIMUM_CHARGE,
+    ];
 
     /// Whether `tag` is reserved by the engine.
     #[must_use]
@@ -309,7 +319,8 @@ pub mod prelude {
         RateSchedule, RateScheduleBuilder, RoundingStrategy, Sign, SumAggregator,
         TaxBreakdownEntry, TaxCategory, TaxLayer, TimeBand, TimeOfUsePricing, UNIT_CODE_ONE,
         UniqueCountAggregator, UnitPrice, UsageAggregator, VatAccountingCurrency,
-        WeightedSumAggregator, merge_period_documents, minimum_charge, minimum_charge_gross,
-        proportional_split, prorate, prorate_amount, residual_breakdown,
+        WeightedSumAggregator, maximum_charge, maximum_charge_gross, merge_period_documents,
+        minimum_charge, minimum_charge_gross, proportional_split, prorate, prorate_amount,
+        residual_breakdown,
     };
 }

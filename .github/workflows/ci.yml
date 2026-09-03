@@ -156,3 +156,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --no-run
+
+  # ── Mutation testing, diff-scoped ───────────────────────────────────────────
+  # The full sweep (~1 000 mutants) is deliberately not a CI gate; see the README.
+  # A pull request mutates only the lines it changed — usually a few dozen mutants —
+  # and fails on any survivor the baseline does not record. Same recipe as the
+  # developer's pre-push `just mutants-diff`, so the two cannot drift.
+  mutants-diff:
+    name: Mutation testing (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,just
+      - name: Mutate the lines this pull request changed
+        run: |
+          mkdir -p target
+          git diff "${{ github.event.pull_request.base.sha }}...HEAD" > target/mutants.diff
+          just mutants-diff-gate target/mutants.diff
+
+  # ── Citations ───────────────────────────────────────────────────────────────
+  # Every EN 16931 / Peppol / XRechnung rule id cited in the crate must exist in
+  # the pinned validation artefacts. Fetches ~6 MB from GitHub; no toolchain needed.
+  citations:
+    name: Rule citations exist in the pinned artefacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just check-citations

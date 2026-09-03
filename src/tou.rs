@@ -751,4 +751,20 @@ mod tests {
             Amount::parse("5.00000").unwrap()
         );
     }
+
+    /// Every name in [`crate::tags::RESERVED`] is refused as a band name, including
+    /// the ones added after this check was written — a new engine tag must not
+    /// become a band name a caller can collide with.
+    #[test]
+    fn every_reserved_tag_is_refused_as_a_band_name() {
+        for name in crate::tags::RESERVED {
+            let err = TimeOfUsePricing::builder()
+                .unit("kWh")
+                .currency(Currency::EUR)
+                .band(TimeBand::new(*name, Amount::parse("0.30000").unwrap()))
+                .build()
+                .unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{name}: {err}");
+        }
+    }
 }
