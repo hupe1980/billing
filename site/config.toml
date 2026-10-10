@@ -7,10 +7,11 @@
 # its search ranking.
 base_url = "https://hupe1980.github.io/billing"
 
-title = "billing — a pure Rust tariff and invoice calculation engine"
+title = "billing — EN 16931 invoice arithmetic for Rust"
 description = """\
-Domain-agnostic billing engine for Rust: fixed-point money, tiered and time-of-use \
-pricing, composable VAT layers, and invoice totals that satisfy EN 16931.\
+EN 16931 invoice arithmetic for Rust: fixed-point money, sign-symmetric rounding, \
+exact largest-remainder splits, tariffs, VAT derived by grouping, and documents whose \
+totals are derived once from their inputs.\
 """
 author = "hupe1980"
 
@@ -46,7 +47,7 @@ index_format = "elasticlunr_json"
 repo = "https://github.com/hupe1980/billing"
 crate = "https://crates.io/crates/billing"
 api_docs = "https://docs.rs/billing"
-version = "0.12"
+version = "0.16"
 # Used for the Open Graph / Twitter card image and the JSON-LD logo.
 og_image = "/og.png"
 

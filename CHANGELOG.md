@@ -20,14 +20,399 @@ means under semver, and this crate uses it. In exchange:
 3. **Every release carries a migration table** (old → new) for mechanical updates.
 4. **No deprecation shims.** A removed name is gone rather than left as a
    deprecated alias, so the compiler shows you every affected site in one pass
-   instead of a warning you can accumulate. Migrations are hard cuts by design.
-5. `BillingError` is `#[non_exhaustive]`: **new variants may appear in a minor
-   release** and are not treated as breaking. Always include a `_ =>` arm.
+   instead of a warning you can accumulate.
+5. `ErrorKind` is `#[non_exhaustive]` (as `BillingError` was before 0.16), and so
+   are `Location`, `Aggregation`, `TaxCategory`, `VatError` and `TierError`: **new
+   variants may appear in a minor release** and are not treated as breaking.
+   Always include a `_ =>` arm.
 6. `cargo-semver-checks` runs in CI, so an unintended API break fails the build
    rather than shipping.
 
-Pin exactly (`billing = "=0.15.0"`) if you need to schedule migrations yourself;
-`"0.15"` will pick up `0.15.x` patch fixes only.
+Pin exactly (`billing = "=0.16.0"`) if you need to schedule migrations yourself;
+`"0.16"` will pick up `0.16.x` patch fixes only.
+
+## [0.16.0] — 2026-10-10
+
+**Breaking release.** The crate is rewritten around one idea: a document is its
+inputs, and every EN 16931 total is *derived* from them once, at build, each amount
+rounded once — VAT is an attribute of each line and adjustment, and the breakdown
+(BG-23) is grouped from those attributes. Header data (number, dates, type code,
+parties, notes, periods, payment-terms text) and code lists move to `en16931`;
+`src/` shrinks from about 19 900 to about 9 000 lines (unit tests included), and
+the only dependencies are `rust_decimal` and optional `serde` (`thiserror` is gone).
+There are no deprecation shims, so nearly every 0.15 call site fails to compile:
+read the **⚠️ silent** list first: those changes compile and still change values.
+
+### Why: what 0.15 billed wrongly
+
+Each was reproduced against the 0.15.0 tree on 2026-10-09 and is now a named
+regression test.
+
+- **Discounts outside the VAT base.** 400.00 at 19 % + 100.00 at 7 %, 10 % off: VAT
+  **83.00**, correct 74.70 (tag-filtered single rate: 76.00 vs 68.40). Stromsteuer
+  left out of the base (57.00 vs 60.90); commission charged on VAT (11.90 on 100.00).
+  → VAT is per line and adjustment; a discount is one adjustment per VAT group
+  (`DocumentBuilder::apportion`); a levy is a line.
+- **`"1,000"` parsed as 1.** `Amount::parse` read every `,` as `.`: "1,000" became
+  **1.00000** (1000× under), "12,345" 12.345, serde included. → The grammar is
+  `[+-]digits[.digits]`; anything else is `ErrorKind::Malformed`.
+- **Call order changed results.** `.positions([100]).extra_tax(VAT).pricing(&m)` gave
+  net 10.00, tax **0.00**; the other order 110.00 / 20.90. → Builder methods append or
+  set once; setting twice is `ConflictingSetting` at build, in any order.
+- **Credit notes reversed twice.** `reverse()` wrote BT-3 381 *and* negated (gross
+  **−119.00**); EN 16931 allows one or the other, and Peppol BIS 3 rejects it fatally
+  between Danish parties (DK-R-016: no negative PayableAmount). →
+  `Document::negated()` negates amounts only; 380 negative or 381 positive is the format's call.
+- **Allocation drifted by cents.** Allocate, then rebuild at `EN16931`: **47.10 → Σ 47.11**
+  net, **56.05 → Σ 56.06** gross, in 15 of 21 cases; ties piled up (1 000 × 0.00001 split
+  40/35/25 gave 0.01000 to the first, nothing to the rest). → `Document::split` splits
+  every reduced leaf in one `split_matrix` (ties to the largest running deficit) and
+  partitions each group's tax: [18.84, 16.49, 11.77], Σ gross 56.05.
+- **`PercentileAggregator::new(0.95)` billed the minimum** (95× under). →
+  `Percentile::new(p: u8)` takes 1–100; `0.95` does not compile.
+- **Proration rounded one way.** `prorate` divided first: under `Truncate`, 30.00 ×
+  10/30 = **9.99999** (multiply-first is still one unit off over 4 000 000 007 days). →
+  `Line::segments` splits the reduced line exactly (30.00 by 10 : 20 = 10.00 + 20.00).
+- **Merging rounded twice, or failed.** `merge_period_documents` of a tariff change
+  returned `Err(R110/R111)`; summing periods rounded VAT per period (2 × 0.03 at 19 %
+  → 0.02, not 0.01), as did two same-group layers. → `Document::concat` derives once.
+- **Hidden rounding in `Amount`.** `Amount<5>(10.02629).checked_mul_qty(0.19)` gave
+  1.90500 → 1.91; rounded once, 1.9049951 is **1.90**. `Ceiling`/`Floor` gave one credit
+  −1.01 or −1.00 by constructor. → `Amount` has no `*` or `/`; `AmountScale::reduce`
+  rounds an exact value once; all four `Rounding` modes are sign-symmetric.
+- **More silent miscalculations:** an exact 0.0049950 spot series emitted as 0.01
+  (correct 0.00); 239 of 1500 gross minimum charges missed at `EN16931` (5.18 → 5.17);
+  a Guthaben final invoice with itemised advances refused; 817 PLN of BT-111 accepted
+  against a BT-110 of 0; a cash-rounding increment of 0.003 accepted at 2 dp; a
+  deserialised VAT of 190.99 on 1000.00 at 19 % accepted; Skonto emitted at 5 dp (24.69140).
+
+### rust_decimal ≤ 1.42.0: subtraction defect
+
+`rust_decimal` 1.30.0–1.42.0 compute some subtractions wrongly (PR #804's test vectors
+fail on all of them; the faulty carry loop dates back to 1.15.0); 1.42.1 fixed it.
+Every earlier `billing` release admits 1.42.0 (0.1–0.6 admit any `1.x`). 0.16 requires
+`rust_decimal >= 1.43`, and a CI job tests the lowest allowed versions. **Staying on
+0.15? Run `cargo update -p rust_decimal`** to resolve 1.42.1 or later.
+
+### ⚠️ Silent changes
+
+These compile, or compile after a mechanical rename, and give different values.
+(Percentages are not among them: 0.15's `LineVat::new(S, dec!(0.19))` and
+`FixedRateTax::new(_, dec!(0.19))` took a fraction; every 0.16 percentage input takes
+a typed `Percent` — `Percent::new(dec!(19))` is 19 % — and a bare number does not compile.)
+
+- ⚠️ **VAT values for 0.15 tax-layer users.** Discounts lower their group's base
+  (76.00 → 68.40; mixed rates 83.00 → 74.70), levies are taxed (57.00 → 60.90), and
+  each group's tax is rounded once (0.02 → 0.01): a different, correct BT-110.
+- ⚠️ **Skonto and interest round at the document's scale.**
+  `EarlyPaymentDiscount::amount` on 1234.57 at 2 % is 24.69, not 24.69140;
+  `late_payment_interest` rounds once at the `AmountScale` you pass, not at 5 dp.
+- ⚠️ **`negated` is not `reverse`.** It negates amounts and writes no header. Pair it
+  with BT-3 380; for 381, send the original amounts instead.
+- ⚠️ **`','` is refused.** `Amount::parse("1,000")` and the serde form are `Malformed`
+  (they were 1.00000).
+- ⚠️ **`Amount`'s `Display` honours a precision.** `{:.2}` of an `Amount<5>` holding 1.5
+  prints `"1.50"` (half away from zero), not `"1.50000"`. Without one it prints `P`
+  decimals. Use `rescale::<2>` for a value.
+- ⚠️ **`Quantity::new`'s second argument is the BT-130 unit code** (`"KWH"`). A 0.15
+  display label such as `"kWh"` compiles and lands in BT-130, checked against no code list.
+- ⚠️ **`Tiers::new` refuses unsorted tiers.** `RateLookup` used to sort them.
+- ⚠️ **Payments may exceed the supply.** Advances above it are no longer refused;
+  BT-115 goes negative (a Guthaben).
+
+### Migration table
+
+The 0.15 `pub mod`s (`advance`, `aggregation`, `allocation`, `amount`, `currency`,
+`document`, `error`, `line_item`, `lookup`, `minimum`, `period`, `pricing`, `quantity`,
+`schedule`, `settlement`, `tax`, `terms`, `tou`, `vat`) are no longer public. Every
+item is exported at the crate root: `billing::amount::Amount` becomes `billing::Amount`.
+
+**Money and errors**
+
+| 0.15 | 0.16 |
+|---|---|
+| `RoundingStrategy` | `Rounding` |
+| `RoundingStrategy::MidpointAwayFromZero` / `MidpointToEven` | `Rounding::HalfAwayFromZero` / `HalfEven` |
+| `RoundingStrategy::Truncate` | `Rounding::TowardZero` |
+| `RoundingStrategy::Ceiling` / `Floor` | removed (sign-asymmetric). `AwayFromZero` or `TowardZero` are the symmetric ones |
+| `AmountScale::new(d, strategy)` | `AmountScale::new(d, rounding)` (d ≤ 5) |
+| `AmountScale::decimals()` / `strategy()` | fields `.decimals` / `.rounding` |
+| `AmountScale::apply(amount)` | `amount.round_to(scale.decimals, scale.rounding)` |
+| `AmountScale::apply_decimal(d)` | `scale.reduce(d)` (rounded once) |
+| `Amount::checked_from_decimal`, `TryFrom<Decimal>` | `Amount::from_decimal` |
+| `Amount::into_decimal` | `Amount::to_decimal` |
+| `Amount::from_int`, `checked_from_int`, `TryFrom<i64>` | `Amount::from_decimal(Decimal::from(n))` |
+| `Amount::from_raw_units` | `Amount::from_raw` |
+| `Amount::abs` | `Amount::checked_abs` |
+| `Amount::round_to::<Q>(s)`, `checked_round_to::<Q>` | `Amount::rescale::<Q>(rounding)` |
+| `Amount::round_to_scale(d, s)` | `Amount::round_to(d, rounding)` |
+| `Amount::exact_to::<Q>` | `Amount::exact::<Q>` |
+| `Amount::fits_scale` | `Amount::fits` |
+| `Amount::mul_qty`, `checked_mul_qty` | removed (hidden rounding). `scale.reduce(a.to_decimal() * q)` |
+| `Amount::checked_div` | removed. `scale.reduce(a.to_decimal() / d)`, or `split` to apportion |
+| `Amount::distribute(n)`, `allocate(ratios)` | `Amount::split(&weights)`, or `split(total, &weights, decimals)` |
+| `Amount::extract_tax`, `net_of_tax` | `split_gross(gross, &vat, scale)` → `(net, tax)` |
+| `Amount::within_tolerance_ppm` | removed |
+| `BillingError` (all variants) | `Error` with `kind() -> &ErrorKind`, `location()`, `rule()` |
+| `BillingError::MonetaryOverflow` | `ErrorKind::Overflow` |
+| `BillingError::PrecisionLoss` | `ErrorKind::ExcessPrecision { value, decimals }` |
+| `BillingError::InvalidInput { reason }` | a specific `ErrorKind` (`NegativePrice`, `InvalidWeights`, `InvalidRate` …) |
+| `BillingError::InvalidSchedule` | `ErrorKind::InvalidTiers(TierError)` / `Uncovered` |
+| `BillingError::InvalidAllocationShares` | `ErrorKind::InvalidWeights` (+ `Location::Weight`) |
+| `BillingError::ValidationFailed`, `LayerError` | removed (no validator, no layers): build-time `ErrorKind`s |
+| `BillingError::ZeroPeriod` | removed (no periods) |
+| `BillingError::CurrencyMismatch` | `ErrorKind::CurrencyMismatch` |
+| `BillingError::Parse(ParseAmountError)`, `ParseAmountError` | `ErrorKind::Malformed` / `ExcessPrecision` / `Overflow` |
+| `Currency::is_iso4217`, `minor_units`, `minor_unit_increment`, the ISO 4217 table | moved to `en16931` (BR-CL-04). The scale is the format's `AmountScale` |
+| `Currency::is_unset`, `Default for Currency` | removed (the currency is always stated) |
+| `TryFrom<&str> for Currency` | `Currency::new` / `FromStr`, plus `Currency::of` for `const` |
+| `prelude` | removed. Import from the crate root |
+| `UNIT_CODE_ONE` | `Quantity::one()` (1 `C62`) |
+| `tags` (`TAX`, `VAT`, `LEVY`, `DISCOUNT`, `PERCENTAGE_CHARGE`, `MINIMUM_CHARGE`, `MAXIMUM_CHARGE`, `RESERVED`, `is_reserved`) | removed. Labels are opaque (`Line::with_label`), and the engine reads none |
+
+**Lines, prices and VAT**
+
+| 0.15 | 0.16 |
+|---|---|
+| `LineItem`, `LineItemBuilder` | `Line` |
+| `LineItem::for_usage(desc, qty, price)` | `Line::new(desc, Quantity, UnitPrice)` |
+| `LineItem::credit_for_usage` | `Line::new` with a negative `Quantity` |
+| `LineItem::fixed`, `flat_fee`, `credit_fixed`, `credit_flat_fee`, `LineItemBuilder::fixed_amount` | `Line::fixed(desc, signed_amount)` |
+| `LineItem::debit` / `credit`, `Sign`, `is_debit`, `is_credit`, `normalize_sign` | removed. The direction is the quantity's sign |
+| `LineItem::tag`, `has_tag`, `meta`, `get_meta` | `Line::with_label`, `label`, `labels` |
+| `LineItem::period` | moved to `en16931` (BG-26) |
+| `LineItem::unit_label`, `quantity_value` | `line.quantity().unit()` / `.value()` |
+| `LineItem::check_price_consistency` | `Document::price_inconsistent()` (R120) |
+| `LineItem::scaled`, `validate`, `negated` | removed (derived at build; `Document::negated`) |
+| `Quantity::new(v, unit)`, `with_code` | `Quantity::new(v, unit_code)` |
+| `UnitPrice::new(amount, unit)`, `per`, `with_base_quantity_code` | `UnitPrice::new(Price)` with `with_base_quantity`, `with_unit` |
+| `UnitPrice::discounted`, `rounded`, `per_unit_value`, `validate` | removed. Prices are exact `Price`s, a list-price discount is a `LineAdjustment`, and checks run at build |
+| `AllowanceCharge`, `AllowanceKind` | `DocumentAdjustment`, `AdjustmentKind` |
+| `AllowanceCharge::allowance(amount, reason)` / `charge` | `DocumentAdjustment::allowance(reason, amount)` / `charge` |
+| `AllowanceCharge::coded_allowance` / `coded_charge`, `with_reason_code` | `…::with_reason_code` |
+| `AllowanceCharge::percentage_of(base, rate)` / `of` | `…::with_basis(base, Percent::new(p))` (R040 checked) |
+| `AllowanceCharge::signed_amount`, `charge_indicator`, `check_amount`, `without_basis`, `scaled`, `negated` | `kind()`, derived amounts on `Document`; removed otherwise |
+| `LineAllowanceCharge` (`line_allowance`, `allowance_charge`, `coded`) | `LineAdjustment::allowance` / `charge` + `Line::with_adjustment` |
+| `LineVat::new(category, rate_fraction)` | `Vat::standard(Percent::new(p))`, `Vat::zero_rated()`, `Vat::exempt(cat, Exemption)`, `Vat::regional(cat, Percent::new(p))` — a typed percent, 19 not 0.19 |
+| `LineVat::with_exemption_reason` / `_code`, `has_exemption_reason` | `Exemption::Text` / `Code` / `Both`; `Vat::exemption()` |
+| `LineVat::validate`, `group_key`, `rate_percent` | validated at construction; `Vat::rate_percent()` (a `Percent`) |
+| `TaxBreakdownEntry` (`category`, `rate`, `taxable_base`, `tax_amount`, `new`, `from_gross`, `validate`) | `VatGroup` (read-only: `category()`, `rate_percent()`, `taxable_base()`, `tax()`, `exemption()`) |
+| `TaxCategory::requires_exemption_reason`, `forbids_exemption_reason`, `requires_positive_rate`, `requires_zero_rate` | enforced by the `Vat` constructors (`VatError`) |
+| `TaxLayer`, `DiscountLayer` | removed. VAT is an attribute, and discounts are adjustments |
+| `FixedRateTax::new(name, rate)` (+ `exempt`, `exempt_coded`, `zero_rated`, `with_tag`, `require_tag`, `with_category`, `exemption_reason`, `exemption_reason_code`, `with_exemption_reason`, `with_exemption_reason_code`) | `.default_vat(Vat::…)` or `Line::with_vat` / `DocumentAdjustment::with_vat` (a typed `Percent`) |
+| `PerUnitLevy::new(…)` (+ `with_currency`, `with_unit_code`, `with_vat`, `with_tag`) | `per_unit_levy(desc, &lines, filter, UnitPrice, unit)` → a `Line` |
+| `PercentageDiscount`, `FixedDiscount` | `DocumentBuilder::apportion(Allowance, desc, Adjust::Percent / Fixed)`, or the free `apportion` with a filter |
+| `PercentageCharge` | `apportion(Charge, …)`, or a `DocumentAdjustment::charge` with its own `Vat` |
+| `PercentageDiscount::with_min` / `with_max` | compute the amount, then use `Adjust::Fixed` |
+
+**Pricing**
+
+| 0.15 | 0.16 |
+|---|---|
+| `RateSchedule::graduated()` / `volume()` + `RateBand::up_to` / `over` / `between` | `Tariff::Graduated(Tiers)` / `Tariff::Volume(Tiers)` with `Tier::up_to`, `Tier::above` |
+| `RateSchedule::block()`, `RateBand::block` | `Tariff::Package { size, price, rounding: PackageRounding::Up }` |
+| `RateSchedule::capacity()`, `apply_peak(peak)` | `Tariff::Volume` with flat-only tiers (`Tier::with_flat`) rated at the peak |
+| `RateBand::free_up_to` | `Tier::up_to(limit, Price::new(0))` |
+| `RateBand::with_description`, `RateSchedule::unit` / `currency` | removed. Describe in `Piece::into_lines(desc, unit)`; the document holds the currency |
+| `RateSchedule::split(q)` | `tariff.rate(q)?` → `Vec<Piece>`, then `Piece::into_lines` |
+| `RateScheduleBuilder` | `Tiers::new([...])` |
+| `RateLookup`, `RateLookupBuilder` (`at_most`, `fallback`, `rate_for`) | `Tiers::at(x)` (an open last tier is the fallback) |
+| `TimeOfUsePricing`, `TimeOfUsePricingBuilder`, `TimeBand` (`band`, `bands`, `band_names`) | `rate_by_key(&tariffs, usage)` with a `Tariff` per band |
+| `DynamicPricing`, `DynamicPricingBuilder` (`interval`, `intervals`, `calculate`) | `rate_series(intervals)` → `SeriesTotal::into_line` |
+| `UsageAggregator` (`aggregate`) | `Aggregation::apply(samples)` → `Result<Option<Usage>>`, or `Meter::apply` with a `UnitConversion` |
+| `SumAggregator` | `Aggregation::Sum` |
+| `CountAggregator` | `Aggregation::Count` |
+| `MaxAggregator` | `Aggregation::Max` (new: `Aggregation::Min`) |
+| `MeanAggregator` | `Aggregation::Mean` — **now exact**: an exact fraction, not a 28-digit quotient; price it with `Line::from_usage` or `Tariff::rate` |
+| `LatestAggregator` | `Aggregation::Latest` (readings in chronological order) |
+| `UniqueCountAggregator` | `Aggregation::UniqueCount` (a reading without a key is `ErrorKind::MissingKey`) |
+| `WeightedSumAggregator` | `Aggregation::WeightedSum` (a negative weight is `ErrorKind::NegativeWeight`; new: `Aggregation::WeightedMean`) |
+| `PercentileAggregator::new(0.95)` / `p95` / `percentile` | `Aggregation::Percentile(Percentile::P95)`, or `nearest_rank(&mut samples, Percentile::P95)` |
+| `PricingModel` (`positions`, `tax_layers`, `discount_layers`, `amount_scale`, `bill`, `try_bill`, `settle`, `try_settle`) | removed. Build lines, then a `Document` |
+| `Billing<T, R>`, `Billed<R>`, `Positions` (`billable`, `billable_or_else`, `is_billable`, `into_billable`, `into_inner`, `reason`, `map`, `map_reason`) | removed. Use your own `Result`/`Option` (0.16's `Billed` is the unrelated progressive-billing state of `Tariff::rate_increment`) |
+| `BillingDocumentBuilder::pricing`, `try_pricing` | `.lines(...)` |
+| `impl From<Infallible> for BillingError` | removed (nothing left to convert) |
+
+**Documents**
+
+| 0.15 | 0.16 |
+|---|---|
+| `BillingDocument`, `BillingDocumentBuilder` | `Document`, `DocumentBuilder` (`Document::builder(currency, scale)`) |
+| `BillingDocument::builder()`, `.currency(c)`, `.amount_scale(s)` | `Document::builder(c, s)` |
+| `.positions(v)`, `from_positions`, `from_raw` | `.line(l)`, `.lines(v)` |
+| `.extra_tax(layer)`, `.extra_discount(layer)` | `.default_vat(vat)`, `.apportion(…)`, `.adjustment(…)` |
+| `.meta(DocumentMeta)`, `DocumentMeta` (`number`, `issue_date`, `with_issue_date`), `Note`, `PartyIdentifier` (`scheme`), `PrecedingInvoice`, `DocumentKind` (`code`, `from_code`, `is_credit_note`, `is_self_billed`, `is_peppol_billing_code`, `requires_german_parties`) | moved to `en16931` (BT-1/2/3, BG-1, BG-3, BG-4/7) |
+| `Period` (`new`, `from_display`, `is_ordered`, `within`, `validate`), `LineItem::period` | moved to `en16931` (BG-14, BG-26) |
+| `net_total`, `taxable_total` | `tax_exclusive_total()` (BT-109) |
+| `tax_total`, `vat_total` | `vat_total()` (BT-110) |
+| `gross_total` | `tax_inclusive_total()` (BT-112) |
+| `discount_total` | `allowance_total()` (BT-107) |
+| `amount_due` | `payable()` (BT-115) |
+| `tax_breakdown()` | `vat_groups()` |
+| `net_positions`, `tax_positions`, `vat_positions`, `charge_positions`, `discount_positions`, `all_positions`, `positions_by_tag` | `lines()`, `adjustments()`, `line_net(i)`, `adjustment_amount(i)` |
+| `price_inconsistent_positions` | `price_inconsistent()` |
+| `validate`, `assert_valid`, `verify_vat_attribution`, `unattributed_positions`, `fits_amount_scale`, `amount_scale_violation` | removed. A `Document` that exists holds them, because `build` refuses the rest |
+| `reverse(meta)` | `negated()` ⚠️ (no header) |
+| `with_extra_position(item)` | `into_builder().line(item).build()` (bounds and apportion are applied again) |
+| `merge_period_documents` | `Document::concat` |
+| `minimum_charge`, `minimum_charge_gross` | `.bound(Bound::minimum(Basis::Net / Gross, amount, desc))` |
+| `maximum_charge`, `maximum_charge_gross` | `.bound(Bound::maximum(…))` |
+| `AllocationRule`, `ProportionalAllocation`, `EqualAllocation` | `Document::split(&weights)` (equal: `&[dec!(1); n]`) |
+| `proportional_split` | `split(total, &weights, decimals)` / `split_matrix` |
+| `prorate`, `prorate_amount` | `Line::segments(&weights, scale)`, or `split` for an amount |
+
+**Settlement and terms**
+
+| 0.15 | 0.16 |
+|---|---|
+| `Prepayment::total_of(a)` / `itemised(v)` | `Payment::Gross { description, amount }` / one `Payment::Advance(Advance)` per advance |
+| `AdvancePayment::new(tax)` + `with_reference`, `with_reference_date`, `with_received_on`, `reference`, `reference_date`, `received_on` | `Advance { vat, net, tax }`. References and dates → `en16931` |
+| `AdvancePayment::net`, `tax_total`, `gross`, `checked_net`, `checked_tax_total`, `checked_gross` | the `Advance` fields; `Document::prepaid()` |
+| `Prepayment::total`, `tax_total`, `advances`, `is_none` | `Document::prepaid()`, `Document::payments()` (inputs), `Document::paid_entries()` (with drawn after-tax credits) |
+| `Prepayment::default()` (no prepayment) | no `.payment(…)`; `Document::payments()` is empty |
+| `with_prepaid(a)`, `with_prepayment`, `with_advances`, `advances`, `advance_deductions`, `advance_tax_total` | `.payment(Payment::…)`, once per entry (it appends), or `.payments(…)` |
+| `residual_breakdown` | `Document::residual_vat()` (per VAT group, after the `Payment::Advance` entries; a report, BG-23 still covers the whole supply). BT-115 may go negative |
+| `CashRounding::new(increment, strategy)`, `round`, `difference` | `CashRounding { increment, rounding }` → `.cash_rounding(…)`, `Document::rounding()` |
+| `VatAccountingCurrency::new(currency, rate)`, `converted`, `vat_total` | `VatAccounting { currency, rate }` → `.vat_accounting(…)`, `Document::vat_accounting_total()` |
+| `with_cash_rounding`, `cash_rounding` | `.cash_rounding(…)`, `cash_rounding()` |
+| `with_vat_accounting_currency`, `vat_accounting_currency` | `.vat_accounting(…)`, `vat_accounting()` |
+| `PaymentTerms` (`text`, `with_discount`, `prose`, `discounts`, `is_empty`, `discount_within`, `best_discount_within`, `FromStr`, `Display`) | moved to `en16931` (BT-20 rendering, `#SKONTO#`) |
+| `EarlyPaymentDiscount::new(days, percent)`, `days`, `rate`, `discount_on`, `payable_on`, `with_base_amount`, `base_amount`, `FromStr`, `Display` | `EarlyPaymentDiscount { percent: Percent::new(p) }` with `amount(&doc)` and `vat_correction(&doc)`. Days → `en16931` |
+| `LatePaymentPenalty` (`new`, `annual_percent`, `annual_rate`, `with_day_count`, `day_count`, `interest_on`, `total_on`, `payable_on`, `with_recovery_fee`, `recovery_fee`) | `late_payment_interest(principal, &[InterestSegment], scale)` (`annual_percent: Percent`). Add the fee yourself |
+| `DayCountBasis::{Actual365, Actual366, Actual360}`, `days_in_year` | `InterestSegment { year_days: 365 / 366 / 360, .. }` |
+
+### Added
+
+- **Core.** `Price` (exact, any precision), `Quantity::one`, `Line::segments`,
+  `Document::split`, `split_matrix`, `Document::concat`, `Document::into_builder`,
+  `Bound`, `Tariff::Package` with `PackageRounding::Down` and the measured quantity,
+  `rate_by_key`, `Percentile`, `nearest_rank`, `Vat` with validating constructors,
+  `Exemption`, `VatError`, `EarlyPaymentDiscount::vat_correction`, `InterestSegment`,
+  `Currency::of` (`const`).
+- **Errors.** `Error::rule` and `Error::location` (`Location::Line`, `LineAdjustment`,
+  `Adjustment`, `Tier`, `Weight`, `Bound`, `Payment`, `Sample`, all 0-based).
+- **Formatting and serde.** `Display` of `Amount`, `Price`, `Percent`, `Currency` and
+  `TaxCategory` honours width and alignment (`format!("{:>6}", rate)` → `"  19 %"`).
+  Serde forms serialise the inputs only and rebuild on deserialise; every decimal is a string.
+- **Metering** (`Sample`, `Aggregation`, `UnitConversion`, `Meter`, `Usage`): the meter
+  kinds OpenMeter, Lago and Stripe configure — `Sum`, `Count`, `UniqueCount`, `Min`,
+  `Max`, `Latest`, `Mean`, `WeightedSum`, `WeightedMean`, `Percentile(p)`. Empty input
+  is 0 for additive kinds, `None` for the others.
+- **Exact averages to the invoice.** Every result is an exact `Usage`.
+  `Line::from_usage` / `Line::exact_quantity` show the decimal reading as BT-129 and
+  derive BT-131 from the fraction, rounded once: readings 1, 0, 0 at 0.015 per unit
+  bill 0.01 (a 28-digit average bills 0.00). A line whose BT-129 disagrees with its
+  exact quantity is refused on deserialise.
+- **Usage in tariffs.** `UnitConversion` divides and rounds once (7 201 s → 3 started
+  hours). `Tariff::rate` takes `impl Into<Usage>` and compares tier bounds exactly;
+  `Piece::quantity` is a `Usage` (`.to_decimal()` for the old reading);
+  `Piece::into_lines` builds through `Line::from_usage`. New `MissingKey`,
+  `NegativeWeight`, `InvalidConversion` (no rule cited), `Location::Sample`; all serialisable.
+- **Credits** (`Credit`, `CreditPlacement`, `CreditApplication`, `DocumentBuilder::credit`,
+  `Document::credits` / `credit_applications` / `credit_adjustments`): ledger balances
+  drawn against one document at build, in call order. Before-tax: at most BT-109, one
+  allowance per VAT group split exactly by the group bases (400.00 at 19 % + 100.00 at
+  7 %, 50.00 credit: VAT 74.70). After-tax: at most what is still due after payments,
+  added to BT-113 as a `Payment::Gross` entry (`Document::paid_entries`).
+- **Credit rules.** Credit notes draw nothing; no credit makes BT-115 negative. Credits
+  are inputs (serialised, re-applied by `into_builder`); `negated`, `split` and `concat`
+  turn drawn credits into ordinary allowances and gross payment entries. New
+  `InvalidCredit` at `Location::Credit`. Commitments are documented as a net
+  `Bound::minimum`, settled before credits.
+- **Residual VAT.** `Document::residual_vat`: per VAT group, base and tax left after the
+  itemised advances of the same category and rate (§14 Abs. 5 S. 2 UStG) — a report
+  beside BG-23, on every document, derived ones included. New `UnmatchedAdvance` at
+  `Location::Payment`.
+- **`Percent`**: exact, displays "19 %", serialises as the decimal string, no
+  `From<Decimal>`. Every percentage input takes it, so 0.9 % (Corsica) is a rate like 19 %.
+- **`Payment`**: what was paid is a list of `Payment::Advance(Advance)` /
+  `Payment::Gross { description, amount }` entries (`DocumentBuilder::payment` appends).
+  Every transform keeps every entry (`split` partitions an advance's net and tax
+  exactly). `Location::Payment(i)`.
+- **Keyed tariffs.** `rate_by_key` gives each key (HT/NT, region, model) a full `Tariff`,
+  tiers included (Orb matrix prices, Lago charge filters), sums usage per key exactly,
+  and returns each key's pieces in first-appearance order.
+- **Transaction fees.** `TransactionFee` (percent, fixed per transaction, per-transaction
+  `min`/`max`, free transactions) rates amounts into an exact
+  `FeeTotal { transactions, charged, base, fee }`; a refund mirrors its purchase;
+  `FeeTotal::into_line` is rounded once by the document (2.9 % + 0.30, 0.50–5.00, 2 free
+  over 10, 100, 1 000, 5, −100: fee 2.30, base 905).
+- **Progressive billing.** `Tariff::rate_increment(billed, to)` rates the increment from
+  an explicit `Billed { Nothing, UpTo(Usage) }` state and returns the next one. From
+  `Nothing`: the full rating (a first-tier base fee even for an idle month); otherwise
+  slices crossed and flat fees newly reached; volume: reversal + charge (negative at the
+  cliff); packages added. Exact increments sum to rating the total for every sequence,
+  all-zero included.
+- **Rounded increments add up.** `Tariff::increment_lines(billed, to, scale, …)` states
+  each tier's net as `round(net at to) − round(net at from)`: 0.4, 0.8, 1.2 kWh at 0.015
+  bill 0.01 + 0.00 + 0.01 = 0.02, not 0.03. Graduated percentage is documented as a
+  graduated tariff over the volume. New `InvalidFee`, `InvalidRange { from, to }` (no
+  rule cited), `Location::Transaction`; `TransactionFee` (validated on deserialise) and
+  `FeeTotal` are serialisable.
+
+### Tooling
+
+- `cargo-fuzz` targets (`parse`, `serde`, `split`), a `no_std` build for
+  `thumbv7em-none-eabihf`, a direct-dependency count check, a minimal-versions job, and
+  `citations.lock`, a hash lock of every cited rule's test.
+- `cargo-deny` is the one advisory checker; `cargo-audit` and `.cargo/audit.toml` are gone.
+- Test suites rewritten around 0.16's invariants; `tests/rules.rs` checks the EN 16931
+  rules on generated documents and their split shares.
+- Releases publish via crates.io Trusted Publishing (GitHub OIDC), no stored token. Once
+  the first OIDC release has `trustpub_data`, the crate goes trusted-publishing-only and
+  the old token is revoked.
+
+### For consumers
+
+- **mako** (`energy-billing`, `eeg-billing`, `grid-billing`; also `einsd`,
+  `netzbilanzd`, `invoic-checker`):
+  - Port `RateSchedule` / `RateLookup` tariffs to `Tariff` + `Tiers`, HT/NT to
+    `rate_by_key` (a `Tariff` per band), annual schedules billed monthly to
+    `Tariff::increment_lines`, and EPEX to `rate_series` + `SeriesTotal::into_line`.
+  - Replace the `FixedRateTax` / `TaxLayer` set-up in `eeg-billing`'s `ust.rs`
+    with `.default_vat(Vat::standard(Percent::new(dec!(19)))?)`.
+  - Stromsteuer (rate in `grid-billing`'s `stromsteuer.rs`, billed by
+    `energy-billing`) is a line in the 19 % group; `per_unit_levy` builds it.
+  - `prorate` / `distribute` / `allocate` / `proportional_split` become `split`,
+    `Line::segments` or `Document::split`. Drop the `normalise_weights` /
+    `signed_split` wrappers and their inexact fallbacks.
+  - The hand-computed Guthaben (`AdvancePayment`, `residual_breakdown`) becomes
+    `Payment::Advance` entries and `Document::residual_vat`.
+  - `grid_billing::reverse` and `energy-billing`'s `Invoice::merge` become
+    `negated` + your BT-3 choice and `concat`.
+  - `DocumentMeta`, `Period`, `PartyIdentifier` and `PrecedingInvoice` move to
+    your `en16931` mapping.
+- **nebenkostenabrechnung** (`verteilung.rs`, `kosten.rs`, `kuerzung.rs`):
+  - `proportional_split` becomes `split` (or `Document::split` to split a
+    supplier invoice with its VAT).
+  - `RoundingStrategy` becomes `Rounding`, and `extract_tax` becomes
+    `split_gross`.
+  - `Ceiling` / `Truncate` in `kosten.rs` act on non-negative values, so they
+    become `AwayFromZero` / `TowardZero` with no change in value.
+  - A tenant change mid-period is `split` (or `Line::segments`) by days.
+- **en16931** (`billing_adapter.rs`, `tests/billing_roundtrip.rs`): the adapter
+  now owns:
+  - the header: BT-1, BT-2, **BT-3** (380 or 381 for a `negated` document; never
+    381 *and* negative amounts);
+  - all dates and periods (BG-14, BG-26), parties, notes, preceding invoices;
+  - **BT-20** (payment terms text, including `#SKONTO#`, built from
+    `EarlyPaymentDiscount` and your days);
+  - ISO 4217 membership and minor units (BR-CL-04).
+
+  Map `Line` → BG-25, `LineAdjustment` → BG-27/28, `DocumentAdjustment` →
+  BG-20/21, `VatGroup` → BG-23, and the `Document` totals → BG-22.
+  `LineVat` / `TaxBreakdownEntry` become `Vat` / `VatGroup` (rates as `Percent`).
+  `PaymentTerms` and `VatAccountingCurrency` become your own BT-20 type and
+  `VatAccounting`. `maximum_charge` becomes `Bound::maximum`.
+  `verify_vat_attribution` is no longer needed: every line carries its `Vat`.
+- **esales** (`esales-core/money.rs`, `esales-commission`, `esales-tariff`,
+  `esales-terms`, `esales-payout`):
+  - `checked_mul_qty` becomes `AmountScale::reduce` of the exact product. This
+    is the "rounded once" commission tax (`partner.rs` `tax_on`): 1.90, not 1.91.
+  - `RoundingStrategy` becomes `Rounding`.
+  - `LineVat` becomes `Vat` and `DocumentKind` moves to `en16931`
+    (`esales-payout`).
+  - `BillingError` becomes `Error` + `ErrorKind`.
 
 ## [0.15.0]
 

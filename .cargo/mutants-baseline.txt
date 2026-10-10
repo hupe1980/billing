@@ -1,62 +1,27 @@
 # Mutants that survive the test suite, and why each one is allowed to.
 #
-# `just mutants-gate` runs the full sweep and diffs its survivors against this
-# file. A new survivor fails the gate; so does a listed one that is now caught,
-# because that means the entry is stale and the list should shrink.
+# One entry per line: `survivor  # reason` (two spaces, `#`, the reason). Every
+# entry must carry a reason; `just mutants-gate` fails on one that does not.
+# `just mutants-gate` runs the full sweep and compares its survivors with this
+# file: a new survivor fails, and so does a recorded one that is now caught.
+# `just mutants-baseline-update` rewrites the entries from the last full sweep and
+# keeps every reason it can match; new entries are marked `REASON NEEDED`.
+# `:LINE:COL` is stripped before comparison, so ordinary edits do not churn this file.
 #
-# Line and column numbers are stripped before comparison, so ordinary edits do
-# not churn this file — only a genuine change in what survives does.
-#
-# Blank lines and `#` comments are ignored. Entries are sorted.
-#
-# Nothing here is an `exclude_re`. An exclusion is a permanent blind spot: the
-# regex that hides `builder -> Default::default()` today also hides it once
-# `builder()` starts doing real work. These mutants are still generated, still
-# run, and still reported — they are merely expected.
-#
-# ── Provably equivalent — the rewrite cannot change behaviour ─────────────────
-#
-# `Amount::parse`: at `frac_str.len() == P` the widened branch slices an empty
-# tail, so its `any()` is false and nothing is rejected that was not before.
-src/amount.rs: replace > with >= in Amount<P>::parse
-#
-# `Amount::allocate`: `neg` is read only to re-apply a sign to a magnitude, and
-# the sign of a zero magnitude is not observable.
-src/amount.rs: replace < with <= in Amount<P>::allocate
-#
-# `Amount::round_to_increment`, `Truncate` arm: `value <= 0` differs from
-# `value < 0` only at zero, where `r == 0` makes the `&&` short-circuit anyway.
-src/amount.rs: replace < with <= in Amount<P>::round_to_increment
-#
-# `Amount::exact_to`: a value always fits its own scale, so admitting `Q == P`
-# to the `fits_scale` check adds a case that can only answer "it fits".
-src/amount.rs: replace < with <= in Amount<P>::exact_to
-#
-# `PercentageCharge::compute`, min and max clamps: clamping a value to a bound
-# it already sits on assigns what is already there. The `charge == uncapped`
-# test below compares by value, so the BT-100 / BT-101 decision is unchanged too.
-src/tax.rs: replace < with <= in <impl TaxLayer for PercentageCharge>::compute
-src/tax.rs: replace > with >= in <impl TaxLayer for PercentageCharge>::compute
-#
-# `TaxLayer::covers` and `TaxLayer::breakdown`: the mutant is the default body.
-# (The *other* mutants on these lines — `covers -> false` — are caught.)
-src/tax.rs: replace TaxLayer::covers -> bool with true
-src/tax.rs: replace TaxLayer::breakdown -> Result<Option<TaxBreakdownEntry>, BillingError> with Ok(None)
-#
-# `X::builder()`: every one of these has `XBuilder::default()` as its whole body.
-src/document.rs: replace BillingDocument::builder -> BillingDocumentBuilder with Default::default()
-src/lookup.rs: replace RateLookup::builder -> RateLookupBuilder with Default::default()
-src/tou.rs: replace TimeOfUsePricing::builder -> TimeOfUsePricingBuilder with Default::default()
-src/tou.rs: replace DynamicPricing::builder -> DynamicPricingBuilder with Default::default()
-#
-# ── Unreachable by construction — the branch exists, no input reaches it ──────
-#
-# `split_graduated`: `qty > 0` guards against emitting a zero-quantity tier line,
-# which needs a band of zero width — `cap == band.upper - prev_upper == 0`.
-# `RateScheduleBuilder::build` refuses that: upper bounds must be strictly
-# increasing, and only the last band may be unbounded. Deserialisation cannot
-# route around it either, because `RateSchedule` is `#[serde(try_from)]` onto
-# the builder. Verified against both paths rather than assumed — an identical
-# "unreachable" comment in `proportional_split` turned out to be wrong, and the
-# bug it hid is in the 0.11.0 changelog.
-src/schedule.rs: replace > with >= in RateSchedule::split_graduated
+# Reset for the 0.16 hard cut (every 0.15 survivor referred to code 0.16 deleted),
+# then regenerated on the 0.16 tree 2026-10-09 by a full sweep (`just mutants-gate`).
+# Every entry is an equivalent mutant: no input distinguishes it from the original.
+src/amount.rs: replace < with <= in Rounding::div  # n == 0 gives q == 0, and 0.wrapping_neg() == 0: the sign branch is irrelevant at zero
+src/amount.rs: replace < with <= in <impl fmt::Display for Amount<P>>::fmt  # at shown == P the divisor is 10^0 = 1, so mag and kept are unchanged
+src/decimal.rs: replace < with <= in ratio_units  # q == 0 is refused with DivisionByZero above, so q <= 0 and q < 0 agree (moved from vat::units_ratio, spec 027)
+src/decimal.rs: replace serde_str::from_str::<impl Visitor<'_> for StrVisitor<T>>::expecting -> fmt::Result with Ok(Default::default())  # only serde's diagnostic text changes; by policy no test asserts message text (the error kind and refusal are unchanged)
+src/document.rs: replace < with <= in settle  # minimum: when f(x) == target the upward loop adds one unit, and the downward loop (f(x − unit) >= target) takes it back; the result is the same minimal x
+src/document.rs: replace > with >= in settle  # maximum: mirror of the minimum — the upward loop restores the unit the downward loop took at f(x) == target
+src/split.rs: replace < with <= in row  # `negative` only signs the extra units; a zero total has none, so its sign is irrelevant
+src/split.rs: replace * with / in split_matrix  # `sign` is ±1, and x / ±1 == x * ±1
+src/tariff.rs: replace > with >= in packages  # the downward loop may take one package too many; the upward loop (mul(n + 1) <= q) restores n
+src/tariff.rs: replace > with >= in packages  # (second `>` of the same condition) same: over-decrement restored by the upward loop
+src/tariff.rs: replace && with || in packages  # the downward loop runs on to n == 0; the upward loop then climbs back to ⌊q/size⌋
+src/tariff.rs: replace += with -= in packages  # upward-correction body is unreachable: Decimal division rounds monotonically, so after the downward loop n == ⌊q/size⌋ and mul(n + 1) > q on entry
+src/tariff.rs: replace += with *= in packages  # same unreachable body as the `-=` entry (the loop guard is mutation-tested: `<=` → `>` times out)
+src/meter.rs: replace > with >= in lowest_terms  # equivalent: the gcd is 1 at the only point where the operators differ, and dividing numerator and denominator by 1 changes nothing (the gcd cannot be 0: the denominator is positive)

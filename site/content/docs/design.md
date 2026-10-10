@@ -1,138 +1,105 @@
 +++
-title = "Design invariants"
-description = "The rules the crate holds itself to, how correctness is checked — property tests, mutation testing, a recorded survivor baseline — and how it compares."
+title = "Design"
+description = "The model — inputs in, every total derived once, nothing stored that a caller could edit — the invariants the crate holds itself to, and how correctness is checked."
 weight = 130
 +++
+
+## The model
+
+There are two kinds of value in the crate, and they never mix.
+
+**Inputs** are what you state: `Line`s (quantity, price, optional stated net, VAT,
+line allowances and charges, labels), `DocumentAdjustment`s, `apportion` inputs,
+`Bound`s, `Payment`s, a `CashRounding`, a `VatAccounting`. Their constructors are
+infallible and their fields are yours.
+
+**Derived values** are what EN 16931 computes from them: BT-131 per line, the reduced
+allowance and charge amounts, the VAT breakdown, BT-106 … BT-115, BT-111.
+`DocumentBuilder::build` validates the inputs and derives all of them **once**; a
+`Document` exposes them through infallible accessors and nothing derived can be set.
+Consequences:
+
+- **No `validate()`.** The arithmetic rules hold by construction
+  ([the totals chain](../totals/#what-holds-by-construction)).
+- **Builder order never matters** — except between credits, whose call order is their
+  priority. Setting a single-valued setting twice is `ErrorKind::ConflictingSetting`.
+- **Editing re-derives.** `Document::into_builder` returns the inputs — bounds, apportion
+  inputs and credits included, so they re-settle — and the next `build()` derives
+  everything again.
+- **Serde carries inputs.** A serialised `Document` is its inputs; deserialising runs
+  `build()`, so untrusted JSON is validated exactly like code.
+- **Transforms are on inputs.** `negated`, `concat`, `split` and `segments` produce
+  new inputs and re-derive (a split share additionally carries its VAT partition).
+
+```rust
+use billing::{AmountScale, Currency, Document, ErrorKind, Line, Percent, Vat};
+use rust_decimal::dec;
+
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::fixed("service", dec!(100)))
+    .build()?;
+
+// A serialised document is its inputs; deserialising re-builds and re-checks.
+let json = serde_json::to_string(&doc)?;
+assert!(!json.contains("vat_total"));
+let back: Document = serde_json::from_str(&json)?;
+assert_eq!(back, doc);
+
+// Setting a single-valued setting twice is refused, whatever the order.
+let twice = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .default_vat(Vat::standard(Percent::new(dec!(7)))?)
+    .build()
+    .unwrap_err();
+assert_eq!(twice.kind(), &ErrorKind::ConflictingSetting { setting: "default_vat" });
+```
 
 ## Invariants
 
 | Invariant | How it is enforced |
 |---|---|
-| No `f64` in monetary arithmetic | `Amount<P>` is `i64 × 10⁻ᴾ`; every intermediate uses `rust_decimal` |
-| Encapsulated representation | the inner `i64` is private; `to_raw()` reads it and `from_raw_units()` reconstructs — both explicit, neither implicit |
-| Overflow is visible, never silent | infallible ops **panic**; every `checked_*` returns `Err` and never panics, including on `Decimal`'s own panicking operators. `UsageAggregator::aggregate` is fallible too — raw usage events are the least trusted input there is |
-| Rounding is explicit wherever it is observable | `RoundingStrategy` is a required parameter on every reduction. The one default — `quantity × price` at the engine's five decimals — cannot change an emitted digit, because `AmountScale` rounds each line once from the *exact* product instead |
-| No silent precision loss | `parse` and `checked_from_decimal` refuse excess precision identically; `from_decimal_rounded` is the opt-in |
-| Precision is bounded at compile time | `Amount<19>` fails to compile, with an explanatory const-eval message |
-| A gross price is split, never multiplied | `extract_tax` applies `r/(1+r)`; `net_of_tax` takes the remainder, so the pair reconstructs the quoted price exactly |
-| A conditional discount is not a discount | payment terms change no total and no breakdown |
-| A layer never reverses its own direction | both percentage layers refuse a negative rate **and** clamp a negative base |
-| Documents are self-validating | sixteen exact invariants, run by every constructor and again on deserialisation |
-| Allocation is exact | `Σ(parts) == total`, with per-document penny correction |
-| Money splits exactly | `distribute` / `allocate` / `proportional_split` never create or destroy a unit |
-| Value added tax is distinguishable from a charge | marked from the layer's own `breakdown()` return value, so it is total rather than heuristic |
-| Precision reduction happens at the leaves | totals are recomputed from reduced leaves, never rounded themselves |
-| Invariants survive deserialisation | validated types re-run their checks via `#[serde(try_from)]` |
-| The engine tag namespace is protected | caller labels that would collide with a reserved tag are rejected |
-| No silent under-billing | unknown band names, uncovered quantities and non-monotonic schedules are errors, not skips |
-| Zero domain assumptions | no jurisdiction constants, no default currency, no default cash increment |
-| A position's bucket is its EN 16931 group | `net_positions` is BG-25; the other two are BG-20 / BG-21. An invoice line carrying document level allowance detail is refused — the amount would land in BT-106 instead of BT-107 with every total still balancing |
-| No I/O, no async, no `unsafe` | `#![forbid(unsafe_code)]`; every `fn` is a pure `fn` |
+| No `f64` | `Amount<P>` is an `i64` of units; prices and quantities are exact `Decimal`s |
+| Every leaf is rounded once, from its exact value | `AmountScale::reduce` on exact rationals; no intermediate precision exists |
+| Aggregates are never rounded | every total is a sum of reduced leaves |
+| VAT is rounded once per group | the breakdown is a group-by over `Vat` attributes |
+| Rounding is sign-symmetric | four `Rounding` modes, no floor or ceiling; `negated` is exact |
+| Overflow is visible | operators panic, everything else returns `Err(Overflow)`; nothing wraps |
+| No silent precision loss | `parse` and `from_decimal` refuse excess digits; rounding is an explicit call |
+| Splits are exact | largest remainder in `i128`; `Σ parts == total`, per-part quota |
+| A price is not money | `Price` is a `Decimal`; only a line's net becomes an `Amount` |
+| A conditional discount is not a discount | Skonto changes no total; `vat_correction` is a separate result |
+| Direction lives in the quantity | prices are ≥ 0 (`BR-27`); credits are negative quantities |
+| No domain assumptions | no default currency, scale, VAT rate, unit or cash increment |
+| No header | numbers, dates, parties, type codes and text belong to `en16931` |
+| `no_std`, no I/O, no `unsafe` | `#![no_std]` with `alloc`, `#![forbid(unsafe_code)]`; `just nostd` builds for a bare-metal target |
+| Two runtime dependencies | `rust_decimal` and optional `serde`, checked by `just deps-check` |
 
-## How correctness is actually checked
+## How correctness is checked
 
-Four layers, each answering a question the previous one cannot.
-
-**Example tests** answer *"does the code do what I expect?"* — around 700 of them,
-including a suite of regressions named after the audit finding that produced each one.
-
-Beside the four layers sits one check on the *citations*: `just check-citations` — a CI
-job — asserts that every `BR-*`, `BR-DE-*` and `PEPPOL-EN16931-*` rule id cited in the
-code, the README or this site exists in the pinned validation artefacts, so a pin that
-moves to a release that renamed a rule fails the build rather than the reader.
-
-**Property tests** answer *"does the law hold for inputs I did not think of?"*
-`proptest` searches for counterexamples to the algebraic statements: parse/display
-round-trips exactly, splitting conserves the total, rounding is idempotent and bounded,
-a gross amount splits into net and tax without loss, `R120` is rounded once from the
-exact value. Counterexamples are persisted and replayed forever after.
-
-**Doctests** answer *"is the documentation true?"* The entire README is included into
-the crate with `#![doc = include_str!]`, so every Rust example in it is compiled and
-run — a snippet that stops compiling is a build failure, not a reader's problem.
-
-**Mutation testing** answers the one none of the others can: *"would anything fail if
-the code did something else?"* `cargo-mutants` rewrites the source — flipping `<` to
-`<=`, deleting a guard, replacing a computed amount with its default — and reports
-every rewrite the suite still accepts.
-
-That fourth layer is the one that finds the gaps — code that can be changed, in ways
-that alter what an invoice says, without a single test failing. On a suite that passes
-every other level, a first sweep routinely surfaces dozens: mostly holes in the tests,
-occasionally a bug.
-
-It keeps earning its keep, most often on *new* code: a `discount_within` that
-returned the first qualifying discount rather than the best one when the larger was
-declared second, and a merge test that could not tell a currency mismatch from an
-unstated BT-111 because it only asserted `is_err()`.
-
-### The full sweep is not a CI gate — the diff is
-
-The full sweep is **not wired into CI**, on purpose. It is ~1 000 mutants: tens of
-minutes on a laptop, considerably worse on a shared runner. Paying that on every pull
-request buys a signal that changes rarely, and waiting for it is the fastest way to
-make people stop reading it. It is run by hand — after writing tests for a tricky
-invariant, before a release, or when a survivor is suspected.
-
-What *is* wired in is the **diff-scoped** run: a pull request mutates only the lines
-it changed and fails on any survivor the baseline does not record — the same
-`just mutants-diff-gate` recipe a developer runs before pushing.
-
-Three settings roughly halve the per-mutant cost without changing which mutants are
-caught: a build profile with no debuginfo and no incremental state, excluding doctests
-from the sweep, and not leaving the generated site-example harness in `tests/`.
-
-Excluding doctests surfaces every function whose **only** test is a doctest: those
-mutants survive. That is a finding, not a false positive, so the answer is a real test
-— never a baseline entry. A function tested only by an example is a gap whether or not
-a sweep is what reveals it.
-
-### The survivor baseline
-
-Surviving mutants are not suppressed with an exclusion regex — an exclusion is a
-permanent blind spot, and the pattern that hides a builder today also hides it once the
-builder starts doing real work. They are **recorded**, with a written reason each is
-tolerated, and the gate fails in *both* directions: a new survivor is a genuine gap, and
-a recorded survivor that is now caught means the entry is stale and the list should
-shrink.
-
-Every entry is one of two kinds:
-
-- **provably equivalent** — the rewrite cannot change behaviour, e.g. `> ` to `>=` in
-  `Amount::parse`, where the widened branch slices an empty tail;
-- **unreachable by construction** — the branch exists but no input reaches it, verified
-  against every construction path rather than assumed.
-
-That second category is checked rather than trusted for a specific reason: an identical
-"unreachable" comment in `proportional_split` turned out to be wrong, and the bug it hid
-made the function reject splits its own validation had already accepted.
+| Check | Question | How |
+|---|---|---|
+| Example tests | does the code do what I expect? | golden EN 16931 documents; every fixed defect is a named regression |
+| Property tests | does the law hold for inputs I did not think of? | `proptest`: round-trips, split conservation and quota, sign symmetry, `negated`, `concat` |
+| Fuzzing | does anything panic on hostile input? | `cargo-fuzz` on the parser, the splitter and serde (`just fuzz <target>`) |
+| Doctests, site examples | is the documentation true? | README doctests; `just site-verify` runs every block on this site |
+| Mutation testing | would anything fail if the code did something else? | `cargo-mutants` against a baseline of justified survivors; full sweep before a release, diff-scoped in CI |
+| Citations | does the cited rule say what we claim? | every rule id is hash-locked against the pinned Schematron in `citations.lock` (`just check-citations`) |
 
 ## Comparison
 
 | System | Language | Notes |
 |---|---|---|
-| **Kill Bill** | Java | a full billing *platform*; this is a calculation *library* |
-| **Lago** | TypeScript | API server with event ingestion; this is an embeddable library |
-| **Stripe Billing** | SaaS | payment platform; this is standalone |
-| **Chargebee / Zuora** | SaaS | subscription lifecycle management; out of scope |
-| `rust_decimal` | Rust | low-level decimal arithmetic, no billing abstractions — and this crate's one runtime dependency |
-| `rusty-money` | Rust | 128-bit money with formatting, exchange and `allocate`; no pricing models, tax layers or document model |
-| `use-invoice` | Rust | invoice vocabulary for same-currency totals; explicitly does not calculate tax |
-
-The honest summary: if you need subscription lifecycle, dunning, payment capture or a
-hosted API, you want a platform and this is not one. If you need the *amounts* to be
-right — and to still be right after they have been rounded to two decimals, split three
-ways and reversed into a credit note — that is the gap this fills.
+| **Kill Bill** | Java | a billing *platform*; this is a calculation *library* |
+| **Lago**, **Orb** | various | metering and billing services; this is embeddable arithmetic |
+| **Stripe Billing**, **Chargebee**, **Zuora** | SaaS | subscription lifecycle and payments; out of scope |
+| `rust_decimal` | Rust | decimal arithmetic, no billing semantics — this crate's one required dependency |
+| `rusty-money` | Rust | money with formatting and exchange; no tariffs, VAT breakdown or EN 16931 totals |
+| `en16931` | Rust | the EN 16931 model and rules; uses amounts like these, does not compute them |
 
 ## Stability
 
-Pre-1.0, a minor bump may break the API. In exchange, every breaking change is listed in
-the [changelog](https://github.com/hupe1980/billing/blob/main/CHANGELOG.md) with the old
-and new spelling; semantics changes are called out even when the signature is unchanged
-(marked **⚠️ silent**, because they will not fail your build); every release carries a
-migration table; and there are no deprecation shims, so the compiler shows you every
-affected site in one pass.
-
-`BillingError` is `#[non_exhaustive]` — new variants may appear in a minor release, so
-always include a `_ =>` arm. `cargo-semver-checks` runs in CI, so an unintended break
-fails the build rather than shipping.
+Pre-1.0, a minor bump may break the API. Breaking and silent changes are listed in
+the [changelog](https://github.com/hupe1980/billing/blob/main/CHANGELOG.md).
+`ErrorKind`, `TaxCategory`, `Tariff` and a few other enums are `#[non_exhaustive]`;
+`cargo-semver-checks` (`just semver`) guards against unintended breaks.

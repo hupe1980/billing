@@ -1,6 +1,6 @@
 +++
 title = "Getting started"
-description = "Install billing, price a tiered rate schedule, add VAT, and assemble a document whose totals are checked rather than assumed."
+description = "Install billing, rate a tiered water tariff, attach VAT, and read every EN 16931 total from a document that derived them once."
 weight = 10
 +++
 
@@ -13,116 +13,90 @@ cargo add billing
 cargo add --dev rust_decimal --features macros
 ```
 
-The crate is `no_std`-hostile on purpose — it allocates — but it has no other
-surprises: three dependencies, no I/O, no async, no `unsafe`, MSRV 1.85.
-
-An optional `serde` feature adds `Serialize`/`Deserialize` to every public type.
-Amounts serialise as decimal **strings**, never as JSON numbers, and every type that
-carries an invariant re-runs its validation on the way in.
+`#![no_std]` with `alloc`, no `unsafe`, no I/O; one runtime dependency, `rust_decimal`
+(re-exported as `billing::Decimal`). MSRV 1.85. The optional `serde` feature
+serialises decimals as strings, and deserialising a `Document` re-runs `build()`.
 
 ## A first invoice
 
-A three-tier water tariff, billed on 28.5 m³, with 10 % VAT.
+A three-tier water tariff, billed on 28.5 m³, with 7 % VAT.
 
 ```rust
-use billing::prelude::*;
+use billing::{Amount, AmountScale, Currency, Document, Percent, Price, Tariff, Tier, Tiers, Vat};
 use rust_decimal::dec;
 
-let schedule = RateSchedule::graduated()
-    .unit("m³")                  // the domain unit — nothing is assumed
-    .currency(Currency::EUR)     // no currency is assumed either
-    .band(RateBand::up_to(dec!(5),   Amount::parse("0.80000")?))
-    .band(RateBand::between(dec!(5), dec!(20), Amount::parse("1.40000")?))
-    .band(RateBand::over(dec!(20),   Amount::parse("2.60000")?))
+let tariff = Tariff::Graduated(Tiers::new([
+    Tier::up_to(dec!(5), Price::new(dec!(0.80))),
+    Tier::up_to(dec!(20), Price::new(dec!(1.40))),
+    Tier::above(Price::new(dec!(2.60))),
+])?);
+
+// 5 m³ × 0.80 + 15 m³ × 1.40 + 8.5 m³ × 2.60, one line per tier.
+let lines = tariff
+    .rate(dec!(28.5))?
+    .into_iter()
+    .flat_map(|piece| piece.into_lines("water", "MTQ"));
+
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(7)))?)
+    .lines(lines)
     .build()?;
 
-// → [5 m³ × 0.80 = 4.00, 15 m³ × 1.40 = 21.00, 8.5 m³ × 2.60 = 22.10]
-let items = schedule.split(dec!(28.5))?;
-
-let doc = BillingDocument::from_positions(
-    DocumentMeta {
-        invoice_number: "WATER-2026-07".into(),
-        period_label:   "July 2026".into(),
-        currency:       Currency::EUR,
-        ..Default::default()
-    },
-    items,
-    vec![FixedRateTax::new("VAT", dec!(0.10))?.boxed()],
-    vec![],
-)?;
-
-assert_eq!(doc.net_total().to_string(),   "47.10000");
-assert_eq!(doc.tax_total().to_string(),   "4.71000");
-assert_eq!(doc.gross_total().to_string(), "51.81000");
-
-doc.assert_valid();   // panics if any arithmetic invariant fails
+assert_eq!(doc.lines().len(), 3);
+assert_eq!(doc.line_net(2), Amount::parse("22.10")?);
+assert_eq!(doc.line_total(), Amount::parse("47.10")?);   // BT-106
+assert_eq!(doc.vat_total(), Amount::parse("3.30")?);     // BT-110: 47.10 × 7 % = 3.297
+assert_eq!(doc.payable(), Amount::parse("50.40")?);      // BT-115
 ```
 
-Three things in that snippet are deliberate and worth noticing.
+- **Currency and scale are required.** `AmountScale::EN16931` is two decimals, half
+  away from zero.
+- **The unit is a code you choose** (`MTQ`, UN/ECE Rec. 20); the engine only checks a
+  stated price unit matches it (`PEPPOL-EN16931-R130`).
+- **VAT is an attribute.** `default_vat` applies wherever none is set; the breakdown
+  rounds once per group.
+- **Every check runs in `build()`**, which returns an [`Error`](../errors/) naming the
+  rule and the line.
 
-**`DocumentMeta` is built with `..Default::default()`.** The struct gains fields
-between minor releases; struct-update syntax means that is not a breaking change for
-you.
+## Reading the result
 
-**The unit and the currency are arguments.** There is no default. A generated
-unit-price label reads `XXX/m³` if you forget the currency — `XXX` is the ISO 4217
-code for "no currency involved", and seeing it on a rendered invoice is a visible bug
-rather than a silent mislabelling.
-
-**`assert_valid()` is not decoration.** It re-derives the totals from the positions
-and compares them exactly. On a document this constructor produced it cannot fail; its
-value is on documents that were allocated, merged, deserialised, or built by hand.
-
-## Assembling at invoice precision
-
-The document above carries five decimals, because `28.5 × 2.60` needs them. EN 16931
-allows two. Ask for them during assembly, not afterwards:
+Every total is an accessor returning an `Amount` (an `i64` count of 10⁻⁵) on the
+document's scale; [the totals chain](../totals/) maps each to its business term.
 
 ```rust
-use billing::prelude::*;
+use billing::{AmountScale, Currency, Document, DocumentAdjustment, Line, Percent, Price, Quantity, UnitPrice, Vat};
 use rust_decimal::dec;
 
-let doc = BillingDocument::builder()
-    .currency(Currency::EUR)
-    .amount_scale(AmountScale::EN16931)
-    .positions(vec![LineItem::for_usage(
-        "Arbeit",
-        Quantity::new(dec!(1234.567), "kWh"),
-        UnitPrice::new(dec!(0.28901), "EUR/kWh"),
-    ).build()?])
-    .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.boxed())
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::new("energy", Quantity::new(dec!(1000), "KWH"), UnitPrice::new(Price::new(dec!(0.30)))))
+    .adjustment(DocumentAdjustment::allowance("loyalty", dec!(10)))
     .build()?;
 
-assert!(doc.fits_amount_scale(2));
-doc.assert_valid();
+assert_eq!(doc.line_total().to_string(), "300.00000");          // BT-106
+assert_eq!(doc.allowance_total().to_string(), "10.00000");      // BT-107
+assert_eq!(doc.tax_exclusive_total().to_string(), "290.00000"); // BT-109
+assert_eq!(doc.vat_total().to_string(), "55.10000");            // BT-110
+assert_eq!(doc.tax_inclusive_total().to_string(), "345.10000"); // BT-112
+assert_eq!(format!("{:.2}", doc.payable()), "345.10");          // BT-115, as emitted
 ```
 
-Why it has to happen there, and what breaks if it does not, is
-[E-invoicing and precision](../e-invoicing/).
-
-## The builder, and the `PricingModel` trait
-
-`BillingDocument::builder()` takes positions and layers directly. For anything
-reusable, implement [`PricingModel`](../pricing/#the-pricingmodel-trait) instead: it separates
-pricing from tax, which is how invoices are audited, and it lets a model say
-*"nothing to bill, because …"* as a first-class outcome rather than as an empty
-vector or an error.
-
-```rust,ignore
-let doc = BillingDocument::builder()
-    .meta(meta)
-    .pricing(&my_model, &usage)?   // loads positions + tax and discount layers
-    .build()?;
-```
+An `Amount<5>` prints five decimals; `{:.2}` only drops zeros here, since every
+derived amount already fits the scale.
 
 ## Where to go next
 
 | If you want to | Read |
 |---|---|
-| understand `Amount<P>`, rounding and overflow | [Amounts and rounding](../amounts/) |
-| price metered usage, seats, capacity or spot intervals | [Pricing models](../pricing/) |
-| stack VAT, excise duties and commissions | [Tax and discount layers](../tax-and-discounts/) |
-| emit a lawful VAT breakdown | [VAT breakdown](../vat-breakdown/) |
+| understand `Amount<P>`, `Price`, rounding and overflow | [Money and rounding](../amounts/) |
+| rate metered usage, spot intervals, HT/NT or a 95th percentile | [Pricing](../pricing/) |
+| choose VAT categories and exemption reasons | [VAT](../vat-breakdown/) |
+| invoice from gross (consumer) prices | [Gross prices](../gross-pricing/) |
+| add discounts, surcharges or a per-unit levy | [Allowances, charges and levies](../tax-and-discounts/) |
 | map to BT-106 … BT-115 | [The totals chain](../totals/) |
-| convert a gross-quoted catalogue | [Tax-inclusive pricing](../gross-pricing/) |
-| split a bill across tenants | [Allocation](../allocation/) |
+| split a bill across tenants or prorate a fee | [Splitting](../allocation/) |
+| issue a credit, merge documents, cap or floor a total | [Corrections and bounds](../corrections/) |
+| deduct advances, cash-round, report VAT in another currency | [Settlement](../settlement/) |
+| compute Skonto or late-payment interest | [Payment terms](../payment-terms/) |
+| handle errors | [Errors](../errors/) |
+| upgrade from 0.15 | [Migrating from 0.15](../migrating/) |

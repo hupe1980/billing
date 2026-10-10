@@ -1,127 +1,74 @@
-//! [`TaxCategory`] and [`TaxBreakdownEntry`] — the per-rate VAT breakdown.
+//! VAT as an attribute: [`TaxCategory`], [`Exemption`], [`Vat`], the derived
+//! [`VatGroup`] (BG-23) and [`split_gross`].
 //!
-//! # Why a breakdown is not optional
-//!
-//! A single `tax_total` is not a lawful invoice. EU VAT Directive 2006/112/EC
-//! art. 226 and German §14 UStG both require the taxable amount **per rate** and
-//! the tax amount **per rate**, and any invoice carrying more than one rate — a
-//! reduced-rate line beside a standard-rate line, a reverse-charge position, an
-//! exempt feed-in credit — must show them separately.
-//!
-//! This module models the EN 16931 **VAT BREAKDOWN** group (BG-23), the semantic
-//! structure that XRechnung, ZUGFeRD/Factur-X and Peppol BIS all serialise:
-//!
-//! | Field | EN 16931 | Meaning |
-//! |-------|----------|---------|
-//! | [`TaxBreakdownEntry::taxable_base`] | BT-116 | VAT category taxable amount |
-//! | [`TaxBreakdownEntry::tax_amount`] | BT-117 | VAT category tax amount |
-//! | [`TaxBreakdownEntry::category`] | BT-118 | VAT category code |
-//! | [`TaxBreakdownEntry::rate`] | BT-119 | VAT category rate |
-//! | [`TaxBreakdownEntry::exemption_reason`] | BT-120 | VAT exemption reason text |
-//!
-//! The engine produces the breakdown; it does **not** decide which category
-//! applies. That is a jurisdictional question and stays with the caller.
+//! EN 16931 states a VAT category and rate on every line (BT-151/152),
+//! allowance (BT-95/96) and charge (BT-102/103); the VAT breakdown (BG-23) is a
+//! group-by over those attributes with the tax rounded **once** per group. This
+//! module holds the attribute; [`Document`](crate::Document) does the grouping.
+
+use alloc::string::String;
+use core::fmt;
 
 use rust_decimal::Decimal;
 
-use crate::amount::Amount;
+use crate::{Amount, AmountScale, Error, ErrorKind, Percent, Result};
 
-/// EN 16931 BT-118 / UNTDID 5305 VAT category code.
+/// A VAT category code (UNTDID 5305, the subset BR-CL-17 permits).
 ///
-/// The code tells a tax authority *why* a given base carries the rate it does —
-/// a 0% line is not self-explanatory, and "zero-rated", "exempt", "reverse
-/// charge" and "outside scope" have materially different legal meanings even
-/// though all four produce no tax.
+/// `#[non_exhaustive]`: a later edition of the code list adds variants without a
+/// breaking change. Serialises as its code (`"S"`, `"AE"` …).
 ///
-/// This enum is deliberately **not** `#[non_exhaustive]`: it mirrors a closed,
-/// externally-governed code list, and callers legitimately need exhaustive
-/// matching when mapping to an output format. The list is fixed by rules
-/// **BR-CL-17** and **BR-CL-18**, which restrict BT-118 / BT-151 to exactly the
-/// ten codes below — [`TaxCategory::ALL`] is that set, in the artefact's order.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// ```
+/// use billing::TaxCategory;
+///
+/// assert_eq!(TaxCategory::ReverseCharge.code(), "AE");
+/// assert_eq!(TaxCategory::from_code("ae"), Some(TaxCategory::ReverseCharge));
+/// assert!(!TaxCategory::OutOfScope.states_rate()); // BR-O-05: no rate on the line
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TaxCategory {
-    /// `S` — standard rate.
+    /// `S` — standard rate (rate > 0, BR-S-05).
     Standard,
-    /// `Z` — zero-rated goods. Taxable at 0%; input tax remains deductible.
+    /// `Z` — zero rated (rate 0, no exemption reason: BR-Z-05, BR-Z-10).
     ZeroRated,
-    /// `E` — exempt from VAT. Unlike zero-rating, input tax is generally not
-    /// deductible. Requires an exemption reason.
+    /// `E` — exempt (rate 0, reason required: BR-E-05, BR-E-10).
     Exempt,
-    /// `AE` — VAT reverse charge: the recipient accounts for the tax
-    /// (§13b UStG, art. 194–199 of the VAT Directive).
+    /// `AE` — reverse charge (BR-AE-05, BR-AE-10).
     ReverseCharge,
-    /// `K` — VAT-exempt intra-Community supply of goods.
+    /// `K` — intra-community supply (BR-IC-05, BR-IC-10).
     IntraCommunity,
-    /// `G` — free export item, VAT not charged.
+    /// `G` — export outside the EU (BR-G-05, BR-G-10).
     Export,
-    /// `O` — services outside the scope of VAT.
+    /// `O` — not subject to VAT: no rate is stated (BR-O-05), reason required
+    /// (BR-O-10), and no other group may coexist (BR-O-11).
     OutOfScope,
-    /// `L` — Canary Islands general indirect tax (IGIC).
+    /// `L` — Canary Islands IGIC (rate ≥ 0, BR-AF-05).
     CanaryIslands,
-    /// `M` — tax for production, services and importation in Ceuta and Melilla (IPSI).
+    /// `M` — Ceuta and Melilla IPSI (rate ≥ 0, BR-AG-05).
     CeutaMelilla,
-    /// `B` — split payment (Italy, *scissione dei pagamenti*): the buyer remits
-    /// the VAT directly to the tax authority instead of paying it to the supplier.
-    ///
-    /// Unlike the other "someone else pays" category (`AE`), the tax amount is
-    /// **not** zero — the supply is taxed at the normal rate and the tax is stated;
-    /// only the settlement route differs. The CEN artefacts make this observable by
-    /// omission: `B` is the one category with no `BR-B-05`, no `BR-B-09` and no
-    /// `BR-B-10`, so nothing constrains its rate, forces BT-117 to zero, or requires
-    /// an exemption reason. It is therefore also the only category for which both
-    /// [`requires_exemption_reason`](Self::requires_exemption_reason) and
-    /// [`forbids_exemption_reason`](Self::forbids_exemption_reason) are `false`.
-    ///
-    /// Its two rules divide neatly, and the engine checks exactly the one it can:
-    ///
-    /// - **BR-B-01** — an invoice using `B` shall be a domestic Italian invoice.
-    ///   This needs the *parties' countries*, which this crate never sees, so it
-    ///   stays with the caller.
-    /// - **BR-B-02** — `B` shall not appear in the same document as `S`. This is a
-    ///   property of the categories present, which the engine owns entirely, so it
-    ///   is checked: at breakdown level by
-    ///   [`BillingDocument::validate`](crate::BillingDocument::validate) and at
-    ///   position level by
-    ///   [`verify_vat_attribution`](crate::BillingDocument::verify_vat_attribution),
-    ///   exactly as BR-O-11 and BR-O-12/13/14 are.
+    /// `B` — Italian split payment: taxed normally, never beside `S` (BR-B-02).
     SplitPayment,
 }
 
 impl TaxCategory {
-    /// Every UNCL 5305 code EN 16931 permits, in the order BR-CL-17 lists them.
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    /// assert_eq!(TaxCategory::ALL.len(), 10);
-    /// // Every code round-trips through `from_code`.
-    /// for c in TaxCategory::ALL {
-    ///     assert_eq!(TaxCategory::from_code(c.code()), Some(c));
-    /// }
-    /// ```
+    /// Every category, in declaration order.
     pub const ALL: [Self; 10] = [
-        Self::ReverseCharge,
-        Self::CanaryIslands,
-        Self::CeutaMelilla,
-        Self::Exempt,
         Self::Standard,
         Self::ZeroRated,
+        Self::Exempt,
+        Self::ReverseCharge,
+        Self::IntraCommunity,
         Self::Export,
         Self::OutOfScope,
-        Self::IntraCommunity,
+        Self::CanaryIslands,
+        Self::CeutaMelilla,
         Self::SplitPayment,
     ];
 
-    /// The UNTDID 5305 code as written in EN 16931 / UBL / CII documents.
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    /// assert_eq!(TaxCategory::Standard.code(), "S");
-    /// assert_eq!(TaxCategory::ReverseCharge.code(), "AE");
-    /// assert_eq!(TaxCategory::SplitPayment.code(), "B");
-    /// ```
+    /// The UNTDID 5305 code.
     #[must_use]
-    pub fn code(&self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::Standard => "S",
             Self::ZeroRated => "Z",
@@ -136,66 +83,33 @@ impl TaxCategory {
         }
     }
 
-    /// Parse a UNTDID 5305 code (case-insensitive).
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    /// assert_eq!(TaxCategory::from_code("ae"), Some(TaxCategory::ReverseCharge));
-    /// assert_eq!(TaxCategory::from_code("B"), Some(TaxCategory::SplitPayment));
-    /// assert_eq!(TaxCategory::from_code("Q"), None);
-    /// ```
+    /// The category of a code, case-insensitively.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
-        match code.to_ascii_uppercase().as_str() {
-            "S" => Some(Self::Standard),
-            "Z" => Some(Self::ZeroRated),
-            "E" => Some(Self::Exempt),
-            "AE" => Some(Self::ReverseCharge),
-            "K" => Some(Self::IntraCommunity),
-            "G" => Some(Self::Export),
-            "O" => Some(Self::OutOfScope),
-            "L" => Some(Self::CanaryIslands),
-            "M" => Some(Self::CeutaMelilla),
-            "B" => Some(Self::SplitPayment),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|c| c.code().eq_ignore_ascii_case(code))
     }
 
-    /// Whether this category actually levies tax.
-    ///
-    /// True for `S`, `L`, `M` and `B`. For every other category EN 16931 requires
-    /// the category tax amount (BT-117) to be exactly zero — rules BR-Z-09,
-    /// BR-E-09, BR-AE-09, BR-IC-09, BR-G-09 and BR-O-09. There is deliberately no
-    /// `BR-B-09`: under split payment the supply is taxed normally and the tax is
-    /// stated, the buyer merely remits it to the authority rather than to the
-    /// supplier.
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    /// assert!(TaxCategory::Standard.carries_tax());
-    /// assert!(TaxCategory::SplitPayment.carries_tax());
-    /// assert!(!TaxCategory::ZeroRated.carries_tax());
-    /// assert!(!TaxCategory::ReverseCharge.carries_tax());
-    /// ```
+    /// Whether a line, allowance or charge in this category states its rate
+    /// (BT-152/96/103). `false` only for `O` (BR-O-05/06/07). The breakdown
+    /// rate BT-119 is a different term and is always stated.
     #[must_use]
-    pub fn carries_tax(&self) -> bool {
+    pub const fn states_rate(self) -> bool {
+        !matches!(self, Self::OutOfScope)
+    }
+
+    /// Whether the category levies tax at its rate (`S`, `L`, `M`, `B`); every
+    /// other category has rate 0 and tax 0.
+    #[must_use]
+    pub const fn carries_tax(self) -> bool {
         matches!(
             self,
             Self::Standard | Self::CanaryIslands | Self::CeutaMelilla | Self::SplitPayment
         )
     }
 
-    /// Whether EN 16931 **requires** an exemption reason (BT-120/BT-121).
-    ///
-    /// Required for `E`, `AE`, `K`, `G` and `O` (rules BR-E-10, BR-AE-10,
-    /// BR-IC-10, BR-G-10, BR-O-10).
-    ///
-    /// Note the asymmetry that implementers most often get wrong: **`Z` and `E`
-    /// both carry zero tax, but `Z` must *not* have an exemption reason and `E`
-    /// must.** Zero-rating and exemption are legally distinct — input tax stays
-    /// deductible under `Z` but generally not under `E`.
-    #[must_use]
-    pub fn requires_exemption_reason(&self) -> bool {
+    const fn needs_exemption(self) -> bool {
         matches!(
             self,
             Self::Exempt
@@ -206,852 +120,703 @@ impl TaxCategory {
         )
     }
 
-    /// Whether EN 16931 **forbids** an exemption reason for this category.
-    ///
-    /// Forbidden for `S` (BR-S-10), `Z` (BR-Z-10), `L` (BR-AF-10) and `M`
-    /// (BR-AG-10): a taxed or zero-rated supply is not an exemption and needs no
-    /// justification.
-    ///
-    /// `B` is neither required nor forbidden — the artefacts contain no `BR-B-10` —
-    /// so it is the single category for which this and
-    /// [`requires_exemption_reason`](Self::requires_exemption_reason) are both
-    /// `false`. Code that assumes exactly one of the two holds is wrong on `B`.
-    #[must_use]
-    pub fn forbids_exemption_reason(&self) -> bool {
+    const fn forbids_exemption(self) -> bool {
         matches!(
             self,
             Self::Standard | Self::ZeroRated | Self::CanaryIslands | Self::CeutaMelilla
         )
     }
-
-    /// Whether EN 16931 requires a **strictly positive** line/allowance/charge VAT
-    /// rate (BT-152 / BT-96 / BT-103) for this category.
-    ///
-    /// True for `S` alone. **BR-S-05** says the rate "shall be greater than zero",
-    /// whereas the corresponding rules for `L` and `M` — BR-AF-05 and BR-AG-05 —
-    /// say "0 (zero) or greater than zero", and `B` has no rule at all. Treating
-    /// all taxed categories alike would wrongly reject a lawful 0 % IGIC line.
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    /// assert!(TaxCategory::Standard.requires_positive_rate());
-    /// assert!(!TaxCategory::CanaryIslands.requires_positive_rate()); // BR-AF-05 allows 0
-    /// assert!(!TaxCategory::SplitPayment.requires_positive_rate());  // no BR-B-05
-    /// ```
-    #[must_use]
-    pub fn requires_positive_rate(&self) -> bool {
-        matches!(self, Self::Standard)
-    }
-
-    /// Whether EN 16931 requires a **zero** line/allowance/charge VAT rate for this
-    /// category — rules BR-Z-05, BR-E-05, BR-AE-05, BR-IC-05, BR-G-05 and BR-O-05.
-    ///
-    /// For `O` this crate stores zero, but a consumer must **omit** the rate rather
-    /// than write `0` — see [`states_rate`](Self::states_rate).
-    #[must_use]
-    pub fn requires_zero_rate(&self) -> bool {
-        !self.carries_tax()
-    }
-
-    /// Whether a **line, allowance or charge** in this category may state its VAT
-    /// rate — BT-152, BT-96, BT-103.
-    ///
-    /// **`O` is the only category where the answer is no**, and the distinction is
-    /// not cosmetic. The other zero-tax categories say the rate *"shall be 0
-    /// (zero)"* — present, and zero (BR-Z-05, BR-E-05, BR-AE-05, BR-IC-05,
-    /// BR-G-05). `O` says the opposite:
-    ///
-    /// > `[BR-O-05]` An Invoice line (BG-25) where the VAT category code (BT-151)
-    /// > is "Not subject to VAT" shall **not contain** an Invoiced item VAT rate
-    /// > (BT-152).
-    ///
-    /// BR-O-06 and BR-O-07 say the same for BT-96 and BT-103. Because
-    /// [`LineVat::rate`] is a plain `Decimal` rather than an `Option`, an `O`
-    /// position stores `0` — so a consumer emitting UBL or CII must **suppress the
-    /// element** for `O` instead of writing `<cbc:Percent>0</cbc:Percent>`, which
-    /// is a fatal violation. This predicate is that instruction, in code.
-    ///
-    /// # It does **not** apply to BT-119
-    ///
-    /// The VAT *breakdown* rate ([`TaxBreakdownEntry::rate`]) is a different term
-    /// and is governed by different rules. No BR-O rule suppresses it, and
-    /// XRechnung's **BR-DE-14** requires it unconditionally — *"Das Element 'VAT
-    /// category rate' (BT-119) muss übermittelt werden"*, fatal, with no category
-    /// exception. Applying this predicate to BG-23 would produce an invoice that
-    /// fails the KoSIT validator.
-    ///
-    /// ```rust
-    /// use billing::TaxCategory;
-    ///
-    /// // Every other zero-tax category states an explicit 0 on its lines …
-    /// assert!(TaxCategory::ReverseCharge.states_rate());
-    /// assert!(TaxCategory::ZeroRated.states_rate());
-    /// // … while `O` must not state one at all (BR-O-05 / BR-O-06 / BR-O-07).
-    /// assert!(!TaxCategory::OutOfScope.states_rate());
-    /// ```
-    #[must_use]
-    pub fn states_rate(&self) -> bool {
-        !matches!(self, Self::OutOfScope)
-    }
 }
 
-impl std::fmt::Display for TaxCategory {
-    /// Honours width, fill and alignment.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TaxCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(self.code())
     }
 }
 
-/// The VAT treatment of a single position — EN 16931 **BT-151 / BT-152** on an
-/// invoice line (BG-30), **BT-95 / BT-96** on a document level allowance (BG-20),
-/// **BT-102 / BT-103** on a document level charge (BG-21).
-///
-/// EN 16931 requires this on every line: BR-CO-04 makes BT-151 mandatory, BR-32
-/// and BR-37 do the same for allowances and charges. It is what BR-S-08 and its
-/// siblings check the VAT breakdown against — for each `(category, rate)`, the
-/// breakdown's taxable amount (BT-116) must equal the sum of the line net amounts
-/// plus charges minus allowances carrying that pair.
-///
-/// [`crate::BillingDocument`] fills this in during assembly from the layer that
-/// covers the position ([`crate::TaxLayer::covers`]), so a document built by this
-/// crate carries the attribution the standard asks for. Set it explicitly with
-/// [`crate::LineItemBuilder::vat`] when the caller already knows it.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "LineVatRepr"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LineVat {
-    /// BT-151 / BT-95 / BT-102 — the UNCL 5305 VAT category code.
-    pub category: TaxCategory,
-    /// BT-152 / BT-96 / BT-103 — the rate as a fraction (`0.19`, not `19`).
-    pub rate: Decimal,
+#[cfg(feature = "serde")]
+impl serde::Serialize for TaxCategory {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> core::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.code())
+    }
 }
 
 #[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-struct LineVatRepr {
-    category: TaxCategory,
-    rate: Decimal,
-}
-
-#[cfg(feature = "serde")]
-impl TryFrom<LineVatRepr> for LineVat {
-    type Error = crate::error::BillingError;
-    fn try_from(r: LineVatRepr) -> Result<Self, Self::Error> {
-        Self::new(r.category, r.rate)
+impl<'de> serde::Deserialize<'de> for TaxCategory {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> core::result::Result<Self, D::Error> {
+        crate::decimal::serde_str::from_str(
+            d,
+            |s| Self::from_code(s).ok_or_else(|| ErrorKind::Malformed { input: s.into() }.into()),
+            "a VAT category code such as \"S\"",
+        )
     }
 }
 
-impl LineVat {
-    /// Create a VAT attribution, checking the category's rate rule.
-    ///
-    /// # Errors
-    /// [`crate::BillingError::InvalidInput`] if the rate contradicts the category:
-    /// zero (or negative) under `S` (BR-S-05), or non-zero under a category that
-    /// levies none (BR-Z-05, BR-E-05, BR-AE-05, BR-IC-05, BR-G-05, BR-O-05).
-    ///
-    /// ```rust
-    /// use billing::{LineVat, TaxCategory};
-    /// use rust_decimal::dec;
-    ///
-    /// assert!(LineVat::new(TaxCategory::Standard, dec!(0.19)).is_ok());
-    /// // BR-S-05 — a standard-rated line at 0 % is not standard-rated.
-    /// assert!(LineVat::new(TaxCategory::Standard, dec!(0)).is_err());
-    /// // BR-AE-05 — reverse charge carries no rate.
-    /// assert!(LineVat::new(TaxCategory::ReverseCharge, dec!(0.19)).is_err());
-    /// // `L` may legitimately be 0 % (BR-AF-05), unlike `S`.
-    /// assert!(LineVat::new(TaxCategory::CanaryIslands, dec!(0)).is_ok());
-    /// ```
-    pub fn new(category: TaxCategory, rate: Decimal) -> Result<Self, crate::error::BillingError> {
-        let this = Self { category, rate };
-        this.validate()?;
-        Ok(this)
-    }
-
-    /// Re-check the category/rate consistency of an existing value.
-    ///
-    /// # Errors
-    /// As [`LineVat::new`].
-    pub fn validate(&self) -> Result<(), crate::error::BillingError> {
-        use crate::error::BillingError;
-        if self.category.requires_positive_rate() && self.rate <= Decimal::ZERO {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} requires a rate greater than zero (BR-S-05), got {}",
-                    self.category, self.rate
-                ),
-            });
-        }
-        if self.category.requires_zero_rate() && !self.rate.is_zero() {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} levies no tax, so its rate must be 0, got {}",
-                    self.category, self.rate
-                ),
-            });
-        }
-        if self.rate.is_sign_negative() && !self.rate.is_zero() {
-            return Err(BillingError::InvalidInput {
-                reason: format!("VAT rate must not be negative, got {}", self.rate),
-            });
-        }
-        Ok(())
-    }
-
-    /// The group this position contributes to in the VAT breakdown, with the rate
-    /// normalised exactly as [`TaxBreakdownEntry::group_key`] normalises it.
-    #[must_use]
-    pub fn group_key(&self) -> (TaxCategory, Decimal) {
-        (self.category, self.rate.normalize())
-    }
-
-    /// The rate as a percentage with trailing zeros stripped (`0.19` → `19`).
-    #[must_use]
-    pub fn rate_percent(&self) -> Decimal {
-        self.rate
-            .checked_mul(Decimal::ONE_HUNDRED)
-            .map(|d| d.normalize())
-            .unwrap_or(self.rate)
-    }
-}
-
-impl std::fmt::Display for LineVat {
-    /// `"S 19%"`, `"AE 0%"`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}%", self.category, self.rate_percent())
-    }
-}
-
-/// One line of the EN 16931 VAT BREAKDOWN (BG-23): the taxable base and tax
-/// amount for a single (category, rate) pair.
-///
-/// Entries sharing a category and rate are **merged** by
-/// [`crate::BillingDocument`] — see [`TaxBreakdownEntry::group_key`] for which
-/// rules make that mandatory.
+/// The VAT exemption reason (BT-120 text, BT-121 code), required for `E`, `AE`,
+/// `K`, `G` and `O`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "TaxBreakdownEntryRepr"))]
+pub enum Exemption {
+    /// BT-120 only.
+    Text(String),
+    /// BT-121 only (e.g. `"VATEX-EU-AE"`).
+    Code(String),
+    /// Both.
+    Both {
+        /// BT-120.
+        text: String,
+        /// BT-121.
+        code: String,
+    },
+}
+
+impl Exemption {
+    /// BT-120, if stated.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(t) | Self::Both { text: t, .. } => Some(t),
+            Self::Code(_) => None,
+        }
+    }
+
+    /// BT-121, if stated.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Code(c) | Self::Both { code: c, .. } => Some(c),
+            Self::Text(_) => None,
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.text().is_none_or(|t| t.trim().is_empty())
+            && self.code().is_none_or(|c| c.trim().is_empty())
+    }
+}
+
+/// Why a VAT treatment is invalid; the payload of [`ErrorKind::InvalidVat`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaxBreakdownEntry {
-    /// BT-118 — VAT category code.
-    pub category: TaxCategory,
-    /// BT-119 — the rate as a fraction (`0.19`, not `19`). Zero for the zero-tax
-    /// categories.
-    ///
-    /// **Always emit it**, including under `O`. BT-119 is *not* covered by
-    /// BR-O-05/06/07 — those forbid the *line*, *allowance* and *charge* rates
-    /// (BT-152 / BT-96 / BT-103), which is what [`TaxCategory::states_rate`]
-    /// describes. XRechnung goes further and requires BT-119 unconditionally:
-    ///
-    /// > `[BR-DE-14]` Das Element "VAT category rate" (BT-119) muss übermittelt
-    /// > werden.
-    ///
-    /// — **fatal**, with no category exception. Suppressing BT-119 for `O` on the
-    /// strength of BR-O-05 is therefore a validation failure, not a safe
-    /// simplification.
-    pub rate: Decimal,
-    /// BT-116 — the sum of line net amounts subject to this category and rate.
-    pub taxable_base: Amount<5>,
-    /// BT-117 — the tax charged on `taxable_base`.
-    pub tax_amount: Amount<5>,
-    /// BT-120 — the exemption reason as **free text**.
-    ///
-    /// One of this and [`exemption_reason_code`](Self::exemption_reason_code) is
-    /// required for the categories where
-    /// [`TaxCategory::requires_exemption_reason`] is `true`, and **both** are
-    /// forbidden where [`TaxCategory::forbids_exemption_reason`] is.
-    pub exemption_reason: Option<String>,
-    /// BT-121 — the exemption reason as a **code** from the CEF VATEX list
-    /// (`"VATEX-EU-AE"`, `"VATEX-EU-IC"`, `"VATEX-EU-O"`).
-    ///
-    /// A lawful *alternative* to [`exemption_reason`](Self::exemption_reason), not
-    /// an addition to it: BR-E-10, BR-AE-10, BR-IC-10, BR-G-10 and BR-O-10 each
-    /// require "a VAT exemption reason code (BT-121) **or** a VAT exemption reason
-    /// text (BT-120)". A caller holding only the code does not have to invent
-    /// prose to satisfy the engine.
-    ///
-    /// **BR-CL-22** restricts the value to the VATEX code list; the engine does not
-    /// check membership, for the same reason it does not check UNCL 5189 or
-    /// UN/ECE Rec 20 — it carries no copy of the list, and a stale embedded copy
-    /// would be worse than none.
-    pub exemption_reason_code: Option<String>,
-}
-
-#[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-struct TaxBreakdownEntryRepr {
-    category: TaxCategory,
-    rate: Decimal,
-    taxable_base: Amount<5>,
-    tax_amount: Amount<5>,
-    #[serde(default)]
-    exemption_reason: Option<String>,
-    #[serde(default)]
-    exemption_reason_code: Option<String>,
-}
-
-#[cfg(feature = "serde")]
-impl TryFrom<TaxBreakdownEntryRepr> for TaxBreakdownEntry {
-    type Error = crate::error::BillingError;
-    fn try_from(r: TaxBreakdownEntryRepr) -> Result<Self, Self::Error> {
-        let entry = Self {
-            category: r.category,
-            rate: r.rate,
-            taxable_base: r.taxable_base,
-            tax_amount: r.tax_amount,
-            exemption_reason: r.exemption_reason,
-            exemption_reason_code: r.exemption_reason_code,
-        };
-        // Fields are public, so serde reconstructs them directly. Re-run the
-        // category and BR-CO-17 checks so an entry can never enter the process
-        // in a state the type says is impossible.
-        entry.validate()?;
-        Ok(entry)
-    }
-}
-
-impl TaxBreakdownEntry {
-    /// The grouping key EN 16931 forces on the VAT breakdown: one line per
-    /// distinct `(category, rate)` pair.
-    ///
-    /// The requirement comes from two different places depending on the category,
-    /// and the standard's asymmetry between them is deliberate:
-    ///
-    /// | Categories | Rule | Wording |
-    /// |---|---|---|
-    /// | `S`, `L`, `M` | BR-S-08, BR-AF-08, BR-AG-08 | *"For each different value of VAT category rate (BT-119) … the VAT category taxable amount (BT-116) … shall equal the sum of …"* — the equality can only hold for each rate if entries at that rate are merged |
-    /// | `Z`, `E`, `AE`, `K`, `G`, `O` | BR-Z-01, BR-E-01, BR-AE-01, BR-IC-01, BR-G-01, BR-O-01 | *"… shall contain in the VAT breakdown (BG-23) **exactly one** VAT category code (BT-118) equal with …"* |
-    ///
-    /// The taxed categories say *"at least one"* because they can legitimately
-    /// appear at several rates; the zero-tax categories say *"exactly one"* because
-    /// they cannot.
-    ///
-    /// This is **not** BR-CO-18, which is a different rule entirely — *"An Invoice
-    /// shall at least have one VAT breakdown group (BG-23)"* — and is checked by
-    /// [`crate::BillingDocument::validate`] instead.
-    ///
-    /// The rate is **normalised** before comparison, because Peppol specifies
-    /// that "for the VAT rate, only significant decimals should be considered,
-    /// i.e. any difference in trailing zeros should not result in different VAT
-    /// breakdowns". Without normalising, `0.19` and `0.190` would produce two
-    /// breakdown lines for one rate — an invalid invoice.
-    #[must_use]
-    pub fn group_key(&self) -> (TaxCategory, Decimal) {
-        (self.category, self.rate.normalize())
-    }
-
-    /// Validate this entry against the EN 16931 per-category rules.
-    ///
-    /// # Errors
-    /// [`crate::BillingError::InvalidInput`] if a zero-tax category carries a
-    /// non-zero tax amount, if a category requiring an exemption reason lacks
-    /// one, or if a category forbidding one has it.
-    pub fn validate(&self) -> Result<(), crate::error::BillingError> {
-        use crate::error::BillingError;
-        if !self.category.carries_tax() && !self.tax_amount.is_zero() {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} carries no tax, but the breakdown reports {}",
-                    self.category, self.tax_amount
-                ),
-            });
-        }
-        // BR-E-10, BR-AE-10, BR-IC-10, BR-G-10 and BR-O-10 each require "a VAT
-        // exemption reason code (BT-121) OR a VAT exemption reason text (BT-120)" —
-        // the two are alternatives, so demanding the text would reject a lawful
-        // invoice from a caller who holds only the code.
-        if self.category.requires_exemption_reason()
-            && self.exemption_reason.is_none()
-            && self.exemption_reason_code.is_none()
-        {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} requires an exemption reason text (BT-120) \
-                     or reason code (BT-121)",
-                    self.category
-                ),
-            });
-        }
-        // BR-S-10, BR-Z-10, BR-AF-10 and BR-AG-10 forbid *both* ("shall not have a
-        // VAT exemption reason code (BT-121) or VAT exemption reason text
-        // (BT-120)"), so checking only the text would let the code through.
-        if self.category.forbids_exemption_reason()
-            && (self.exemption_reason.is_some() || self.exemption_reason_code.is_some())
-        {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} must not carry an exemption reason text (BT-120) \
-                     or reason code (BT-121)",
-                    self.category
-                ),
-            });
-        }
-        // A (S, 0 %) group is unsatisfiable rather than merely unusual: BR-S-05
-        // forbids a standard-rated line from carrying a zero rate, and BR-S-08
-        // defines this group's BT-116 as the sum of exactly those lines. `Z` is the
-        // category for a supply taxed at zero. `L` and `M` are excluded here —
-        // BR-AF-05 and BR-AG-05 explicitly permit a zero rate — and so is `B`,
-        // which has no rate rule at all.
-        if self.category.requires_positive_rate() && self.rate.is_zero() {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT category {} requires a rate greater than zero (BR-S-05); \
-                     use {} for a supply taxed at zero",
-                    self.category,
-                    TaxCategory::ZeroRated
-                ),
-            });
-        }
-        // BR-CO-17: the tax amount must follow from the base and the rate.
-        //
-        // The CEN Schematron is two branches, and this implements both:
-        //
-        //   round(BT-119) = 0  ⇒  round(BT-117) = 0
-        //   round(BT-119) ≠ 0  ⇒  |abs(BT-117) − round(abs(BT-116) × rate)| < 1.00
-        //
-        // The ±1.00 slack in the second branch is necessary here too: merging two
-        // entries sums amounts that were each rounded to 5 dp, so `Σ(base_i × rate)`
-        // and `(Σbase_i) × rate` can legitimately differ in the last place.
-        //
-        // This crate compares the *signed* difference where the Schematron compares
-        // magnitudes, which is strictly stricter — it additionally catches a tax
-        // that opposes its own base, a state no lawful document reaches and one the
-        // magnitude form would wave through.
-        //
-        // The zero-rate branch is the tighter of the two — `round(x) = 0` means
-        // `|x| < 0.5`, not `< 1` — and it is reachable: `L`, `M` and `B` may carry a
-        // zero rate (BR-AF-05, BR-AG-05, and no BR-B-05 at all) while still levying
-        // tax in general, so `carries_tax()` does not force BT-117 to zero for them.
-        //
-        // Applied at a rate of **exactly** zero, not at "a percentage that rounds to
-        // zero". The Schematron's `round(BT-119)` is a quirk of expressing the branch
-        // in XPath: taken literally it also selects every rate below 0.5 %, and would
-        // then demand a tax of zero on a lawful 0.4 % supply. Where the two readings
-        // differ the crate refuses to reject an arithmetically correct document;
-        // where they agree — a rate of zero — the tighter bound applies.
-        if self.rate.is_zero() {
-            const HALF: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
-            if self.tax_amount.into_decimal().abs() >= HALF {
-                return Err(BillingError::InvalidInput {
-                    reason: format!(
-                        "VAT breakdown inconsistent (BR-CO-17): a rate of 0 % requires \
-                         a tax amount that rounds to zero, got {}",
-                        self.tax_amount
-                    ),
-                });
-            }
-            return Ok(());
-        }
-        let expected = self
-            .taxable_base
-            .into_decimal()
-            .checked_mul(self.rate)
-            .ok_or(BillingError::MonetaryOverflow {
-                precision: 5,
-                input_value: None,
-            })?;
-        // `checked_sub`: `Decimal`'s `-` PANICS on overflow. `expected` is only
-        // bounded by `Decimal::MAX`, so an opposing-signed `tax_amount` can push the
-        // difference out of range — and both operands are attacker-controlled when
-        // this entry arrives from JSON. A difference too large to represent is, of
-        // course, also far outside the tolerance.
-        let diff = match self.tax_amount.into_decimal().checked_sub(expected) {
-            Some(d) => d.abs(),
-            None => Decimal::MAX,
-        };
-        if diff >= Decimal::ONE {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "VAT breakdown inconsistent (BR-CO-17): base {} × rate {} is {}, \
-                     but the reported tax is {}",
-                    self.taxable_base, self.rate, expected, self.tax_amount
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    /// Create a breakdown entry.
-    #[must_use]
-    pub fn new(
+pub enum VatError {
+    /// The rate is not allowed for the category (BR-S-05: > 0; BR-Z-05 and
+    /// siblings: = 0; BR-AF-05/BR-AG-05: ≥ 0).
+    Rate {
+        /// The category.
         category: TaxCategory,
-        rate: Decimal,
-        taxable_base: Amount<5>,
-        tax_amount: Amount<5>,
-    ) -> Self {
-        Self {
-            category,
-            rate,
-            taxable_base,
-            tax_amount,
-            exemption_reason: None,
-            exemption_reason_code: None,
+        /// The refused rate.
+        rate_percent: Percent,
+    },
+    /// The category requires an exemption reason (BR-E-10 and siblings).
+    ExemptionRequired {
+        /// The category.
+        category: TaxCategory,
+    },
+    /// The category forbids an exemption reason (BR-S-10 and siblings).
+    ExemptionForbidden {
+        /// The category.
+        category: TaxCategory,
+    },
+    /// This constructor does not build this category (e.g.
+    /// `Vat::exempt(Standard, …)`).
+    Constructor {
+        /// The category.
+        category: TaxCategory,
+    },
+    /// `O` beside another VAT group (BR-O-11).
+    OutOfScopeMixed,
+    /// `B` beside `S` (BR-B-02).
+    SplitPaymentWithStandard,
+}
+
+impl VatError {
+    pub(crate) fn rule(&self) -> Option<&'static str> {
+        use TaxCategory as C;
+        match self {
+            Self::Rate { category, .. } => match category {
+                C::Standard => Some("BR-S-05"),
+                C::ZeroRated => Some("BR-Z-05"),
+                C::Exempt => Some("BR-E-05"),
+                C::ReverseCharge => Some("BR-AE-05"),
+                C::IntraCommunity => Some("BR-IC-05"),
+                C::Export => Some("BR-G-05"),
+                C::OutOfScope => Some("BR-O-05"),
+                C::CanaryIslands => Some("BR-AF-05"),
+                C::CeutaMelilla => Some("BR-AG-05"),
+                C::SplitPayment => None,
+            },
+            Self::ExemptionRequired { category } => match category {
+                C::Exempt => Some("BR-E-10"),
+                C::ReverseCharge => Some("BR-AE-10"),
+                C::IntraCommunity => Some("BR-IC-10"),
+                C::Export => Some("BR-G-10"),
+                C::OutOfScope => Some("BR-O-10"),
+                _ => None,
+            },
+            Self::ExemptionForbidden { category } => match category {
+                C::Standard => Some("BR-S-10"),
+                C::ZeroRated => Some("BR-Z-10"),
+                C::CanaryIslands => Some("BR-AF-10"),
+                C::CeutaMelilla => Some("BR-AG-10"),
+                _ => None,
+            },
+            Self::Constructor { .. } => None,
+            Self::OutOfScopeMixed => Some("BR-O-11"),
+            Self::SplitPaymentWithStandard => Some("BR-B-02"),
         }
     }
+}
 
-    /// Build an entry from a **tax-inclusive** total, splitting it into BT-116 and
-    /// BT-117.
+impl fmt::Display for VatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rate {
+                category,
+                rate_percent,
+            } => write!(
+                f,
+                "rate {rate_percent} is not allowed for category {category}"
+            ),
+            Self::ExemptionRequired { category } => {
+                write!(f, "category {category} requires an exemption reason")
+            }
+            Self::ExemptionForbidden { category } => {
+                write!(f, "category {category} must not state an exemption reason")
+            }
+            Self::Constructor { category } => {
+                write!(f, "category {category} is not built by this constructor")
+            }
+            Self::OutOfScopeMixed => {
+                f.write_str("category O must be the only vat group of a document (BR-O-11)")
+            }
+            Self::SplitPaymentWithStandard => {
+                f.write_str("category B must not appear beside category S (BR-B-02)")
+            }
+        }
+    }
+}
+
+fn vat_err(e: VatError) -> Error {
+    ErrorKind::InvalidVat(e).into()
+}
+
+/// The VAT treatment of a line, allowance or charge: category (BT-151), rate
+/// as a [`Percent`] (BT-152) and exemption reason (BT-120/121).
+///
+/// Built only through validating constructors, so every `Vat` satisfies its
+/// category's rate and reason rules. The rate is stored normalised (`19.00` →
+/// `19`).
+///
+/// ```
+/// use billing::{Exemption, Percent, TaxCategory, Vat};
+/// use rust_decimal::dec;
+///
+/// let s = Vat::standard(Percent::new(dec!(19)))?;
+/// assert_eq!(s.rate_percent(), Percent::new(dec!(19)));
+/// assert!(Vat::standard(Percent::ZERO).is_err()); // BR-S-05
+///
+/// let ae = Vat::exempt(TaxCategory::ReverseCharge, Exemption::Code("VATEX-EU-AE".into()))?;
+/// assert_eq!(ae.rate_percent(), Percent::ZERO);
+/// # Ok::<(), billing::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "VatRepr", into = "VatRepr"))]
+pub struct Vat {
+    category: TaxCategory,
+    rate_percent: Decimal,
+    exemption: Option<Exemption>,
+}
+
+impl Vat {
+    /// The single gate: every `Vat` (constructors and serde) passes here.
+    fn checked(
+        category: TaxCategory,
+        rate_percent: Decimal,
+        exemption: Option<Exemption>,
+    ) -> Result<Self> {
+        let rate_percent = rate_percent.normalize();
+        let rate_ok = match category {
+            TaxCategory::Standard => rate_percent > Decimal::ZERO,
+            TaxCategory::CanaryIslands | TaxCategory::CeutaMelilla | TaxCategory::SplitPayment => {
+                !rate_percent.is_sign_negative() || rate_percent.is_zero()
+            }
+            _ => rate_percent.is_zero(),
+        };
+        if !rate_ok {
+            return Err(vat_err(VatError::Rate {
+                category,
+                rate_percent: Percent::new(rate_percent),
+            }));
+        }
+        // A negative zero would serialise as "-0"; there is one zero.
+        let rate_percent = if rate_percent.is_zero() {
+            Decimal::ZERO
+        } else {
+            rate_percent
+        };
+        let blank = exemption.as_ref().is_none_or(Exemption::is_blank);
+        if category.needs_exemption() && blank {
+            return Err(vat_err(VatError::ExemptionRequired { category }));
+        }
+        if category.forbids_exemption() && exemption.is_some() {
+            return Err(vat_err(VatError::ExemptionForbidden { category }));
+        }
+        Ok(Self {
+            category,
+            rate_percent,
+            exemption,
+        })
+    }
+
+    /// `S` at `rate` (BT-152). The rate is a [`Percent`], so its unit is never
+    /// guessed: Corsica's 0.9 % is as expressible as 19 %.
     ///
-    /// The consumer-pricing case: a catalogue quoted gross (§1 PAngV in Germany, and
-    /// the equivalent almost everywhere else) still has to be invoiced net, because
-    /// EN 16931's whole totals chain is net and BR-CO-17 derives BT-117 from BT-116.
-    /// This does that split once, at the boundary:
-    ///
-    /// ```text
-    /// BT-117 = round(gross × rate ÷ (1 + rate))     ← the "VAT fraction", 19/119
-    /// BT-116 = gross − BT-117                       ← the remainder, so the two re-sum
     /// ```
-    ///
-    /// Deriving the base as the remainder rather than rounding it separately is what
-    /// keeps `BT-116 + BT-117` equal to the gross the customer was quoted — the
-    /// figure the price tag promised, and the one a rounding of both halves would
-    /// miss by a cent.
-    ///
-    /// # The scale is the interchange scale, and it rounds once
-    ///
-    /// `scale` is where the tax lands, and the exact product is rounded **once**, at
-    /// that precision — never at the engine's five decimals and then again on the way
-    /// out. On a gross of `9.99` at 19 % the exact tax is `1.59504`: rounding once to
-    /// two decimals gives `1.60`, while reducing the five-decimal answer afterwards
-    /// gives the same here and a different figure elsewhere. EN 16931 makes the
-    /// single rounding the required behaviour — BR-CO-17 defines BT-117 as the
-    /// rounded product, and a validator recomputes it exactly that way.
-    ///
-    /// Both results are therefore already at `scale`, so a document assembled with
-    /// [`amount_scale`](crate::BillingDocumentBuilder::amount_scale) at the same
-    /// precision leaves them untouched. Pass `AmountScale::new(5, …)` to stay at the
-    /// engine's own precision.
-    ///
-    /// ```rust
-    /// use billing::{Amount, AmountScale, TaxBreakdownEntry, TaxCategory};
+    /// use billing::{Percent, Vat};
     /// use rust_decimal::dec;
     ///
-    /// // A shelf price of 9,99 € including 19 % VAT.
-    /// let entry = TaxBreakdownEntry::from_gross(
-    ///     TaxCategory::Standard, dec!(0.19),
-    ///     Amount::parse("9.99000")?, AmountScale::EN16931,
-    /// )?;
+    /// assert_eq!(Vat::standard(Percent::new(dec!(19)))?.rate_percent(), Percent::new(dec!(19)));
+    /// assert_eq!(Vat::standard(Percent::new(dec!(0.9)))?.rate_percent().to_string(), "0.9 %");
+    /// # Ok::<(), billing::Error>(())
+    /// ```
     ///
-    /// assert_eq!(entry.taxable_base, Amount::parse("8.39000")?); // BT-116
-    /// assert_eq!(entry.tax_amount,   Amount::parse("1.60000")?); // BT-117
-    /// assert!(entry.validate().is_ok());                         // BR-CO-17 holds
-    /// // Nothing is lost: the two still add up to the price on the tag.
-    /// assert_eq!(entry.taxable_base.checked_add(entry.tax_amount)?, Amount::parse("9.99000")?);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// A bare number is not a percentage and does not compile:
+    ///
+    /// ```compile_fail
+    /// use billing::Vat;
+    /// use rust_decimal::dec;
+    ///
+    /// let _ = Vat::standard(dec!(19));
     /// ```
     ///
     /// # Errors
-    /// [`crate::BillingError::InvalidInput`] if `rate` is negative, or
-    /// [`crate::BillingError::MonetaryOverflow`] on overflow. The category rules are
-    /// **not** checked here, exactly as in [`TaxBreakdownEntry::new`] — attach an
-    /// exemption reason first, then call [`validate`](Self::validate).
-    pub fn from_gross(
-        category: TaxCategory,
-        rate: Decimal,
-        gross: Amount<5>,
-        scale: crate::amount::AmountScale,
-    ) -> Result<Self, crate::error::BillingError> {
-        let exact = crate::amount::exact_tax_in_gross(gross.into_decimal(), rate)?;
-        let tax_amount = scale.apply_decimal(exact)?;
-        let taxable_base = gross.checked_sub(tax_amount)?;
-        Ok(Self::new(category, rate, taxable_base, tax_amount))
+    /// [`ErrorKind::InvalidVat`] unless the rate is above zero (BR-S-05).
+    pub fn standard(rate: Percent) -> Result<Self> {
+        Self::checked(TaxCategory::Standard, rate.value(), None)
     }
 
-    /// Attach the BT-120 exemption reason text.
+    /// `Z`: zero rated, no exemption reason (BR-Z-10).
     #[must_use]
-    pub fn with_exemption_reason(mut self, reason: impl Into<String>) -> Self {
-        self.exemption_reason = Some(reason.into());
-        self
+    pub fn zero_rated() -> Self {
+        Self {
+            category: TaxCategory::ZeroRated,
+            rate_percent: Decimal::ZERO,
+            exemption: None,
+        }
     }
 
-    /// Attach the BT-121 exemption reason code (CEF VATEX).
+    /// `E`, `AE`, `K`, `G` or `O` at rate 0 with the reason `why`. For `O` the
+    /// rate is not stated on the line ([`TaxCategory::states_rate`]).
     ///
-    /// Satisfies BR-E-10 / BR-AE-10 / BR-IC-10 / BR-G-10 / BR-O-10 on its own —
-    /// the text is not additionally required.
-    ///
-    /// ```rust
-    /// use billing::{TaxBreakdownEntry, TaxCategory, Amount};
-    /// use rust_decimal::Decimal;
-    ///
-    /// // Reverse charge stated by code alone, with no invented prose.
-    /// let e = TaxBreakdownEntry::new(
-    ///     TaxCategory::ReverseCharge, Decimal::ZERO, Amount::ZERO, Amount::ZERO,
-    /// ).with_exemption_reason_code("VATEX-EU-AE");
-    /// assert!(e.validate().is_ok());
-    /// ```
-    #[must_use]
-    pub fn with_exemption_reason_code(mut self, code: impl Into<String>) -> Self {
-        self.exemption_reason_code = Some(code.into());
-        self
+    /// # Errors
+    /// [`ErrorKind::InvalidVat`] for another category or a blank reason.
+    pub fn exempt(category: TaxCategory, why: Exemption) -> Result<Self> {
+        if !category.needs_exemption() {
+            return Err(vat_err(VatError::Constructor { category }));
+        }
+        Self::checked(category, Decimal::ZERO, Some(why))
     }
 
-    /// Whether this entry states an exemption reason in either form —
-    /// BT-120 text or BT-121 code.
-    #[must_use]
-    pub fn has_exemption_reason(&self) -> bool {
-        self.exemption_reason.is_some() || self.exemption_reason_code.is_some()
+    /// `L`, `M` or `B` at `rate` (≥ 0).
+    ///
+    /// # Errors
+    /// [`ErrorKind::InvalidVat`] for another category or a negative rate.
+    pub fn regional(category: TaxCategory, rate: Percent) -> Result<Self> {
+        if !matches!(
+            category,
+            TaxCategory::CanaryIslands | TaxCategory::CeutaMelilla | TaxCategory::SplitPayment
+        ) {
+            return Err(vat_err(VatError::Constructor { category }));
+        }
+        Self::checked(category, rate.value(), None)
     }
 
-    /// The rate formatted as a percentage with trailing zeros stripped
-    /// (`0.19` → `"19"`, `0.075` → `"7.5"`).
+    /// The category (BT-151).
     #[must_use]
-    pub fn rate_percent(&self) -> Decimal {
-        self.rate
-            .checked_mul(Decimal::ONE_HUNDRED)
-            .map(|d| d.normalize())
-            .unwrap_or(self.rate)
+    pub fn category(&self) -> TaxCategory {
+        self.category
     }
+
+    /// The rate (BT-152); 0 % for the zero-tax categories and `O`.
+    #[must_use]
+    pub fn rate_percent(&self) -> Percent {
+        Percent::new(self.rate_percent)
+    }
+
+    /// The rate as a line states it: `None` for `O` (BR-O-05).
+    #[must_use]
+    pub fn stated_rate(&self) -> Option<Percent> {
+        self.category
+            .states_rate()
+            .then_some(Percent::new(self.rate_percent))
+    }
+
+    /// The exemption reason, if any.
+    #[must_use]
+    pub fn exemption(&self) -> Option<&Exemption> {
+        self.exemption.as_ref()
+    }
+
+    /// The BG-23 grouping key: category and rate.
+    pub(crate) fn key(&self) -> (TaxCategory, Decimal) {
+        (self.category, self.rate_percent)
+    }
+
+    /// `round(base × rate / 100)` at `scale`, once, exactly.
+    pub(crate) fn tax_on(&self, base: Amount, scale: AmountScale) -> Result<Amount> {
+        reduce_exact(
+            &[base.to_decimal(), self.rate_percent],
+            &[Decimal::ONE_HUNDRED],
+            scale,
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VatRepr {
+    category: TaxCategory,
+    #[serde(with = "crate::decimal::serde_str")]
+    rate_percent: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exemption: Option<Exemption>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<VatRepr> for Vat {
+    type Error = Error;
+    fn try_from(r: VatRepr) -> Result<Self> {
+        Self::checked(r.category, r.rate_percent, r.exemption)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<Vat> for VatRepr {
+    fn from(v: Vat) -> Self {
+        Self {
+            category: v.category,
+            rate_percent: v.rate_percent,
+            exemption: v.exemption,
+        }
+    }
+}
+
+/// One row of the VAT breakdown (BG-23): the group's [`Vat`], taxable amount
+/// (BT-116) and tax (BT-117). Derived by [`Document`](crate::Document) (or
+/// [`EarlyPaymentDiscount::vat_correction`](crate::EarlyPaymentDiscount::vat_correction));
+/// read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VatGroup {
+    vat: Vat,
+    taxable_base: Amount,
+    tax: Amount,
+}
+
+impl VatGroup {
+    pub(crate) fn new(vat: Vat, taxable_base: Amount, tax: Amount) -> Self {
+        Self {
+            vat,
+            taxable_base,
+            tax,
+        }
+    }
+
+    /// The group's VAT treatment.
+    #[must_use]
+    pub fn vat(&self) -> &Vat {
+        &self.vat
+    }
+
+    /// BT-118.
+    #[must_use]
+    pub fn category(&self) -> TaxCategory {
+        self.vat.category
+    }
+
+    /// BT-119 (stated for every category, `O` included: it is 0 %).
+    #[must_use]
+    pub fn rate_percent(&self) -> Percent {
+        Percent::new(self.vat.rate_percent)
+    }
+
+    /// BT-120/121.
+    #[must_use]
+    pub fn exemption(&self) -> Option<&Exemption> {
+        self.vat.exemption.as_ref()
+    }
+
+    /// BT-116.
+    #[must_use]
+    pub fn taxable_base(&self) -> Amount {
+        self.taxable_base
+    }
+
+    /// BT-117.
+    #[must_use]
+    pub fn tax(&self) -> Amount {
+        self.tax
+    }
+
+    pub(crate) fn negated(&self) -> Self {
+        Self::new(self.vat.clone(), -self.taxable_base, -self.tax)
+    }
+}
+
+/// Split a tax-inclusive `gross` into `(net, tax)` at `scale`:
+/// `tax = round(gross × r / (100 + r))` once, exactly, and `net = gross − tax`, so
+/// the two re-add to `gross` exactly.
+///
+/// ```
+/// use billing::{AmountScale, Percent, Vat, split_gross};
+/// use rust_decimal::dec;
+///
+/// let (net, tax) = split_gross(dec!(9.99), &Vat::standard(Percent::new(dec!(19)))?, AmountScale::EN16931)?;
+/// assert_eq!((net.to_string().as_str(), tax.to_string().as_str()), ("8.39000", "1.60000"));
+/// # Ok::<(), billing::Error>(())
+/// ```
+///
+/// # Errors
+/// [`ErrorKind::ExcessPrecision`] if `gross` does not fit `scale`;
+/// [`ErrorKind::Overflow`].
+pub fn split_gross(gross: Decimal, vat: &Vat, scale: AmountScale) -> Result<(Amount, Amount)> {
+    let g = Amount::from_decimal(gross)?;
+    if !g.fits(scale.decimals) {
+        return Err(ErrorKind::ExcessPrecision {
+            value: gross,
+            decimals: scale.decimals,
+        }
+        .into());
+    }
+    let r = vat.rate_percent;
+    let tax = reduce_exact(
+        &[gross, r],
+        &[Decimal::ONE_HUNDRED
+            .checked_add(r)
+            .ok_or(ErrorKind::Overflow)?],
+        scale,
+    )?;
+    Ok((g.checked_sub(tax)?, tax))
+}
+
+/// `round(Π num / Π den)` at `scale`, exactly: integer arithmetic on the
+/// mantissas, one rounding. [`ErrorKind::Overflow`] past `i128`,
+/// [`ErrorKind::DivisionByZero`] for a zero denominator.
+pub(crate) fn reduce_exact(num: &[Decimal], den: &[Decimal], scale: AmountScale) -> Result<Amount> {
+    units_to_amount(units_exact(num, den, scale)?, scale)
+}
+
+/// [`reduce_exact`] as a count of `10^-decimals` units.
+pub(crate) fn units_exact(num: &[Decimal], den: &[Decimal], scale: AmountScale) -> Result<i128> {
+    let overflow = || Error::from(ErrorKind::Overflow);
+    let product = |ds: &[Decimal]| -> Result<(i128, u32)> {
+        let mut m: i128 = 1;
+        let mut s: u32 = 0;
+        for d in ds {
+            let d = d.normalize();
+            m = m.checked_mul(d.mantissa()).ok_or_else(overflow)?;
+            s += d.scale();
+        }
+        Ok((m, s))
+    };
+    let (n, ns) = product(num)?;
+    let (q, qs) = product(den)?;
+    units_ratio((n, ns), (q, qs), scale)
+}
+
+/// `round((n / 10^ns) / (q / 10^qs))` in units of `10^-decimals`, exactly:
+/// one integer division, one rounding.
+pub(crate) fn units_ratio(n: (i128, u32), q: (i128, u32), scale: AmountScale) -> Result<i128> {
+    let decimals = scale.check()?;
+    crate::decimal::ratio_units(n, q, u32::from(decimals), scale.rounding)
+}
+
+/// Units at `scale` as an `Amount`.
+pub(crate) fn units_to_amount(units: i128, scale: AmountScale) -> Result<Amount> {
+    let d = Decimal::try_from_i128_with_scale(units, u32::from(scale.decimals))
+        .map_err(|_| ErrorKind::Overflow)?;
+    Amount::from_decimal(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Rounding;
+    use alloc::string::ToString;
+    use rust_decimal::dec;
+
+    /// Every row of the `VatError` rule table, the category predicates, the
+    /// category code as `Display`, and every `VatError` message shape.
+    #[test]
+    fn every_vat_error_maps_to_its_rule() {
+        use TaxCategory as C;
+        let required = [
+            (C::Exempt, Some("BR-E-10")),
+            (C::ReverseCharge, Some("BR-AE-10")),
+            (C::IntraCommunity, Some("BR-IC-10")),
+            (C::Export, Some("BR-G-10")),
+            (C::OutOfScope, Some("BR-O-10")),
+            (C::Standard, None),
+        ];
+        for (category, rule) in required {
+            assert_eq!(
+                VatError::ExemptionRequired { category }.rule(),
+                rule,
+                "{category:?}"
+            );
+        }
+        let forbidden = [
+            (C::Standard, Some("BR-S-10")),
+            (C::ZeroRated, Some("BR-Z-10")),
+            (C::CanaryIslands, Some("BR-AF-10")),
+            (C::CeutaMelilla, Some("BR-AG-10")),
+            (C::Exempt, None),
+        ];
+        for (category, rule) in forbidden {
+            assert_eq!(
+                VatError::ExemptionForbidden { category }.rule(),
+                rule,
+                "{category:?}"
+            );
+        }
+        let rate = [
+            (C::Standard, Some("BR-S-05")),
+            (C::ZeroRated, Some("BR-Z-05")),
+            (C::Exempt, Some("BR-E-05")),
+            (C::ReverseCharge, Some("BR-AE-05")),
+            (C::IntraCommunity, Some("BR-IC-05")),
+            (C::Export, Some("BR-G-05")),
+            (C::OutOfScope, Some("BR-O-05")),
+            (C::CanaryIslands, Some("BR-AF-05")),
+            (C::CeutaMelilla, Some("BR-AG-05")),
+            (C::SplitPayment, None),
+        ];
+        for (category, rule) in rate {
+            let e = VatError::Rate {
+                category,
+                rate_percent: Percent::new(dec!(1)),
+            };
+            assert_eq!(e.rule(), rule, "{category:?}");
+            let shown = e.to_string();
+            assert!(
+                shown.starts_with(|c: char| c.is_ascii_lowercase()),
+                "{shown}"
+            );
+        }
+        for e in [
+            VatError::ExemptionRequired {
+                category: C::Exempt,
+            },
+            VatError::ExemptionForbidden {
+                category: C::Standard,
+            },
+            VatError::OutOfScopeMixed,
+            VatError::SplitPaymentWithStandard,
+        ] {
+            let shown = e.to_string();
+            assert!(
+                shown.starts_with(|c: char| c.is_ascii_lowercase()),
+                "{shown}"
+            );
+        }
+        for c in TaxCategory::ALL {
+            assert_eq!(c.to_string(), c.code());
+            assert_eq!(c.states_rate(), c != C::OutOfScope, "{c:?}");
+            let taxed = matches!(
+                c,
+                C::Standard | C::CanaryIslands | C::CeutaMelilla | C::SplitPayment
+            );
+            assert_eq!(c.carries_tax(), taxed, "{c:?}");
+        }
+        let s = Vat::standard(Percent::new(dec!(19))).unwrap();
+        assert_eq!(s.stated_rate(), Some(Percent::new(dec!(19))));
+        let why = Exemption::Text("§4".into());
+        let e = Vat::exempt(C::Exempt, why.clone()).unwrap();
+        let g = VatGroup::new(e, Amount::ZERO, Amount::ZERO);
+        assert_eq!(g.exemption(), Some(&why));
+        assert_eq!(
+            VatGroup::new(s, Amount::ZERO, Amount::ZERO).exemption(),
+            None
+        );
+    }
 
     #[test]
-    fn code_roundtrip() {
+    fn codes_round_trip_and_rules_map() {
         for c in TaxCategory::ALL {
             assert_eq!(TaxCategory::from_code(c.code()), Some(c));
         }
-        assert_eq!(TaxCategory::from_code("nonsense"), None);
-    }
-
-    /// BR-CL-17 / BR-CL-18 permit exactly these ten codes, and no others.
-    #[test]
-    fn all_matches_the_uncl_5305_subset_br_cl_17_permits() {
-        let mut codes: Vec<&str> = TaxCategory::ALL.iter().map(TaxCategory::code).collect();
-        codes.sort_unstable();
-        let mut expected = ["AE", "L", "M", "E", "S", "Z", "G", "O", "K", "B"];
-        expected.sort_unstable();
-        assert_eq!(codes, expected);
-    }
-
-    /// `B` is the one category where neither exemption-reason predicate holds —
-    /// the artefacts contain no BR-B-10 requiring a reason and none forbidding one.
-    /// Every *other* category satisfies exactly one of the two.
-    #[test]
-    fn split_payment_is_the_only_category_with_neither_reason_rule() {
-        for c in TaxCategory::ALL {
-            let n = usize::from(c.requires_exemption_reason())
-                + usize::from(c.forbids_exemption_reason());
-            if c == TaxCategory::SplitPayment {
-                assert_eq!(n, 0, "B must be governed by neither rule");
-            } else {
-                assert_eq!(n, 1, "{c} must be governed by exactly one rule");
-            }
-        }
-    }
-
-    /// Split payment is taxed at the normal rate — there is no BR-B-09 forcing
-    /// BT-117 to zero, unlike the other "someone else pays" category, `AE`.
-    #[test]
-    fn split_payment_carries_tax_unlike_reverse_charge() {
-        assert!(TaxCategory::SplitPayment.carries_tax());
-        assert!(!TaxCategory::ReverseCharge.carries_tax());
-
-        let entry = TaxBreakdownEntry::new(
-            TaxCategory::SplitPayment,
-            Decimal::from_str_exact("0.22").unwrap(),
-            Amount::parse("1000.00000").unwrap(),
-            Amount::parse("220.00000").unwrap(),
-        );
-        assert!(
-            entry.validate().is_ok(),
-            "B must be allowed a non-zero BT-117"
-        );
-    }
-
-    /// BR-S-05 demands a rate above zero; BR-AF-05 and BR-AG-05 explicitly allow
-    /// zero, and `B` has no rate rule at all.
-    #[test]
-    fn only_standard_requires_a_positive_rate() {
-        use rust_decimal::dec;
-        assert!(LineVat::new(TaxCategory::Standard, dec!(0)).is_err());
-        assert!(LineVat::new(TaxCategory::CanaryIslands, dec!(0)).is_ok());
-        assert!(LineVat::new(TaxCategory::CeutaMelilla, dec!(0)).is_ok());
-        assert!(LineVat::new(TaxCategory::SplitPayment, dec!(0)).is_ok());
-        assert!(LineVat::new(TaxCategory::SplitPayment, dec!(0.22)).is_ok());
-        // Zero-tax categories must not carry a rate (BR-Z-05 and siblings).
-        for c in TaxCategory::ALL.into_iter().filter(|c| !c.carries_tax()) {
-            assert!(
-                LineVat::new(c, dec!(0.19)).is_err(),
-                "{c} must reject a rate"
-            );
-            assert!(LineVat::new(c, dec!(0)).is_ok());
-        }
-    }
-
-    #[test]
-    fn exemption_reason_required_only_for_zero_tax_categories() {
-        assert!(!TaxCategory::Standard.requires_exemption_reason());
-        assert!(!TaxCategory::CanaryIslands.requires_exemption_reason());
-        assert!(TaxCategory::Exempt.requires_exemption_reason());
-        assert!(TaxCategory::ReverseCharge.requires_exemption_reason());
-        assert!(TaxCategory::Export.requires_exemption_reason());
-    }
-
-    #[test]
-    fn zero_rated_and_exempt_differ_on_the_reason_requirement() {
-        // Both carry zero tax, but Z forbids a reason and E requires one.
-        assert!(!TaxCategory::ZeroRated.carries_tax());
-        assert!(!TaxCategory::Exempt.carries_tax());
-        assert!(TaxCategory::ZeroRated.forbids_exemption_reason());
-        assert!(!TaxCategory::ZeroRated.requires_exemption_reason());
-        assert!(TaxCategory::Exempt.requires_exemption_reason());
-        assert!(!TaxCategory::Exempt.forbids_exemption_reason());
-    }
-
-    #[test]
-    fn group_key_normalises_trailing_zeros() {
-        let a = TaxBreakdownEntry::new(
-            TaxCategory::Standard,
-            Decimal::from_str_exact("0.19").unwrap(),
-            Amount::ZERO,
-            Amount::ZERO,
-        );
-        let b = TaxBreakdownEntry::new(
-            TaxCategory::Standard,
-            Decimal::from_str_exact("0.1900").unwrap(),
-            Amount::ZERO,
-            Amount::ZERO,
-        );
-        assert_eq!(
-            a.group_key(),
-            b.group_key(),
-            "0.19 and 0.1900 are one group"
-        );
-    }
-
-    #[test]
-    fn validate_enforces_category_rules() {
-        let taxed = Amount::<5>::parse("19.00000").unwrap();
-        // Zero-tax category with a non-zero amount.
-        let bad = TaxBreakdownEntry::new(
-            TaxCategory::ReverseCharge,
-            Decimal::ZERO,
-            Amount::ZERO,
-            taxed,
-        );
-        assert!(bad.validate().is_err());
-        // Missing required reason.
-        let bad = TaxBreakdownEntry::new(
-            TaxCategory::Exempt,
-            Decimal::ZERO,
-            Amount::ZERO,
-            Amount::ZERO,
-        );
-        assert!(bad.validate().is_err());
-        assert!(bad.with_exemption_reason("Art. 132").validate().is_ok());
-        // Forbidden reason present.
-        let bad = TaxBreakdownEntry::new(
-            TaxCategory::Standard,
-            Decimal::from_str_exact("0.19").unwrap(),
-            Amount::ZERO,
-            Amount::ZERO,
-        )
-        .with_exemption_reason("nope");
-        assert!(bad.validate().is_err());
-    }
-
-    #[test]
-    fn a_negative_rate_is_refused_but_a_negative_zero_is_not() {
-        // `Decimal` has a signed zero: `-0.00` reports `is_sign_negative()` and
-        // is still zero. A reverse-charge line built by negating a 0 % rate lands
-        // on exactly that, so the sign check has to exempt it — while still
-        // refusing a rate that is genuinely below zero.
-        //
-        // `L` (Canary Islands) is the category that makes the two separable: it
-        // permits a zero rate, so the negative check is the only thing standing
-        // between it and a rate of -5 %.
-        assert!(LineVat::new(TaxCategory::CanaryIslands, Decimal::ZERO).is_ok());
-        assert!(LineVat::new(TaxCategory::CanaryIslands, -Decimal::ZERO).is_ok());
-        assert!(
-            LineVat::new(
-                TaxCategory::CanaryIslands,
-                Decimal::from_str_exact("-0.05").unwrap()
-            )
-            .is_err(),
-            "a negative rate must be refused"
-        );
-        assert!(
-            LineVat::new(
-                TaxCategory::CanaryIslands,
-                Decimal::from_str_exact("-0.000").unwrap()
-            )
-            .is_ok(),
-            "a signed zero is still zero"
-        );
-    }
-
-    #[test]
-    fn a_rate_renders_as_a_percentage_without_trailing_zeros() {
-        // BT-119 goes on the wire as a percentage, not a fraction: 19, not 0.19.
-        // The trailing zeros matter too — `19.00` and `19` are the same number
-        // but not the same string, and a validator comparing BT-119 against a
-        // code list sees the string.
-        let cases = [
-            ("0.19", "19"),
-            ("0.075", "7.5"),
-            ("0.07", "7"),
-            ("0", "0"),
-            ("0.190", "19"),
-            ("1", "100"),
-            ("0.0025", "0.25"),
-        ];
-        for (rate, expected) in cases {
-            let entry = TaxBreakdownEntry::new(
-                TaxCategory::Standard,
-                Decimal::from_str_exact(rate).unwrap(),
-                Amount::ZERO,
-                Amount::ZERO,
-            );
-            assert_eq!(
-                entry.rate_percent().to_string(),
-                expected,
-                "rate {rate} must render as {expected}"
-            );
-        }
-
-        // `LineVat` renders the same figure, with its category, for a line label.
-        let vat = LineVat::new(
-            TaxCategory::Standard,
-            Decimal::from_str_exact("0.19").unwrap(),
+        assert_eq!(TaxCategory::from_code("Q"), None);
+        let e = Vat::standard(Percent::ZERO).unwrap_err();
+        assert_eq!(e.rule(), Some("BR-S-05"));
+        let e = Vat::exempt(TaxCategory::Exempt, Exemption::Text(" ".into())).unwrap_err();
+        assert_eq!(e.rule(), Some("BR-E-10"));
+        let e = Vat::exempt(TaxCategory::Standard, Exemption::Text("x".into())).unwrap_err();
+        assert_eq!(e.rule(), None);
+        assert!(Vat::regional(TaxCategory::CanaryIslands, Percent::ZERO).is_ok());
+        assert!(Vat::regional(TaxCategory::CeutaMelilla, Percent::new(dec!(-1))).is_err());
+        assert!(Vat::regional(TaxCategory::Standard, Percent::new(dec!(1))).is_err());
+        let o = Vat::exempt(
+            TaxCategory::OutOfScope,
+            Exemption::Code("VATEX-EU-O".into()),
         )
         .unwrap();
-        assert_eq!(vat.to_string(), "S 19%");
-        assert_eq!(vat.rate_percent().to_string(), "19");
+        assert_eq!(o.stated_rate(), None);
         assert_eq!(
-            LineVat::new(TaxCategory::ReverseCharge, Decimal::ZERO)
+            Vat::standard(Percent::new(dec!(19.00)))
                 .unwrap()
+                .rate_percent()
                 .to_string(),
-            "AE 0%"
+            "19 %"
+        );
+        assert!(
+            Vat::checked(
+                TaxCategory::Standard,
+                dec!(19),
+                Some(Exemption::Text("x".into()))
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn has_exemption_reason_reports_either_form_and_neither() {
-        // BR-E-10 and its siblings accept BT-120 *or* BT-121, so this predicate
-        // has to see both — and it has to be able to say no, which is what makes
-        // the "reason required" rules enforceable at all.
-        let bare = TaxBreakdownEntry::new(
-            TaxCategory::Standard,
-            Decimal::from_str_exact("0.19").unwrap(),
-            Amount::ZERO,
-            Amount::ZERO,
+    fn reduce_exact_rounds_once() {
+        let s = AmountScale::EN16931;
+        // 1/3 → 0.33; 2/3 → 0.67; −2/3 → −0.67
+        assert_eq!(
+            reduce_exact(&[dec!(1)], &[dec!(3)], s).unwrap().to_string(),
+            "0.33000"
         );
-        assert!(!bare.has_exemption_reason());
+        assert_eq!(
+            reduce_exact(&[dec!(-2)], &[dec!(3)], s)
+                .unwrap()
+                .to_string(),
+            "-0.67000"
+        );
+        assert_eq!(
+            reduce_exact(&[dec!(2)], &[dec!(-3)], s)
+                .unwrap()
+                .to_string(),
+            "-0.67000"
+        );
+        let t = AmountScale::new(2, Rounding::TowardZero).unwrap();
+        assert_eq!(
+            reduce_exact(&[dec!(0.004999)], &[], t).unwrap(),
+            Amount::ZERO
+        );
+        assert_eq!(
+            reduce_exact(&[dec!(1)], &[dec!(0)], s).unwrap_err().kind(),
+            &ErrorKind::DivisionByZero
+        );
+    }
 
-        assert!(
-            bare.clone()
-                .with_exemption_reason("Art. 132")
-                .has_exemption_reason()
-        );
-        assert!(
-            bare.clone()
-                .with_exemption_reason_code("VATEX-EU-132")
-                .has_exemption_reason()
-        );
-        assert!(
-            bare.with_exemption_reason("Art. 132")
-                .with_exemption_reason_code("VATEX-EU-132")
-                .has_exemption_reason()
-        );
+    #[test]
+    fn split_gross_reconstructs() {
+        let v = Vat::standard(Percent::new(dec!(19))).unwrap();
+        let (n, t) = split_gross(dec!(119), &v, AmountScale::EN16931).unwrap();
+        assert_eq!((n.to_decimal(), t.to_decimal()), (dec!(100), dec!(19)));
+        assert!(split_gross(dec!(1.001), &v, AmountScale::EN16931).is_err());
+        let (n, t) = split_gross(dec!(5), &Vat::zero_rated(), AmountScale::EN16931).unwrap();
+        assert_eq!((n.to_decimal(), t), (dec!(5), Amount::ZERO));
     }
 }

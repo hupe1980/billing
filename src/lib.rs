@@ -1,326 +1,42 @@
-//! # billing — a domain-agnostic invoice and usage-billing engine
-//!
-//! `billing` is a **pure, domain-agnostic, dependency-minimal** calculation engine.
-//! It knows nothing about energy, jurisdictions, or currencies beyond an ISO 4217
-//! label. All domain knowledge lives in the *caller*.
-//!
-//! ## Core concepts
-//!
-//! | Type / Function | Purpose |
-//! |-----------------|---------|
-//! | [`Amount<P>`] | Fixed-point monetary arithmetic with compile-time precision (`P` ≤ 18) |
-//! | [`Currency`] | ISO 4217 code for generated labels and cross-document checks |
-//! | [`LineItem`] | Atomic billing unit: quantity × unit-price → net amount |
-//! | [`Period`] | Billing period — construct from strings or any `Display` type |
-//! | [`RateSchedule`] | Graduated / volume / block / capacity pricing |
-//! | [`TimeOfUsePricing`] | N-band time-of-use pricing (peak / off-peak / …) |
-//! | [`DynamicPricing`] | Per-interval price sequence (spot, real-time) |
-//! | [`UsageAggregator`] | Pre-billing event aggregation (SUM / MAX / MEAN / PERCENTILE / …) |
-//! | [`TaxLayer`] | Composable tax and surcharge overlays |
-//! | [`DiscountLayer`] | Composable discount overlays |
-//! | [`PricingModel`] | The extension point: usage in, priced positions and layers out |
-//! | [`Billing`] | Three outcomes: billable, not billable (with a domain reason), error |
-//! | [`BillingDocument`] | Self-validating invoice with ordered positions + totals |
-//! | [`AmountScale`] | Assemble every amount at an interchange format's decimal limit |
-//! | [`VatAccountingCurrency`] | EN 16931 BT-6 / BT-111 — the VAT total in the reporting currency |
-//! | [`PaymentTerms`] | EN 16931 BT-20 — free text plus structured early-payment discounts |
-//! | [`EarlyPaymentDiscount`] | Skonto: the BR-DE-18 `#SKONTO#…#` syntax, and what the buyer pays |
-//! | [`LatePaymentPenalty`] | Verzugszinsen: simple interest plus the art. 6 recovery fee |
-//! | [`DocumentMeta`] | Invoice header with `labels` bag for domain annotations |
-//! | [`PrecedingInvoice`] | EN 16931 BG-3 — what a credit note credits, filled in by `reverse` |
-//! | [`LineVat`] | Per-position VAT category + rate (EN 16931 BT-151/152, BT-95/96, BT-102/103) |
-//! | [`AllocationRule`] | Proportional split of a [`BillingDocument`] across N recipients |
-//! | [`proportional_split`] | Penny-correct Hamilton split of a raw `Decimal` quantity |
-//! | [`RateLookup`] | Parameter-keyed rate table (installed capacity → rate) |
-//!
-//! ## Which EN 16931, and checked against what
-//!
-//! There are now two editions, and they are not compatible. This crate targets
-//! **EN 16931-1:2017+A1:2019** — the edition every deployed CIUS implements today.
-//!
-//! Every rule cited anywhere in this crate is verified against the *validation
-//! artefacts*, not against prose or recollection, and both are pinned:
-//!
-//! | Source | Pinned at | Supplies |
-//! |---|---|---|
-//! | `ConnectingEurope/eInvoicing-EN16931` | tag `validation-1.3.16` | `BR-*`, `BR-CO-*`, `BR-CL-*`, `BR-DEC-*` |
-//! | `OpenPEPPOL/peppol-bis-invoice-3` | tag `v3.0.20` | `PEPPOL-EN16931-*`, the `P01xx` profile rules |
-//!
-//! Where the two disagree with a plain reading of the standard, the artefact wins,
-//! because it is what a validator runs — and where an artefact's own expression of
-//! a rule would reject an arithmetically correct document, this crate says so and
-//! declines (see [`TaxBreakdownEntry::validate`](crate::TaxBreakdownEntry::validate)
-//! on BR-CO-17's zero-rate branch).
-//!
-//! **EN 16931-1:2026**, approved by CEN in October 2025 and published in March 2026,
-//! is a deliberate break: new business terms, changed validation rules, reworked UBL
-//! and CII bindings. No validation artefact has been published for it yet — the CEN
-//! repository's newest tag is still `validation-1.3.16` — so there is nothing to
-//! check citations against, and nothing here claims to implement it. What the
-//! revision moves is mostly *where numbers are written*, which lands in a
-//! serialisation layer; the arithmetic it needs, this crate already computes. See
-//! the README's *2026 revision* section.
-//!
-//! ## Design invariants
-//!
-//! - **No `f64` in monetary arithmetic** — [`Amount<P>`] is `i64 × 10⁻ᴾ`.
-//! - **No I/O, no async, no `unsafe`** — every function is a pure `fn`.
-//! - **Overflow is visible** — `+`, `-` and `mul_qty` panic; every `checked_*`
-//!   variant returns `Err` and never panics, including on `Decimal`'s own
-//!   overflow (whose operators panic rather than saturating).
-//! - **Rounding is explicit wherever it is observable** — [`RoundingStrategy`] is a
-//!   required parameter on every operation that reduces precision. The
-//!   `Decimal` → [`Amount`] conversion therefore *refuses* excess precision
-//!   ([`Amount::checked_from_decimal`]) rather than rounding it silently, and agrees
-//!   with [`Amount::parse`] on exactly what is representable;
-//!   [`Amount::from_decimal_rounded`] is the opt-in that rounds.
-//!
-//!   There is exactly one default, and it is deliberate: `quantity × price` and
-//!   `total ÷ quantity` ([`Amount::mul_qty`], [`Amount::checked_mul_qty`],
-//!   [`Amount::checked_div`], and so [`LineItemBuilder::build`]) land on the
-//!   engine's own five decimals with `MidpointAwayFromZero`. That figure is an
-//!   *intermediate*, not an emitted amount: [`AmountScale`] rounds each line once
-//!   from the **exact** product rather than from the stored five-decimal value, so
-//!   on a document assembled at an interchange scale the choice cannot change a
-//!   single emitted digit. Where a derived price is itself the output, name the
-//!   strategy with [`UnitPrice::rounded`].
-//!
-//!   An aggregate over many terms is reduced **once**, from the exact sum —
-//!   [`DynamicPricing::calculate`] over a year of spot intervals, where rounding
-//!   each product first biases the total in one direction.
-//! - **Comparisons are total** — [`Amount::within_tolerance_ppm`] returns `bool`, so
-//!   a tolerance check can never degrade into a spurious finding via `unwrap_or`.
-//! - **"Nothing to bill" is not an error and not an empty list** — [`Billing`]
-//!   carries the domain's own reason, and models that always bill opt out at the
-//!   type level with `NotBillable = Infallible`.
-//! - **No implicit currency, and no way to lose an explicit one** — [`Currency`]
-//!   defaults to ISO 4217 `XXX`, never `EUR`, and
-//!   [`BillingDocumentBuilder::currency`] is order-independent, so a later
-//!   [`meta`](BillingDocumentBuilder::meta) cannot silently discard it.
-//!   [`Currency::is_iso4217`] answers BR-CL-04 separately from
-//!   [`Currency::is_unset`], because `XXX` passes the former.
-//! - **Every position the engine generates is emittable as an invoice line** —
-//!   BR-22, BR-23 and BR-26 make BT-129, BT-130 and BT-146 mandatory on *every*
-//!   line, and none of them changes an amount, so nothing in the totals would
-//!   notice their absence. Every generator therefore builds through
-//!   [`LineItem::flat_fee`] rather than [`LineItem::fixed`], and satisfies
-//!   `PEPPOL-EN16931-R120` — checkable with
-//!   [`LineItem::check_price_consistency`].
-//! - **Self-validating documents** — [`BillingDocument::validate`] returns `Result`;
-//!   [`BillingDocument::assert_valid`] panics on failure (convenient for tests).
-//! - **Allocation is exact** — [`ProportionalAllocation`] guarantees
-//!   `Σ(recipient totals) == original total` with per-document penny correction.
-//! - **Invariants survive deserialisation** — validated types re-run their checks
-//!   via `#[serde(try_from = ...)]` rather than trusting reconstructed fields.
-//! - **Value added tax is distinguishable from a charge** — every tax position a
-//!   layer produced with a VAT breakdown is marked [`tags::VAT`], so
-//!   [`BillingDocument::vat_total`] (EN 16931 BT-110) and
-//!   [`BillingDocument::charge_total`] (BT-108) are exact rather than heuristic.
-//!   The mark comes from the layer's own `breakdown` return value, so it is as
-//!   accurate for a third-party [`TaxLayer`] as for a built-in one.
-//! - **A gross price is split, never multiplied** — [`Amount::extract_tax`] applies
-//!   the VAT fraction `r/(1+r)`, and [`Amount::net_of_tax`] takes the remainder, so
-//!   `net + tax` reconstructs the quoted price exactly under every strategy.
-//! - **A conditional discount is not a discount** — an early-payment
-//!   [`PaymentTerms`] entry changes no total and no VAT breakdown, because it is
-//!   earned by a payment that has not happened when the invoice is issued.
-//! - **A layer never reverses its own direction** — [`PercentageCharge`] refuses a
-//!   negative rate *and* clamps a negative base, as [`PercentageDiscount`] does, so
-//!   neither can move the total the way the other one should.
-//! - **Precision reduction happens at the leaves** — [`AmountScale`] rounds every
-//!   position and layer output *before* the totals are summed, so an interchange
-//!   format's decimal limit and its totals identities hold at once. Rounding a
-//!   finished document satisfies neither. The model states the target precision
-//!   with [`PricingModel::amount_scale`], so [`bill`](PricingModel::bill) and
-//!   [`settle`](PricingModel::settle) produce a document that already fits it.
-//!
-//! ## README
-//!
-//! The crate README is included below so that **every Rust example in it is
-//! compiled and run as a doctest**, which makes a snippet that no longer compiles a
-//! build failure rather than a reader's problem.
 #![doc = include_str!("../README.md")]
+#![no_std]
 #![forbid(unsafe_code)]
-// Warnings are promoted to errors in CI via RUSTFLAGS="-D warnings".
-// Not set here to avoid breaking downstream users on new compiler releases.
-#![warn(missing_docs, unreachable_pub, rust_2018_idioms, clippy::all)]
+#![deny(clippy::float_arithmetic)]
+#![warn(missing_docs, unreachable_pub, rust_2018_idioms)]
 
-pub mod advance;
-pub mod aggregation;
-pub mod allocation;
-pub mod amount;
-pub mod currency;
-pub mod document;
-pub mod error;
-pub mod line_item;
-pub mod lookup;
-pub mod minimum;
-pub mod period;
-pub mod pricing;
-pub mod quantity;
-pub mod schedule;
-pub mod settlement;
-pub mod tax;
-pub mod terms;
-pub mod tou;
-pub mod vat;
+extern crate alloc;
 
-pub use advance::{AdvancePayment, DocumentKind, Prepayment, residual_breakdown};
-pub use aggregation::{
-    CountAggregator, LatestAggregator, MaxAggregator, MeanAggregator, PercentileAggregator,
-    SumAggregator, UniqueCountAggregator, UsageAggregator, WeightedSumAggregator,
-};
-pub use allocation::{AllocationRule, EqualAllocation, ProportionalAllocation, proportional_split};
-pub use amount::{Amount, AmountScale, RoundingStrategy};
+mod amount;
+mod currency;
+mod decimal;
+mod document;
+mod error;
+mod line;
+mod meter;
+mod price;
+mod settlement;
+mod split;
+mod tariff;
+mod terms;
+mod vat;
+
+pub use amount::{Amount, AmountScale, Rounding};
 pub use currency::Currency;
-pub use document::{
-    BillingDocument, BillingDocumentBuilder, DocumentMeta, Note, PartyIdentifier, PrecedingInvoice,
+pub use document::{Basis, Bound, BoundKind, Document, DocumentBuilder};
+pub use error::{Error, ErrorKind, Location, Result};
+pub use line::{
+    Adjust, AdjustmentKind, DocumentAdjustment, Line, LineAdjustment, apportion, per_unit_levy,
 };
-pub use error::{BillingError, ParseAmountError};
-pub use line_item::{
-    AllowanceCharge, AllowanceKind, LineAllowanceCharge, LineItem, LineItemBuilder, Sign,
+pub use meter::{Aggregation, Meter, Sample, UnitConversion, Usage};
+pub use price::{Percent, Price, Quantity, UnitPrice};
+pub use rust_decimal::Decimal;
+pub use settlement::{
+    Advance, CashRounding, Credit, CreditApplication, CreditPlacement, Payment, VatAccounting,
 };
-pub use lookup::{RateLookup, RateLookupBuilder};
-pub use minimum::{maximum_charge, maximum_charge_gross, minimum_charge, minimum_charge_gross};
-pub use period::{Period, merge_period_documents, prorate, prorate_amount};
-pub use pricing::{Billed, Billing, Positions, PricingModel};
-pub use quantity::{Quantity, UnitPrice};
-pub use schedule::{RateBand, RateSchedule, RateScheduleBuilder};
-pub use settlement::{CashRounding, VatAccountingCurrency};
-pub use tax::{
-    DiscountLayer, FixedDiscount, FixedRateTax, PerUnitLevy, PercentageCharge, PercentageDiscount,
-    TaxLayer,
+pub use split::{split, split_matrix};
+pub use tariff::{
+    Billed, FeeTotal, PackageRounding, Percentile, Piece, SeriesTotal, Tariff, Tier, TierError,
+    Tiers, TransactionFee, nearest_rank, rate_by_key, rate_series,
 };
-pub use terms::{DayCountBasis, EarlyPaymentDiscount, LatePaymentPenalty, PaymentTerms};
-pub use tou::{
-    DynamicPricing, DynamicPricingBuilder, TimeBand, TimeOfUsePricing, TimeOfUsePricingBuilder,
-};
-pub use vat::{LineVat, TaxBreakdownEntry, TaxCategory};
-
-/// UN/ECE Recommendation 20 code for **one** — a countable item with no other
-/// unit of measure. EN 16931 **BT-130** / **BT-150**, constrained by BR-CL-23.
-///
-/// The conventional unit for a flat charge that is billed once: a standing charge,
-/// a monthly fee, a connection fee. [`LineItem::flat_fee`] uses it so that a
-/// position with no natural quantity still satisfies BR-23.
-///
-/// ```rust
-/// use billing::{Currency, LineItem, Amount, UNIT_CODE_ONE};
-///
-/// assert_eq!(UNIT_CODE_ONE, "C62");
-/// let fee = LineItem::flat_fee("Grundpreis", Amount::<5>::parse("8.50000").unwrap(),
-///                              Currency::EUR)
-///     .build().unwrap();
-/// assert_eq!(fee.quantity.unwrap().code.as_deref(), Some(UNIT_CODE_ONE));
-/// ```
-pub const UNIT_CODE_ONE: &str = "C62";
-
-/// Tag values the engine assigns to generated positions to classify them.
-///
-/// These are written by the built-in tax and discount layers and read back by
-/// other layers — `PerUnitLevy`, for instance, excludes anything tagged `"tax"`
-/// from its base so that stacked levies do not compound. Because they are load
-/// bearing, caller-supplied labels that would land in this namespace (a
-/// time-of-use band named `"tax"`, say) are rejected rather than silently
-/// changing how a document is priced.
-pub mod tags {
-    /// Applied to every position produced by a [`crate::TaxLayer`].
-    pub const TAX: &str = "tax";
-    /// Applied to a tax position whose layer contributed a VAT breakdown entry —
-    /// in addition to [`TAX`].
-    ///
-    /// This is the marker that makes the value-added-tax / charge split
-    /// **decidable** rather than a guess. EN 16931 puts the two in completely
-    /// different places, and a consumer that conflates them produces an invoice no
-    /// validator accepts:
-    ///
-    /// | Position | EN 16931 | Contributes to |
-    /// |---|---|---|
-    /// | tagged [`VAT`] | value added tax (BG-23) | **BT-110**, the VAT total |
-    /// | tagged [`TAX`] but not [`VAT`] | document level charge (BG-21) | **BT-108** → BT-109, i.e. the *taxable base* |
-    ///
-    /// Mapping the whole of [`crate::BillingDocument::tax_total`] to BT-110 makes
-    /// **BR-CO-14** (`BT-110 = Σ BT-117`) fail on every document carrying a levy or
-    /// a commission. [`crate::BillingDocument::vat_total`] and
-    /// [`crate::BillingDocument::charge_total`] read this tag and give the two
-    /// figures directly.
-    ///
-    /// Unlike a heuristic over [`LEVY`] / [`PERCENTAGE_CHARGE`], this is **total**:
-    /// it is written by the engine from the layer's own
-    /// [`breakdown`](crate::TaxLayer::breakdown) return value, so a third-party
-    /// [`crate::TaxLayer`] is classified as accurately as a built-in one.
-    pub const VAT: &str = "vat";
-    /// Applied to per-unit levy positions, in addition to [`TAX`].
-    pub const LEVY: &str = "levy";
-    /// Applied to [`crate::PercentageCharge`] positions.
-    pub const PERCENTAGE_CHARGE: &str = "percentage-charge";
-    /// Applied to every position produced by a [`crate::DiscountLayer`].
-    pub const DISCOUNT: &str = "discount";
-    /// Applied to a [`crate::minimum_charge`] shortfall position.
-    pub const MINIMUM_CHARGE: &str = "minimum-charge";
-    /// Applied to a [`crate::maximum_charge`] excess-credit position.
-    pub const MAXIMUM_CHARGE: &str = "maximum-charge";
-
-    /// Every reserved tag, for diagnostics.
-    pub const RESERVED: &[&str] = &[
-        TAX,
-        VAT,
-        LEVY,
-        PERCENTAGE_CHARGE,
-        DISCOUNT,
-        MINIMUM_CHARGE,
-        MAXIMUM_CHARGE,
-    ];
-
-    /// Whether `tag` is reserved by the engine.
-    #[must_use]
-    pub fn is_reserved(tag: &str) -> bool {
-        RESERVED.contains(&tag)
-    }
-}
-
-/// Reject an empty or whitespace-only unit label.
-///
-/// An empty unit renders as `"EUR/"` in a generated unit-price label and as a
-/// bare space in a description — visible nonsense on an invoice, and cheap to
-/// prevent at the boundary.
-pub(crate) fn check_unit(what: &str, unit: &str) -> Result<(), BillingError> {
-    if unit.trim().is_empty() {
-        let subject = if what.is_empty() {
-            "unit label".to_owned()
-        } else {
-            format!("{what} unit label")
-        };
-        return Err(BillingError::InvalidInput {
-            reason: format!("{subject} must not be empty"),
-        });
-    }
-    Ok(())
-}
-
-/// [`check_unit`] in the owned-value position the schedule and time-of-use
-/// builders use, where the checked label is moved into the built value.
-pub(crate) fn validate_unit(unit: String) -> Result<String, BillingError> {
-    check_unit("", &unit)?;
-    Ok(unit)
-}
-
-/// Convenience glob import — covers all primary types and traits.
-pub mod prelude {
-    pub use crate::{
-        AdvancePayment, AllocationRule, AllowanceCharge, Amount, AmountScale, Billed, Billing,
-        BillingDocument, BillingDocumentBuilder, BillingError, CashRounding, CountAggregator,
-        Currency, DayCountBasis, DiscountLayer, DocumentKind, DocumentMeta, DynamicPricing,
-        EarlyPaymentDiscount, EqualAllocation, FixedDiscount, FixedRateTax, LatePaymentPenalty,
-        LatestAggregator, LineAllowanceCharge, LineItem, LineVat, MaxAggregator, MeanAggregator,
-        Note, ParseAmountError, PartyIdentifier, PaymentTerms, PerUnitLevy, PercentageCharge,
-        PercentageDiscount, PercentileAggregator, Period, Positions, PrecedingInvoice, Prepayment,
-        PricingModel, ProportionalAllocation, Quantity, RateBand, RateLookup, RateLookupBuilder,
-        RateSchedule, RateScheduleBuilder, RoundingStrategy, Sign, SumAggregator,
-        TaxBreakdownEntry, TaxCategory, TaxLayer, TimeBand, TimeOfUsePricing, UNIT_CODE_ONE,
-        UniqueCountAggregator, UnitPrice, UsageAggregator, VatAccountingCurrency,
-        WeightedSumAggregator, maximum_charge, maximum_charge_gross, merge_period_documents,
-        minimum_charge, minimum_charge_gross, proportional_split, prorate, prorate_amount,
-        residual_breakdown,
-    };
-}
+pub use terms::{EarlyPaymentDiscount, InterestSegment, late_payment_interest};
+pub use vat::{Exemption, TaxCategory, Vat, VatError, VatGroup, split_gross};

@@ -1,204 +1,142 @@
 +++
-title = "Allocation and proration"
-description = "Split a document across recipients, or a quantity across fractions, with no cent created or lost — and why an allocated document needs re-assembly before emission."
-weight = 110
+title = "Splitting"
+description = "Exact largest-remainder splits — split, split_matrix, Document::split and Line::segments — what they guarantee and what they cannot."
+weight = 70
 +++
 
-## Splitting a document
+The crate has one apportionment method, used everywhere: **largest remainder**
+(Hamilton), in exact integer arithmetic. An input past `i128` is
+`ErrorKind::Overflow`.
 
-`AllocationRule` splits a whole `BillingDocument` across N recipients — a shared meter,
-a co-working floor, a building's occupants.
+## `split`
 
 ```rust
-use billing::prelude::*;
+use billing::{Amount, Decimal, split};
 use rust_decimal::dec;
 
-let doc = BillingDocument::from_positions(
-    DocumentMeta { currency: Currency::EUR, ..Default::default() },
-    vec![LineItem::fixed("Verbrauch", Amount::parse("100.00000")?).build()?],
-    vec![], vec![],
-)?;
+let parts = split(dec!(100.00), &[dec!(1); 3], 2)?;
+assert_eq!(parts, [dec!(33.34), dec!(33.33), dec!(33.33)]);
+assert_eq!(parts.iter().sum::<Decimal>(), dec!(100.00));
 
-let alloc = ProportionalAllocation::new(vec![dec!(0.40), dec!(0.35), dec!(0.25)])?;
-let parts = alloc.allocate(&doc)?;
+// The sign mirrors the total: a credit splits like the mirrored debit.
+assert_eq!(split(dec!(-100.00), &[dec!(1); 3], 2)?, [dec!(-33.34), dec!(-33.33), dec!(-33.33)]);
 
-let sum: Amount<5> = parts.iter().map(|d| d.net_total()).sum();
-assert_eq!(sum, doc.net_total());          // exact — no drift
-for d in &parts {
-    d.assert_valid();                      // each is internally consistent
-    d.verify_vat_attribution()?;           // BR-S-08 survives the split
-}
+// A zero weight gets exactly zero.
+assert_eq!(split(dec!(10.00), &[dec!(3), dec!(0), dec!(1)], 2)?, [dec!(7.50), dec!(0.00), dec!(2.50)]);
+
+// The same on an Amount, at its own precision.
+let shares = Amount::<2>::parse("47.10")?.split(&[dec!(40), dec!(35), dec!(25)])?;
+assert_eq!(shares.iter().map(|a| a.to_string()).collect::<Vec<_>>(), ["18.84", "16.49", "11.77"]);
 ```
 
-`EqualAllocation::new(n)` is the `1/n` case; it bypasses the sum-to-one check because
-`3 × 0.333…` cannot be exactly 1, and the largest-remainder step inside each position's
-split absorbs the difference.
+For `qᵢ = total · wᵢ / Σw` in units, `split` guarantees:
 
-### Five guarantees
+- **Conservation**: `Σ parts == total`, exactly.
+- **Quota**: each `|partᵢ|` is `⌊|qᵢ|⌋` or `⌈|qᵢ|⌉` units — no recipient is more than
+  one unit from its exact share.
+- **Ties** go to the lowest index; a zero weight gets zero.
+- **Sign**: `split(−t) == −split(t)` element-wise.
+- **Permutation**: permuting weights with distinct remainders permutes the parts.
 
-1. `Σ(net_total) == original.net_total` — exactly.
-2. `Σ(tax_total) == original.tax_total` — exactly.
-3. `Σ(gross_total) == original.gross_total` — exactly.
-4. Every recipient document passes `validate()`.
-5. Every recipient document passes `verify_vat_attribution()` — **BR-S-08** — if the
-   document it was split from did.
+A total with more decimals than `decimals` is `ExcessPrecision`; empty, negative or
+(for a non-zero total) all-zero weights are `InvalidWeights`, located at
+`Location::Weight(i)`.
 
-All five rest on one decision: **each position is split exactly**, so
-`Σ(recipients) == the original position` holds line by line and not merely in
-aggregate. Every total is then derived by summing a recipient's own positions, which
-makes (1)–(3) follow immediately, and each VAT group's taxable base is read off the
-very positions BR-S-08 checks it against, which gives (5). (3) additionally derives
-gross as `net + tax` rather than rounding it — rounding all three separately breaks
-`net + tax == gross` for shares that do not divide evenly.
+### The Alabama paradox
 
-#### Why not split the totals and correct the positions?
-
-That is the obvious construction, and it quietly breaks BR-S-08. The breakdown was split per `(category, rate)` group while the
-positions were corrected in aggregate, so a group's BT-116 and the positions
-attributed to it could land a minor unit apart. On a two-rate document that happened
-for roughly **45 %** of recipients — every document internally exact, every one of
-them rejected by a validator.
-
-That is also why there is no "this came from an allocation, skip the check" flag:
-there is nothing left to skip.
-
-The VAT breakdown, BT-113, BT-114 and BT-111 are all split the same way. Dropping any
-of them would re-bill money the customer already handed over, or leave a recipient
-naming a VAT accounting currency with nothing in it.
-
-### What allocation refuses
-
-- a document carrying a **cash-rounding rule** — a rounding adjustment is a property of
-  one payable total, and scaling it by a share generally lands off the increment.
-  Allocate first, then apply rounding per recipient.
-- a document carrying **itemised advances** — see [Advance payments](../advances/).
-- negative shares, even if they sum to one: that hands one recipient a credit funded by
-  the others, and the sum test alone cannot detect it.
-
-## Exactness and invoice precision pull in opposite directions
-
-This is the trade-off worth understanding before you allocate.
-
-`AmountScale` **does not survive allocation, and cannot.** Splitting `100.00` three
-ways is `33.333…`, and there is no two-decimal answer. Allocation keeps the *sum* exact
-— which is the right trade for money, since inventing or losing a cent is worse than
-carrying a third decimal — at the cost of the precision an invoice needs.
-
-So an allocated document must be **re-assembled** at invoice precision before it is
-billed onward, and the split is what then absorbs the difference:
+Largest remainder is **not** monotone (no quota method can be, by Balinski–Young): a
+larger total can give a recipient less:
 
 ```rust
-use billing::prelude::*;
+use billing::split;
 use rust_decimal::dec;
 
-let doc = BillingDocument::builder()
-    .currency(Currency::EUR)
-    .amount_scale(AmountScale::EN16931)
-    .positions(vec![LineItem::fixed("Verbrauch", Amount::parse("47.10000")?).build()?])
+let w = [dec!(6), dec!(6), dec!(2)];
+assert_eq!(split(dec!(0.10), &w, 2)?, [dec!(0.04), dec!(0.04), dec!(0.02)]);
+assert_eq!(split(dec!(0.11), &w, 2)?, [dec!(0.05), dec!(0.05), dec!(0.01)]); // the third gets less
+```
+
+So **never split cumulative totals and bill the differences**; split each increment
+on its own.
+
+## `split_matrix`: many totals, one set of weights
+
+Splitting row by row lets the same recipient win every tie. `split_matrix` keeps
+every row's guarantees — exact row sums, per-cell quota, sign — but breaks ties by each
+recipient's **running deficit** across the rows so far:
+
+```rust
+use billing::{Decimal, split, split_matrix};
+use rust_decimal::dec;
+
+let column = |rows: &[Vec<Decimal>], j: usize| rows.iter().map(|r| r[j]).sum::<Decimal>();
+
+let per_row: Vec<Vec<Decimal>> = (0..10).map(|_| split(dec!(0.01), &[dec!(1); 3], 2)).collect::<Result<_, _>>()?;
+assert_eq!([column(&per_row, 0), column(&per_row, 1), column(&per_row, 2)], [dec!(0.10), dec!(0), dec!(0)]);
+
+let matrix = split_matrix(&[dec!(0.01); 10], &[dec!(1); 3], 2)?;
+assert_eq!([column(&matrix, 0), column(&matrix, 1), column(&matrix, 2)], [dec!(0.04), dec!(0.03), dec!(0.03)]);
+```
+
+A column's sum stays within ½ unit of its exact share for two recipients. For three
+or more there is no proven bound and it can exceed one unit (tests assert < 1.5 units
+up to eight recipients); row-by-row splitting grows without bound.
+
+## `Document::split` {#document-split}
+
+`Document::split(&weights)` splits a whole document — a shared meter, a building's
+tenants, a co-working floor — into one complete `Document` per recipient:
+
+```rust
+use billing::{Amount, AmountScale, Currency, Document, Line, Percent, Vat};
+use rust_decimal::dec;
+
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::fixed("water", dec!(47.10)))
     .build()?;
-assert!(doc.fits_amount_scale(2));               // the invoice is emittable
+assert_eq!(doc.vat_total(), Amount::parse("8.95")?); // 47.10 × 19 % = 8.949
 
-let parts = EqualAllocation::new(3)?.allocate(&doc)?;
-// 47.10 / 3 = 15.70 exactly here, but in general a share will not fit two decimals.
-assert_eq!(parts.iter().map(|d| d.net_total()).sum::<Amount<5>>(), doc.net_total());
+let shares = doc.split(&[dec!(40), dec!(35), dec!(25)])?;
+let show = |f: fn(&Document) -> Amount| shares.iter().map(|s| format!("{:.2}", f(s))).collect::<Vec<_>>();
+assert_eq!(show(Document::tax_exclusive_total), ["18.84", "16.49", "11.77"]);
+assert_eq!(show(Document::vat_total), ["3.58", "3.13", "2.24"]);
+
+// The shares re-assemble to the parent exactly — 56.05, not 56.06.
+let gross: Amount = shares.iter().map(Document::tax_inclusive_total).sum();
+assert_eq!(gross, doc.tax_inclusive_total());
 ```
 
-`fits_amount_scale(2)` and `amount_scale_violation(2)` are how you find out; the second
-names the field so you know what a consumer would actually emit.
+Every **leaf** — line, adjustment, paid entry — is split in one `split_matrix`, so
+the shares' leaves sum to the parent's exactly.
 
-`reverse()`, by contrast, **does** preserve the scale: a credit note of a two-decimal
-invoice is two decimals.
+**VAT is partitioned, not re-rounded.** Each group's tax is distributed by largest
+remainder of each share's exact `base × rate`, so every share's tax is within one unit
+of its own exact tax (`BR-CO-17`) and the shares sum to the parent. The partition is
+recorded (`Document::tax_partition`); a deserialised share with a tampered partition is
+`ErrorKind::InvalidTaxPartition`.
 
-## Splitting a raw quantity
+| Conserved exactly | Re-derived per share |
+|---|---|
+| every leaf; BT-106, BT-107, BT-108, BT-109, BT-110, BT-112, BT-113; every group's BT-116 and BT-117 | BT-114 and BT-115 under cash rounding (each share is rounded to its own increment); BT-111 |
 
-`proportional_split` splits a bare `Decimal` — kWh, m³, capacity — before any document
-exists. It uses the **largest-remainder (Hamilton) method**: floor each part to `scale`
-decimals, then distribute the deficit one unit at a time to the fractions with the
-largest discarded remainders, ties broken by position.
+Adjustment bases are dropped from the shares (a split amount does not reproduce
+`base × percent`, `PEPPOL-EN16931-R040`), and bound lines and apportioned adjustments
+become ordinary ones.
+
+## `Line::segments`: prorating one line
+
+Split one line by weights such as days — a tariff change mid-month, a partial
+period. The segments' nets sum to the line's net:
 
 ```rust
-use billing::proportional_split;
+use billing::{AmountScale, Line, Price, Quantity, UnitPrice};
 use rust_decimal::dec;
 
-let parts = proportional_split(dec!(100), &[dec!(0.333), dec!(0.333), dec!(0.334)], 3)?;
-let total: rust_decimal::Decimal = parts.iter().sum();
-assert_eq!(total, dec!(100));
+let fee = Line::new("base fee", Quantity::new(dec!(1), "MON"), UnitPrice::new(Price::new(dec!(10))));
+let parts = fee.segments(&[dec!(14), dec!(17)], AmountScale::EN16931)?;
+assert_eq!(parts[0].stated_net(), Some(dec!(4.52)));
+assert_eq!(parts[1].stated_net(), Some(dec!(5.48)));
 ```
 
-`Σ(parts) == total` exactly, every part is rounded to exactly `scale` decimals, and the
-correction is spread as evenly as the deficit allows rather than concentrated on one
-part.
-
-The share-sum tolerance scales with `total` rather than being a fixed `1e-9`. A fixed
-absolute tolerance lets the resulting error grow without bound: at `total = 1e18`,
-shares summing to `1 − 5e-10` pass the check and leave a deficit of ~1e9 units, which
-the distribution step could never close — silently returning parts that sum to less
-than `total`, breaking the function's one guarantee. Tying the tolerance to what the
-distribution can actually absorb removes that.
-
-### …and a bare `Amount` by fractional shares
-
-`Amount::allocate` takes **integer** ratios and `Amount::distribute` splits evenly, so
-neither covers shares such as `[0.4, 0.35, 0.25]`. Compose `proportional_split` at the
-amount's own precision and the round trip is exact:
-
-```rust
-use billing::{Amount, proportional_split};
-use rust_decimal::dec;
-
-let total = Amount::<5>::parse("100.00000")?;
-let parts: Vec<Amount<5>> =
-    proportional_split(total.into_decimal(), &[dec!(0.4), dec!(0.35), dec!(0.25)], 5)?
-        .into_iter()
-        .map(Amount::<5>::checked_from_decimal)
-        .collect::<Result<_, _>>()?;
-
-assert_eq!(Amount::checked_sum(parts.into_iter())?, total);
-```
-
-Passing `scale = 5` is what makes the conversion total: every part then carries at most
-five decimals, so `checked_from_decimal` — which *refuses* excess precision rather than
-rounding it — always succeeds, and `Σ(parts) == total` carries straight through. A
-coarser scale is fine; a finer one fails loudly instead of silently re-rounding.
-
-## Proration
-
-`prorate` scales a position to the fraction of a period actually used — a customer
-joining on the 15th, an annual fee cancelled after 100 days:
-
-```rust
-use billing::prelude::*;
-
-let fee = LineItem::fixed("Grundpreis", Amount::parse("30.00000")?).build()?;
-let half = prorate(&fee, 15, 30, RoundingStrategy::MidpointAwayFromZero)?;
-assert_eq!(half.net_amount, Amount::parse("15.00000")?);
-assert!(half.description.contains("prorated 15/30d"));
-```
-
-It scales the **quantity** alongside the amount, not just the net. Scaling the net
-alone would leave the line self-contradictory — "1000 kWh × 0.30 EUR/kWh = 150.00"
-after a half-month proration — and would break `PEPPOL-EN16931-R120`, which recomputes
-`BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27`. Line allowances and the
-BT-93/BT-100 basis are rescaled with it for the same reason. The unit price is left
-alone, because a price is a rate and does not scale.
-
-The period is **cleared**, because this function knows day counts and not dates. Set it
-explicitly if it matters.
-
-`prorate_amount` is the same arithmetic on a bare `Amount<5>`.
-
-## Merging half-periods
-
-A tariff change mid-period produces two documents for one invoice. `merge_period_documents`
-concatenates the positions, sums the totals, and merges the two VAT breakdowns so that
-two half-period documents at the same rate produce **one** breakdown line rather than
-two.
-
-It refuses a currency mismatch, itemised advances, cash-rounding rules, and an
-asymmetric BT-111. It also re-runs `validate()` on the result, because two individually
-lawful halves do not always compose into a lawful whole: merging an "outside the scope
-of VAT" document with a taxed one produces a breakdown that `BR-O-11` forbids, and only
-the combined document can show it.
-
-The merged document keeps `doc_a`'s header. Set the combined period explicitly
-afterwards if it matters.
+The engine takes weights, not a calendar.

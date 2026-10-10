@@ -1,1419 +1,192 @@
-//! [`PaymentTerms`] and [`EarlyPaymentDiscount`] — EN 16931 **BT-20**, and the
-//! structured early-payment-discount (Skonto) convention carried inside it.
-//!
-//! # What BT-20 is, and why it needs help
-//!
-//! EN 16931 models payment terms as **one free-text field**:
-//!
-//! > **BT-20** *Payment terms* — A textual description of the payment terms that
-//! > apply to the amount due for payment (Including description of possible
-//! > penalties).
-//!
-//! An early-payment discount — *Skonto*, *escompte*, *sconto*, "2/10 net 30" — is
-//! therefore not machine-readable in the core standard at all, even though it
-//! changes what the buyer actually pays. Germany's CIUS closes the gap with a
-//! micro-syntax embedded in that free text, made mandatory by **BR-DE-18**:
-//!
-//! ```text
-//! #SKONTO#TAGE=10#PROZENT=2.00#
-//! #SKONTO#TAGE=10#PROZENT=2.50#BASISBETRAG=485.98#
-//! ```
-//!
-//! Uppercase, no whitespace, `#` opening every segment and closing the line, the
-//! percentage with exactly two decimals, one line per discount. This module is that
-//! syntax as a type: [`Display`](std::fmt::Display) writes it, [`FromStr`] reads it
-//! back, and neither can produce a form a validator rejects.
-//!
-//! The revision of EN 16931 approved by CEN in 2025 (published 2026) promotes early
-//! payment discounts and late-payment charges to structured fields of their own. The
-//! *arithmetic* below does not change with it — only where the numbers are written —
-//! so this type stays useful either way, and its accessors are what a future
-//! serialiser maps from.
-//!
-//! # The other half of BT-20
-//!
-//! The field's definition ends *"(Including description of possible penalties)"*,
-//! and [`LatePaymentPenalty`] is that half: simple interest on the overdue amount
-//! plus the fixed recovery fee art. 6(1) of Directive 2011/7/EU entitles the
-//! creditor to. It is a sibling type rather than a field of [`PaymentTerms`],
-//! because `BR-DE-18` gives a Skonto a syntax and gives a penalty none — see
-//! [`LatePaymentPenalty`] for why that distinction is load bearing.
-//!
-//! # The discount does not belong in the totals
-//!
-//! A Skonto is **conditional**: it exists only if the buyer pays early, which has
-//! not happened when the invoice is issued. Deducting it up front would understate
-//! the taxable base for a supply that may well be paid at full price.
-//!
-//! When it *is* taken, the consideration shrinks after the fact, and the VAT follows
-//! it — §17 Abs. 1 UStG in Germany, art. 90 of the VAT Directive elsewhere. That is a
-//! correction triggered by a **payment event**, not by anything the invoice knows, so
-//! this module deliberately computes the payable figure and stops there:
-//! [`BillingDocument`](crate::BillingDocument) totals and the VAT breakdown are never
-//! touched by attaching payment terms.
-//!
-//! ```rust
-//! use billing::{Amount, EarlyPaymentDiscount, PaymentTerms};
-//! use rust_decimal::dec;
-//!
-//! let skonto = EarlyPaymentDiscount::new(10, dec!(2.00))?;
-//! let terms = PaymentTerms::text("Zahlbar innerhalb 30 Tagen ohne Abzug.")
-//!     .with_discount(skonto);
-//!
-//! // What the buyer pays if they take it — the invoice still states the full amount.
-//! assert_eq!(skonto.payable_on(Amount::parse("1190.00000")?)?, Amount::parse("1166.20000")?);
-//!
-//! // …and how it goes into BT-20.
-//! assert_eq!(
-//!     terms.to_string(),
-//!     // The trailing newline is required by BR-DE-18 — see `PaymentTerms`'s `Display`.
-//!     "Zahlbar innerhalb 30 Tagen ohne Abzug.\n#SKONTO#TAGE=10#PROZENT=2.00#\n",
-//! );
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! Payment-terms arithmetic: [`EarlyPaymentDiscount`] (Skonto) and
+//! [`late_payment_interest`]. Rendering terms as text is the format's job.
 
-use std::fmt;
-use std::str::FromStr;
+use alloc::vec::Vec;
 
 use rust_decimal::Decimal;
 
-use crate::amount::Amount;
-use crate::error::BillingError;
+use crate::vat::{reduce_exact, units_ratio, units_to_amount};
+use crate::{
+    Amount, AmountScale, Document, ErrorKind, Percent, Result, VatGroup, split, split_gross,
+};
 
-/// The number of decimals the BT-20 Skonto syntax writes for a percentage and for
-/// a base amount. Fixed by the convention, not a preference.
-const SEGMENT_DECIMALS: u32 = 2;
-
-// ── EarlyPaymentDiscount ──────────────────────────────────────────────────────
-
-/// One early-payment discount: *pay within `days` days and deduct `percent` %*.
+/// A discount for early payment, in percent of the amount due (BT-115).
 ///
-/// See the [module documentation](self) for the BT-20 syntax and for why the
-/// discount stays out of the document totals.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "EarlyPaymentDiscountRepr"))]
+/// ```
+/// use billing::{AmountScale, Currency, Document, EarlyPaymentDiscount, Line, Percent, Vat};
+/// use rust_decimal::dec;
+///
+/// let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+///     .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+///     .line(Line::fixed("a", dec!(1000)))
+///     .build()?;
+/// let skonto = EarlyPaymentDiscount { percent: Percent::new(dec!(2)) };
+/// assert_eq!(skonto.amount(&doc)?.to_string(), "23.80000");
+/// let correction = skonto.vat_correction(&doc)?;
+/// assert_eq!(correction[0].taxable_base().to_string(), "20.00000");
+/// assert_eq!(correction[0].tax().to_string(), "3.80000");
+/// # Ok::<(), billing::Error>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EarlyPaymentDiscount {
-    days: u32,
-    percent: Decimal,
-    base_amount: Option<Amount<5>>,
-}
-
-#[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-struct EarlyPaymentDiscountRepr {
-    days: u32,
-    percent: Decimal,
-    #[serde(default)]
-    base_amount: Option<Amount<5>>,
-}
-
-#[cfg(feature = "serde")]
-impl TryFrom<EarlyPaymentDiscountRepr> for EarlyPaymentDiscount {
-    type Error = BillingError;
-    fn try_from(r: EarlyPaymentDiscountRepr) -> Result<Self, Self::Error> {
-        let d = Self::new(r.days, r.percent)?;
-        match r.base_amount {
-            Some(b) => d.with_base_amount(b),
-            None => Ok(d),
-        }
-    }
+    /// Percent of the amount due, `0..=100`.
+    pub percent: Percent,
 }
 
 impl EarlyPaymentDiscount {
-    /// Create a discount of `percent` % for payment within `days` days.
-    ///
-    /// `percent` is a **percentage** (`2.00` for 2 %), matching the wire syntax —
-    /// not the fraction the tax and discount layers work in. It must carry at most
-    /// two decimals, because the syntax writes exactly two and a third would be
-    /// silently dropped.
-    ///
-    /// ```rust
-    /// use billing::EarlyPaymentDiscount;
-    /// use rust_decimal::dec;
-    ///
-    /// assert!(EarlyPaymentDiscount::new(14, dec!(3)).is_ok());
-    /// assert!(EarlyPaymentDiscount::new(0, dec!(2.5)).is_ok());   // "on receipt"
-    /// assert!(EarlyPaymentDiscount::new(14, dec!(0)).is_err());   // not a discount
-    /// assert!(EarlyPaymentDiscount::new(14, dec!(120)).is_err()); // more than the invoice
-    /// assert!(EarlyPaymentDiscount::new(14, dec!(2.005)).is_err()); // unwritable
-    /// ```
+    /// `round(BT-115 × percent / 100)` once, at the document's scale.
     ///
     /// # Errors
-    /// [`BillingError::InvalidInput`] if `percent` is outside `(0, 100]` or needs
-    /// more than two decimals.
-    pub fn new(days: u32, percent: Decimal) -> Result<Self, BillingError> {
-        if percent <= Decimal::ZERO || percent > Decimal::ONE_HUNDRED {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "early payment discount percentage must be in (0, 100], got {percent}"
-                ),
-            });
+    /// [`ErrorKind::InvalidRate`] if the percent is outside `0..=100`;
+    /// [`ErrorKind::Overflow`].
+    pub fn amount(&self, doc: &Document) -> Result<Amount> {
+        let percent = self.percent.value();
+        if percent < Decimal::ZERO || percent > Decimal::ONE_HUNDRED {
+            return Err(ErrorKind::InvalidRate { rate: percent }.into());
         }
-        if percent.normalize().scale() > SEGMENT_DECIMALS {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "early payment discount percentage {percent} needs more than \
-                     {SEGMENT_DECIMALS} decimals, which the BT-20 syntax cannot state"
-                ),
-            });
-        }
-        Ok(Self {
-            days,
-            percent,
-            base_amount: None,
-        })
+        reduce_exact(
+            &[doc.payable().to_decimal(), percent],
+            &[Decimal::ONE_HUNDRED],
+            doc.scale(),
+        )
     }
 
-    /// State an explicit base (`BASISBETRAG`) the percentage applies to.
+    /// The per-group reduction of base and tax the discount implies (§17 UStG,
+    /// art. 90 VAT Directive): the discount is split across the VAT groups by
+    /// their gross (largest remainder; by |gross| when every group is a
+    /// credit, so the correction of a negated document is the negated
+    /// correction), and each group's share is split into net and tax with
+    /// [`split_gross`]. Σ (base + tax) over the result equals
+    /// [`amount`](Self::amount) exactly.
     ///
-    /// Only needed when the discount does **not** apply to the whole amount due —
-    /// a part-discountable invoice, or one where freight is excluded. Omit it and
-    /// [`discount_on`](Self::discount_on) uses the amount it is handed.
-    ///
-    /// ```rust
-    /// use billing::{Amount, EarlyPaymentDiscount};
-    /// use rust_decimal::dec;
-    ///
-    /// let d = EarlyPaymentDiscount::new(10, dec!(2.50))?
-    ///     .with_base_amount(Amount::parse("485.98000")?)?;
-    /// assert_eq!(d.to_string(), "#SKONTO#TAGE=10#PROZENT=2.50#BASISBETRAG=485.98#");
-    /// // The stated base wins over the amount due: 2,50 % of 485,98, not of 1000,00.
-    /// assert_eq!(d.discount_on(Amount::parse("1000.00000")?)?, Amount::parse("12.14950")?);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
+    /// A VAT-free document has no groups and gets an empty correction. If every
+    /// group's gross is zero, a zero discount gives zero rows and a non-zero
+    /// one (possible only through payments) is refused.
     ///
     /// # Errors
-    /// [`BillingError::InvalidInput`] if `base` is negative or does not fit the two
-    /// decimals the syntax writes — see [`Amount::fits_scale`].
-    pub fn with_base_amount(mut self, base: Amount<5>) -> Result<Self, BillingError> {
-        if base.is_negative() {
-            return Err(BillingError::InvalidInput {
-                reason: format!("early payment discount base amount must be >= 0, got {base}"),
-            });
+    /// [`ErrorKind::InvalidRate`] if the percent is outside `0..=100` (checked
+    /// even for a VAT-free document);
+    /// [`ErrorKind::InvalidWeights`] if the group grosses have mixed signs (or
+    /// are all zero under a non-zero discount); [`ErrorKind::Overflow`].
+    pub fn vat_correction(&self, doc: &Document) -> Result<Vec<VatGroup>> {
+        let discount = self.amount(doc)?;
+        let groups = doc.vat_groups();
+        if groups.is_empty() {
+            return Ok(Vec::new());
         }
-        if !base.fits_scale(SEGMENT_DECIMALS as u8) {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "early payment discount base amount {base} does not fit \
-                     {SEGMENT_DECIMALS} decimals, which the BT-20 syntax cannot state"
-                ),
-            });
-        }
-        self.base_amount = Some(base);
-        Ok(self)
-    }
-
-    /// The payment window in days (`TAGE`).
-    #[must_use]
-    pub fn days(&self) -> u32 {
-        self.days
-    }
-
-    /// The discount as a **percentage** (`PROZENT`) — `2.00`, not `0.02`.
-    #[must_use]
-    pub fn percent(&self) -> Decimal {
-        self.percent
-    }
-
-    /// The discount as the **fraction** the rest of the crate works in — `0.02`.
-    ///
-    /// # Errors
-    /// [`BillingError::MonetaryOverflow`] is not reachable for a percentage in
-    /// `(0, 100]`; the signature is fallible only because `Decimal`'s division is.
-    pub fn rate(&self) -> Result<Decimal, BillingError> {
-        self.percent
-            .checked_div(Decimal::ONE_HUNDRED)
-            .ok_or(BillingError::MonetaryOverflow {
-                precision: 5,
-                input_value: Some(self.percent),
-            })
-    }
-
-    /// The explicit base (`BASISBETRAG`), if one was stated.
-    #[must_use]
-    pub fn base_amount(&self) -> Option<Amount<5>> {
-        self.base_amount
-    }
-
-    /// The amount deducted if the discount is taken.
-    ///
-    /// `base × percent ÷ 100`, where `base` is [`base_amount`](Self::base_amount)
-    /// when stated and `amount_due` otherwise. Rounded to five decimals half away
-    /// from zero, the same commercial rounding every percentage layer in this crate
-    /// uses.
-    ///
-    /// # Errors
-    /// [`BillingError::MonetaryOverflow`] on overflow.
-    pub fn discount_on(&self, amount_due: Amount<5>) -> Result<Amount<5>, BillingError> {
-        self.base_amount
-            .unwrap_or(amount_due)
-            .checked_mul_qty(self.rate()?)
-    }
-
-    /// What the buyer pays if the discount is taken — `amount_due` less
-    /// [`discount_on`](Self::discount_on).
-    ///
-    /// This is a *payment* figure. It is deliberately not EN 16931's BT-115, which
-    /// states the amount due at full price; see the [module documentation](self).
-    ///
-    /// # Errors
-    /// [`BillingError::MonetaryOverflow`] on overflow.
-    pub fn payable_on(&self, amount_due: Amount<5>) -> Result<Amount<5>, BillingError> {
-        amount_due.checked_sub(self.discount_on(amount_due)?)
-    }
-}
-
-impl fmt::Display for EarlyPaymentDiscount {
-    /// The BT-20 segment line — uppercase, no whitespace, two decimals.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "#SKONTO#TAGE={}#PROZENT={:.prec$}#",
-            self.days,
-            self.percent,
-            prec = SEGMENT_DECIMALS as usize
-        )?;
-        if let Some(base) = self.base_amount {
-            write!(
-                f,
-                "BASISBETRAG={:.prec$}#",
-                base.into_decimal(),
-                prec = SEGMENT_DECIMALS as usize
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for EarlyPaymentDiscount {
-    type Err = BillingError;
-
-    /// Parse one `#SKONTO#…#` line.
-    ///
-    /// Strict by design: the syntax forbids whitespace and lowercase, and a
-    /// validator enforcing BR-DE-18 will reject what this refuses. Accepting a
-    /// sloppy form here would let it round-trip into an invoice that fails.
-    ///
-    /// This parses **one segment**, so it is deliberately silent about the trailing
-    /// newline BR-DE-18 also requires: that terminates the *field*, not the segment,
-    /// and belongs to [`PaymentTerms`]'s own [`Display`](std::fmt::Display).
-    ///
-    /// ```rust
-    /// use billing::EarlyPaymentDiscount;
-    /// use rust_decimal::dec;
-    ///
-    /// let d: EarlyPaymentDiscount = "#SKONTO#TAGE=10#PROZENT=2.00#".parse()?;
-    /// assert_eq!(d.days(), 10);
-    /// assert_eq!(d.percent(), dec!(2.00));
-    ///
-    /// assert!("#skonto#TAGE=10#PROZENT=2.00#".parse::<EarlyPaymentDiscount>().is_err());
-    /// assert!("#SKONTO#TAGE=10#".parse::<EarlyPaymentDiscount>().is_err());
-    /// # Ok::<(), billing::BillingError>(())
-    /// ```
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bad = |what: &str| BillingError::InvalidInput {
-            reason: format!("{s:?} is not a BT-20 Skonto segment: {what}"),
+        let gross: Vec<Decimal> = groups
+            .iter()
+            .map(|g| Ok(g.taxable_base().checked_add(g.tax())?.to_decimal()))
+            .collect::<Result<_>>()?;
+        let weights: Vec<Decimal> = if gross.iter().all(|g| *g >= Decimal::ZERO) {
+            gross
+        } else if gross.iter().all(|g| *g <= Decimal::ZERO) {
+            gross.iter().map(|g| -*g).collect()
+        } else {
+            return Err(ErrorKind::InvalidWeights.into());
         };
-        let body = s
-            .strip_prefix("#SKONTO#")
-            .and_then(|b| b.strip_suffix('#'))
-            .ok_or_else(|| bad("expected #SKONTO#…# with no surrounding whitespace"))?;
-
-        let mut days = None;
-        let mut percent = None;
-        let mut base = None;
-        for segment in body.split('#') {
-            let (key, value) = segment
-                .split_once('=')
-                .ok_or_else(|| bad(&format!("segment {segment:?} is not KEY=VALUE")))?;
-            match key {
-                "TAGE" => {
-                    days = Some(value.parse::<u32>().map_err(|_| {
-                        bad(&format!("TAGE={value:?} is not a whole number of days"))
-                    })?);
-                }
-                "PROZENT" => {
-                    percent = Some(
-                        Decimal::from_str_exact(value)
-                            .map_err(|_| bad(&format!("PROZENT={value:?} is not a decimal")))?,
-                    );
-                }
-                "BASISBETRAG" => {
-                    base =
-                        Some(Amount::<5>::parse(value).map_err(|_| {
-                            bad(&format!("BASISBETRAG={value:?} is not an amount"))
-                        })?);
-                }
-                other => return Err(bad(&format!("unknown segment key {other:?}"))),
-            }
-        }
-
-        let discount = Self::new(
-            days.ok_or_else(|| bad("no TAGE segment"))?,
-            percent.ok_or_else(|| bad("no PROZENT segment"))?,
-        )?;
-        match base {
-            Some(b) => discount.with_base_amount(b),
-            None => Ok(discount),
-        }
+        let scale = doc.scale();
+        let shares = split(discount.to_decimal(), &weights, scale.decimals)?;
+        groups
+            .iter()
+            .zip(shares)
+            .map(|(g, share)| {
+                let (net, tax) = split_gross(share, g.vat(), scale)?;
+                Ok(VatGroup::new(g.vat().clone(), net, tax))
+            })
+            .collect()
     }
 }
 
-// ── DayCountBasis ─────────────────────────────────────────────────────────────
-
-/// The denominator a daily interest rate is derived from — `annual_rate ÷ N`.
+/// A stretch of days at one annual rate (statutory rates change every half
+/// year, §247 BGB), with its own day-count denominator.
 ///
-/// Interest for a part-year is `principal × annual_rate × days ÷ N`, and `N` is a
-/// convention rather than a fact: the same rate over the same days produces a
-/// different figure under each of these, by about 1.4 % of the interest between
-/// the extremes. It is therefore explicit, like every other rounding-adjacent
-/// choice in this crate.
-///
-/// The three below are the ones expressible from a **day count alone**. `30/360`
-/// and its variants are deliberately absent: they re-map calendar months onto
-/// 30-day ones, so they need the actual dates rather than the number of days
-/// between them, and [`crate::Period`] is date-*type*-agnostic by design.
+/// `annual_percent` is not range-checked: a negative rate (the German base
+/// rate was negative 2013–2022) yields negative interest. A zero
+/// `year_days` is refused by [`late_payment_interest`] with
+/// [`ErrorKind::DivisionByZero`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum DayCountBasis {
-    /// `Actual/365F` — 365 days, leap year or not. The default, and the usual
-    /// convention for commercial late-payment interest.
-    #[default]
-    Actual365,
-    /// `Actual/366` — for a period lying inside a leap year, where `Actual/Actual`
-    /// reduces to this.
-    Actual366,
-    /// `Actual/360` — the money-market convention (and the German *Bankjahr*),
-    /// which yields about 1.4 % more interest than `Actual/365` for the same rate.
-    Actual360,
+pub struct InterestSegment {
+    /// Annual rate, e.g. 9.27 %.
+    pub annual_percent: Percent,
+    /// Days in this segment.
+    pub days: u32,
+    /// The year's day count (365, 360, 366 …).
+    pub year_days: u32,
 }
 
-impl DayCountBasis {
-    /// The denominator: 365, 366 or 360.
-    #[must_use]
-    pub fn days_in_year(self) -> u32 {
-        match self {
-            Self::Actual365 => 365,
-            Self::Actual366 => 366,
-            Self::Actual360 => 360,
-        }
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
     }
+    a
 }
 
-// ── LatePaymentPenalty ────────────────────────────────────────────────────────
-
-/// What the buyer owes for paying **late** — simple interest on the overdue
-/// amount, plus an optional fixed recovery fee.
+/// Simple interest on `principal` over `segments`:
+/// `Σ principal × annual_percent / 100 × days / year_days`, summed **exactly**
+/// (over the common denominator of the year lengths) and rounded once at `scale`.
 ///
-/// # Why this is here, and why it is not part of [`PaymentTerms`]
-///
-/// BT-20's own definition ends with *"(Including description of possible
-/// penalties)"*, so a penalty is squarely inside the field — but unlike a Skonto
-/// it has **no wire syntax**. `BR-DE-18` structures early-payment discounts and
-/// nothing else, so a penalty reaches the invoice only as prose the caller writes,
-/// in the caller's language. This crate does not invent prose and does not assume
-/// a jurisdiction, so it models the *arithmetic* and leaves the sentence to you:
-///
-/// ```rust
-/// use billing::{Amount, LatePaymentPenalty, PaymentTerms};
+/// ```
+/// use billing::{Amount, AmountScale, InterestSegment, Percent, late_payment_interest};
 /// use rust_decimal::dec;
 ///
-/// // §288 Abs. 2 BGB: 9 percentage points above the base rate, B2B.
-/// let penalty = LatePaymentPenalty::new(dec!(11.62))?
-///     // §288 Abs. 5 BGB / art. 6(1) of Directive 2011/7/EU: the 40 € fixed sum.
-///     .with_recovery_fee(Amount::parse("40.00000")?)?;
-///
-/// // 30 days late on 1 190,00 €.
-/// assert_eq!(penalty.interest_on(Amount::parse("1190.00000")?, 30)?,
-///            Amount::parse("11.36532")?);
-/// assert_eq!(penalty.total_on(Amount::parse("1190.00000")?, 30)?,
-///            Amount::parse("51.36532")?);
-///
-/// // The invoice itself still states the full amount; the prose is yours.
-/// let terms = PaymentTerms::text(
-///     "Zahlbar innerhalb 30 Tagen. Danach Verzugszinsen von 11,62 % p. a. \
-///      zzgl. 40,00 € Pauschale.",
-/// );
-/// assert!(terms.discounts().is_empty());
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// let p = Amount::parse("1000")?;
+/// let i = late_payment_interest(p, &[
+///     InterestSegment { annual_percent: Percent::new(dec!(9.27)), days: 10, year_days: 365 },
+///     InterestSegment { annual_percent: Percent::new(dec!(9.12)), days: 20, year_days: 365 },
+/// ], AmountScale::EN16931)?;
+/// assert_eq!(i.to_string(), "7.54000"); // 2.539726… + 4.997260… = 7.536986… → 7.54
+/// # Ok::<(), billing::Error>(())
 /// ```
 ///
-/// Keeping it out of [`PaymentTerms`] also keeps that type's round trip **total**:
-/// everything `PaymentTerms` holds, its [`Display`](std::fmt::Display) writes and
-/// its [`FromStr`] reads back. A field with no representation in the syntax would
-/// vanish on the way out, silently.
-///
-/// # It changes no total, for the same reason a Skonto does not
-///
-/// Late-payment interest is triggered by a payment event that has not happened
-/// when the invoice is issued, so it is not part of BT-109, BT-110 or BT-115. It
-/// is also generally **outside the scope of VAT** — art. 63 of the VAT Directive
-/// ties the chargeable event to the supply, and default interest is compensation
-/// for delay rather than consideration for anything supplied (CJEU C-222/81,
-/// *BAZ Bausystem*). A recovery fee under art. 6 of Directive 2011/7/EU is the
-/// same. So a penalty invoiced later is its own document, typically carrying
-/// [`TaxCategory::OutOfScope`](crate::TaxCategory::OutOfScope), not a line on this
-/// one.
-///
-/// # The statutory rates this is shaped by
-///
-/// | Jurisdiction | Rate | Fixed sum |
-/// |---|---|---|
-/// | EU floor — Directive 2011/7/EU art. 2(6), art. 6(1) | ECB reference rate **+ 8 pp** | **40 €** |
-/// | Germany — §288 Abs. 2, Abs. 5 BGB (B2B) | base rate **+ 9 pp** | 40 € |
-/// | Germany — §288 Abs. 1 BGB (consumer) | base rate **+ 5 pp** | — |
-///
-/// The reference rate moves twice a year, which is exactly why this type takes the
-/// **assembled** annual percentage rather than a spread over a base it would have
-/// to carry a stale copy of.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "LatePaymentPenaltyRepr"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LatePaymentPenalty {
-    annual_percent: Decimal,
-    basis: DayCountBasis,
-    recovery_fee: Option<Amount<5>>,
-}
-
-#[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-struct LatePaymentPenaltyRepr {
-    annual_percent: Decimal,
-    #[serde(default)]
-    basis: DayCountBasis,
-    #[serde(default)]
-    recovery_fee: Option<Amount<5>>,
-}
-
-#[cfg(feature = "serde")]
-impl TryFrom<LatePaymentPenaltyRepr> for LatePaymentPenalty {
-    type Error = BillingError;
-    fn try_from(r: LatePaymentPenaltyRepr) -> Result<Self, Self::Error> {
-        let p = Self::new(r.annual_percent)?.with_day_count(r.basis);
-        match r.recovery_fee {
-            Some(f) => p.with_recovery_fee(f),
-            None => Ok(p),
+/// # Errors
+/// [`ErrorKind::DivisionByZero`] for a zero `year_days`; [`ErrorKind::Overflow`].
+pub fn late_payment_interest(
+    principal: Amount,
+    segments: &[InterestSegment],
+    scale: AmountScale,
+) -> Result<Amount> {
+    let mut lcm: u128 = 1;
+    for s in segments {
+        if s.year_days == 0 {
+            return Err(ErrorKind::DivisionByZero.into());
         }
+        let y = u128::from(s.year_days);
+        lcm = (lcm / gcd(lcm, y))
+            .checked_mul(y)
+            .ok_or(ErrorKind::Overflow)?;
     }
-}
-
-impl LatePaymentPenalty {
-    /// The upper bound on the annual percentage.
-    ///
-    /// Not a legal limit — usury ceilings are jurisdictional and this crate holds
-    /// none. It is a typo guard wide enough for any real statutory rate, including
-    /// the triple-digit ones a high-inflation currency produces, and narrow enough
-    /// that a rate handed over as basis points lands outside it.
-    const MAX_ANNUAL_PERCENT: Decimal = Decimal::from_parts(1000, 0, 0, false, 0);
-
-    /// Create a penalty at `annual_percent` per year, `Actual/365`, with no fee.
-    ///
-    /// `annual_percent` is a **percentage** (`11.62` for 11.62 % p.a.), matching
-    /// how every statute and contract states it — not the fraction the tax layers
-    /// work in.
-    ///
-    /// ```rust
-    /// use billing::LatePaymentPenalty;
-    /// use rust_decimal::dec;
-    ///
-    /// assert!(LatePaymentPenalty::new(dec!(11.62)).is_ok());
-    /// assert!(LatePaymentPenalty::new(dec!(0)).is_err());     // not a penalty
-    /// assert!(LatePaymentPenalty::new(dec!(-5)).is_err());    // that is a discount
-    /// assert!(LatePaymentPenalty::new(dec!(1162)).is_err());  // basis points, not percent
-    /// ```
-    ///
-    /// # Errors
-    /// [`BillingError::InvalidInput`] if `annual_percent` is not in `(0, 1000]`.
-    pub fn new(annual_percent: Decimal) -> Result<Self, BillingError> {
-        if annual_percent <= Decimal::ZERO || annual_percent > Self::MAX_ANNUAL_PERCENT {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "late payment annual percentage must be in (0, {}] and stated in \
-                     percent (11.62, not 0.1162), got {annual_percent}",
-                    Self::MAX_ANNUAL_PERCENT
-                ),
-            });
-        }
-        Ok(Self {
-            annual_percent,
-            basis: DayCountBasis::Actual365,
-            recovery_fee: None,
+    // Σ annual_percent × days × (lcm / year_days) on mantissas at a common
+    // scale, in i128: no Decimal product can lose digits.
+    let overflow = || ErrorKind::Overflow;
+    let terms: Vec<(i128, u32)> = segments
+        .iter()
+        .map(|s| {
+            let a = s.annual_percent.value().normalize();
+            let f = i128::try_from(lcm / u128::from(s.year_days)).map_err(|_| overflow())?;
+            let m = a
+                .mantissa()
+                .checked_mul(i128::from(s.days))
+                .and_then(|m| m.checked_mul(f))
+                .ok_or_else(overflow)?;
+            Ok((m, a.scale()))
         })
-    }
-
-    /// Choose the day-count denominator. Defaults to [`DayCountBasis::Actual365`].
-    #[must_use]
-    pub fn with_day_count(mut self, basis: DayCountBasis) -> Self {
-        self.basis = basis;
-        self
-    }
-
-    /// State the fixed recovery fee — art. 6(1) of Directive 2011/7/EU, §288
-    /// Abs. 5 BGB.
-    ///
-    /// Charged **once**, not per day, and only when the payment is actually late.
-    ///
-    /// # Errors
-    /// [`BillingError::InvalidInput`] if `fee` is negative — a recovery fee that
-    /// pays the debtor is not one.
-    pub fn with_recovery_fee(mut self, fee: Amount<5>) -> Result<Self, BillingError> {
-        if fee.is_negative() {
-            return Err(BillingError::InvalidInput {
-                reason: format!("late payment recovery fee must be >= 0, got {fee}"),
-            });
-        }
-        self.recovery_fee = Some(fee);
-        Ok(self)
-    }
-
-    /// The annual rate as a **percentage** — `11.62`, not `0.1162`.
-    #[must_use]
-    pub fn annual_percent(&self) -> Decimal {
-        self.annual_percent
-    }
-
-    /// The annual rate as the **fraction** the rest of the crate works in.
-    ///
-    /// # Errors
-    /// [`BillingError::MonetaryOverflow`] is not reachable for a percentage in
-    /// range; the signature is fallible only because `Decimal`'s division is.
-    pub fn annual_rate(&self) -> Result<Decimal, BillingError> {
-        self.annual_percent.checked_div(Decimal::ONE_HUNDRED).ok_or(
-            BillingError::MonetaryOverflow {
-                precision: 5,
-                input_value: Some(self.annual_percent),
-            },
-        )
-    }
-
-    /// The day-count basis.
-    #[must_use]
-    pub fn day_count(&self) -> DayCountBasis {
-        self.basis
-    }
-
-    /// The fixed recovery fee, if one was stated.
-    #[must_use]
-    pub fn recovery_fee(&self) -> Option<Amount<5>> {
-        self.recovery_fee
-    }
-
-    /// Simple interest on `overdue` for `days_late` days:
-    /// `overdue × annual_rate × days_late ÷ days_in_year`.
-    ///
-    /// **Simple, not compounded.** Art. 2(6) of Directive 2011/7/EU defines
-    /// statutory interest as *"simple interest for late payment"*, and §289 BGB
-    /// forbids charging interest on interest outright. Compounding would also make
-    /// the figure depend on an unstated capitalisation period.
-    ///
-    /// The exact product is rounded **once**, at the engine's five decimals with
-    /// commercial rounding — the same treatment
-    /// [`EarlyPaymentDiscount::discount_on`] gives its own figure, and for the same
-    /// reason: this is a payment figure that no
-    /// [`AmountScale`](crate::AmountScale) reduces, because it is not part of the
-    /// document's totals chain.
-    ///
-    /// `days_late == 0` is not late, so it yields zero.
-    ///
-    /// ```rust
-    /// use billing::{Amount, DayCountBasis, LatePaymentPenalty};
-    /// use rust_decimal::dec;
-    ///
-    /// let p = LatePaymentPenalty::new(dec!(11.62))?;
-    /// // 1190.00 × 0.1162 × 30/365 = 11.36531506…  → 11.36532
-    /// assert_eq!(p.interest_on(Amount::parse("1190.00000")?, 30)?,
-    ///            Amount::parse("11.36532")?);
-    /// // The money-market year is shorter, so the same rate earns more.
-    /// assert!(p.with_day_count(DayCountBasis::Actual360)
-    ///          .interest_on(Amount::parse("1190.00000")?, 30)?
-    ///          > Amount::parse("11.36532")?);
-    /// // On time is free.
-    /// assert_eq!(p.interest_on(Amount::parse("1190.00000")?, 0)?, Amount::ZERO);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    ///
-    /// # Errors
-    /// - [`BillingError::InvalidInput`] if `overdue` is negative — there is no
-    ///   interest on a credit balance, and charging it would move the money the
-    ///   wrong way.
-    /// - [`BillingError::MonetaryOverflow`] on overflow.
-    pub fn interest_on(
-        &self,
-        overdue: Amount<5>,
-        days_late: u32,
-    ) -> Result<Amount<5>, BillingError> {
-        self.check_overdue(overdue)?;
-        if days_late == 0 {
-            return Ok(Amount::ZERO);
-        }
-        let overflow = || BillingError::MonetaryOverflow {
-            precision: 5,
-            input_value: None,
-        };
-        // One rounding, from the exact product: `checked_*` throughout, because
-        // `Decimal`'s own operators panic rather than saturating.
-        let factor = self
-            .annual_rate()?
-            .checked_mul(Decimal::from(days_late))
-            .ok_or_else(overflow)?
-            .checked_div(Decimal::from(self.basis.days_in_year()))
+        .collect::<Result<_>>()?;
+    let common = terms.iter().map(|t| t.1).max().unwrap_or(0);
+    let mut sum: i128 = 0;
+    for (m, sc) in terms {
+        let f = crate::decimal::pow10(common - sc).ok_or_else(overflow)?;
+        sum = m
+            .checked_mul(f)
+            .and_then(|m| sum.checked_add(m))
             .ok_or_else(overflow)?;
-        overdue.checked_mul_qty(factor)
     }
-
-    /// Everything the late payment costs: [`interest_on`](Self::interest_on) plus
-    /// the fixed [`recovery_fee`](Self::recovery_fee), if one was stated.
-    ///
-    /// The fee is charged only when the payment is late, so `days_late == 0`
-    /// yields zero rather than the bare fee — art. 6(1) makes the fixed sum
-    /// contingent on interest having become payable in the first place.
-    ///
-    /// # Errors
-    /// As [`interest_on`](Self::interest_on).
-    pub fn total_on(&self, overdue: Amount<5>, days_late: u32) -> Result<Amount<5>, BillingError> {
-        let interest = self.interest_on(overdue, days_late)?;
-        if days_late == 0 {
-            return Ok(Amount::ZERO);
-        }
-        match self.recovery_fee {
-            Some(fee) => interest.checked_add(fee),
-            None => Ok(interest),
-        }
-    }
-
-    /// What the buyer pays if they settle `days_late` days late — `amount_due`
-    /// plus [`total_on`](Self::total_on).
-    ///
-    /// The mirror image of [`EarlyPaymentDiscount::payable_on`], and a *payment*
-    /// figure in exactly the same way: EN 16931's BT-115 states the amount due at
-    /// the full price on the due date, and nothing here changes it.
-    ///
-    /// # Errors
-    /// As [`interest_on`](Self::interest_on).
-    pub fn payable_on(
-        &self,
-        amount_due: Amount<5>,
-        days_late: u32,
-    ) -> Result<Amount<5>, BillingError> {
-        amount_due.checked_add(self.total_on(amount_due, days_late)?)
-    }
-
-    fn check_overdue(&self, overdue: Amount<5>) -> Result<(), BillingError> {
-        if overdue.is_negative() {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "late payment interest needs a non-negative overdue amount, got {overdue}; \
-                     a credit balance is owed to the buyer, not by them"
-                ),
-            });
-        }
-        Ok(())
-    }
-}
-
-// ── PaymentTerms ──────────────────────────────────────────────────────────────
-
-/// EN 16931 **BT-20** — free-text payment terms, plus any structured early-payment
-/// discounts embedded in them.
-///
-/// Round-trips: [`Display`](std::fmt::Display) renders the field as it goes on the
-/// wire — including the trailing newline `BR-DE-18` requires after a Skonto entry,
-/// which is *fatal* — and [`FromStr`] recovers both halves from a field written by
-/// anyone else.
-///
-/// # `Display` is the wire syntax; serde is storage
-///
-/// The two representations are deliberately different, and neither is a rendering
-/// of the other. `Display`/`FromStr` produce and consume the **BT-20 field** —
-/// prose plus `#SKONTO#…#` lines — because that is what a validator reads. serde
-/// persists the *structure* — `{ "text": …, "discounts": [{ "days": 10, … }] }` —
-/// because a stored payment term should survive a change to the micro-syntax, and
-/// because re-parsing prose is not how a database column should work.
-///
-/// Expect JSON to contain `"days": 10`, not `#SKONTO#TAGE=10#`.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct PaymentTerms {
-    text: Option<String>,
-    discounts: Vec<EarlyPaymentDiscount>,
-}
-
-impl PaymentTerms {
-    /// Free-text terms with no structured discount.
-    ///
-    /// A blank or whitespace-only string is treated as **no prose**, so it cannot
-    /// produce a BT-20 field that begins with an empty line — which [`FromStr`]
-    /// would then drop, breaking the round trip. It also keeps
-    /// [`is_empty`](Self::is_empty) honest.
-    #[must_use]
-    pub fn text(text: impl Into<String>) -> Self {
-        let text = text.into();
-        Self {
-            text: (!text.trim().is_empty()).then_some(text),
-            discounts: Vec::new(),
-        }
-    }
-
-    /// Add an early-payment discount. Repeatable — staged terms ("3 % in 10 days,
-    /// 2 % in 20, net 30") are several segments, one per line.
-    #[must_use]
-    pub fn with_discount(mut self, discount: EarlyPaymentDiscount) -> Self {
-        self.discounts.push(discount);
-        self
-    }
-
-    /// The free-text part, if any.
-    #[must_use]
-    pub fn prose(&self) -> Option<&str> {
-        self.text.as_deref()
-    }
-
-    /// The structured discounts, in declaration order.
-    #[must_use]
-    pub fn discounts(&self) -> &[EarlyPaymentDiscount] {
-        &self.discounts
-    }
-
-    /// Whether this carries neither prose nor a discount.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.discounts.is_empty()
-    }
-
-    /// The qualifying discount with the highest **percentage**, if any.
-    ///
-    /// This is what staged terms mean when they share a base: paying on day 5 under
-    /// "3 % in 10 days, 2 % in 20" earns 3 %, not 2 %. Ties keep the first declared.
-    ///
-    /// # It is the highest percentage, not necessarily the largest deduction
-    ///
-    /// A percentage only orders the discounts when they apply to the same base, and
-    /// [`EarlyPaymentDiscount::with_base_amount`] exists precisely so that they need
-    /// not. `3 %` of a stated `BASISBETRAG` of 100,00 is 3,00, while `2 %` of a
-    /// 1 000,00 amount due is 20,00 — the *lower* rate is worth nearly seven times
-    /// as much. Where any qualifying entry states a base, ask
-    /// [`best_discount_within`](Self::best_discount_within) instead, which compares
-    /// the money.
-    ///
-    /// ```rust
-    /// use billing::{EarlyPaymentDiscount, PaymentTerms};
-    /// use rust_decimal::dec;
-    ///
-    /// let terms = PaymentTerms::default()
-    ///     .with_discount(EarlyPaymentDiscount::new(10, dec!(3))?)
-    ///     .with_discount(EarlyPaymentDiscount::new(20, dec!(2))?);
-    ///
-    /// assert_eq!(terms.discount_within(5).map(|d| d.percent()),  Some(dec!(3)));
-    /// assert_eq!(terms.discount_within(15).map(|d| d.percent()), Some(dec!(2)));
-    /// assert_eq!(terms.discount_within(30).map(|d| d.percent()), None);
-    /// # Ok::<(), billing::BillingError>(())
-    /// ```
-    #[must_use]
-    pub fn discount_within(&self, days: u32) -> Option<&EarlyPaymentDiscount> {
-        // `max_by` keeps the *last* maximum on a tie; fold keeps the first, which
-        // is what "ties keep the first declared" means.
-        self.discounts.iter().filter(|d| days <= d.days).fold(
-            None,
-            |best: Option<&EarlyPaymentDiscount>, d| match best {
-                Some(b) if b.percent >= d.percent => Some(b),
-                _ => Some(d),
-            },
-        )
-    }
-
-    /// The qualifying discount worth the **most money** on `amount_due`, if any.
-    ///
-    /// The question a buyer deciding when to pay actually asks. Unlike
-    /// [`discount_within`](Self::discount_within) it compares
-    /// [`EarlyPaymentDiscount::discount_on`], so a stated `BASISBETRAG` is taken
-    /// into account rather than assumed away. Ties keep the first declared.
-    ///
-    /// ```rust
-    /// use billing::{Amount, EarlyPaymentDiscount, PaymentTerms};
-    /// use rust_decimal::dec;
-    ///
-    /// let terms = PaymentTerms::default()
-    ///     // 3 %, but only of a 100,00 part of the invoice.
-    ///     .with_discount(EarlyPaymentDiscount::new(10, dec!(3))?
-    ///         .with_base_amount(Amount::parse("100.00000")?)?)
-    ///     // 2 %, of the whole thing.
-    ///     .with_discount(EarlyPaymentDiscount::new(20, dec!(2))?);
-    ///
-    /// let due = Amount::parse("1000.00000")?;
-    /// // The higher percentage …
-    /// assert_eq!(terms.discount_within(5).map(|d| d.percent()), Some(dec!(3)));
-    /// // … is worth 3,00, where the lower one is worth 20,00.
-    /// assert_eq!(
-    ///     terms.best_discount_within(5, due)?.map(|d| d.percent()),
-    ///     Some(dec!(2)),
-    /// );
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    ///
-    /// # Errors
-    /// [`BillingError::MonetaryOverflow`] if computing a deduction overflows.
-    pub fn best_discount_within(
-        &self,
-        days: u32,
-        amount_due: Amount<5>,
-    ) -> Result<Option<&EarlyPaymentDiscount>, BillingError> {
-        let mut best: Option<(&EarlyPaymentDiscount, Amount<5>)> = None;
-        for d in self.discounts.iter().filter(|d| days <= d.days) {
-            let value = d.discount_on(amount_due)?;
-            // `>` rather than `>=` so a tie keeps the first declared.
-            if best.is_none_or(|(_, b)| value > b) {
-                best = Some((d, value));
-            }
-        }
-        Ok(best.map(|(d, _)| d))
-    }
-}
-
-impl fmt::Display for PaymentTerms {
-    /// The BT-20 field: the prose first, then one `#SKONTO#…#` line per discount,
-    /// and — when there is at least one discount — a **trailing newline**.
-    ///
-    /// # The terminator is part of the syntax, not decoration
-    ///
-    /// `BR-DE-18` is two assertions folded into one `satisfies`, and the second is
-    /// easy to read past because it is not a separate `<assert>`. Verbatim from
-    /// `itplr-kosit/xrechnung-schematron`,
-    /// `src/validation/schematron/ubl/XRechnung-UBL-validation.sch`:
-    ///
-    /// ```xpath
-    /// every $line in cac:PaymentTerms/cbc:Note[1]/tokenize(., '(\r?\n)')
-    ///                  [starts-with(normalize-space(.), '#')]
-    ///   satisfies matches(normalize-space($line), $XR-SKONTO-REGEX)
-    ///         and matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
-    /// ```
-    ///
-    /// The second `matches` requires everything after the last `#…#` to begin with
-    /// a newline. Without one, `tokenize(., '#.+#')[last()]` is the empty string and
-    /// the assertion fails — **fatally**. The rule's own prose says so directly:
-    /// *"Am Ende einer vollständigen Skontoangabe muss ein XML-konformer
-    /// Zeilenumbruch folgen."* KoSIT ships an instance marked
-    /// `schematron-invalid="xrcii:BR-DE-18"` titled *"Every skonto entry should end
-    /// with a newline"* for precisely this shape.
-    ///
-    /// Omitting it gets every XRechnung carrying a Skonto rejected. The terminator
-    /// belongs here rather than in a separate `to_bt20_xrechnung()` because the
-    /// `#SKONTO#…#` micro-syntax **is** the German CIUS convention — there is no core
-    /// EN 16931 form of it — so a rendering that omits it is valid nowhere at all.
-    ///
-    /// A prose-only BT-20 is unchanged: the `every … satisfies` is vacuously true
-    /// when no line starts with `#`, so a trailing newline there would be noise.
-    ///
-    /// [`FromStr`] accepts the terminated form and recovers an equal value, so the
-    /// round trip is unaffected.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        if let Some(text) = &self.text {
-            f.write_str(text)?;
-            first = false;
-        }
-        for d in &self.discounts {
-            if !first {
-                f.write_str("\n")?;
-            }
-            write!(f, "{d}")?;
-            first = false;
-        }
-        if !self.discounts.is_empty() {
-            f.write_str("\n")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for PaymentTerms {
-    type Err = BillingError;
-
-    /// Split a BT-20 field into prose and structured discounts.
-    ///
-    /// Every line beginning `#SKONTO#` is parsed as a segment; everything else is
-    /// kept verbatim as prose, in order, so nothing a supplier wrote is lost.
-    ///
-    /// ```rust
-    /// use billing::PaymentTerms;
-    ///
-    /// let terms: PaymentTerms =
-    ///     "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=2.00#".parse()?;
-    /// assert_eq!(terms.prose(), Some("Zahlbar in 30 Tagen."));
-    /// assert_eq!(terms.discounts().len(), 1);
-    /// # Ok::<(), billing::BillingError>(())
-    /// ```
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut prose: Vec<&str> = Vec::new();
-        let mut discounts = Vec::new();
-        for line in s.split('\n') {
-            let trimmed = line.trim_end_matches('\r');
-            if trimmed.starts_with("#SKONTO#") {
-                discounts.push(trimmed.parse::<EarlyPaymentDiscount>()?);
-            } else {
-                prose.push(trimmed);
-            }
-        }
-        // Drop the blank lines a segment-only field leaves behind, but keep any
-        // internal structure of genuine prose.
-        while prose.last().is_some_and(|l| l.trim().is_empty()) {
-            prose.pop();
-        }
-        let text = (!prose.is_empty()).then(|| prose.join("\n"));
-        Ok(Self { text, discounts })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal::dec;
-
-    #[test]
-    fn the_segment_syntax_round_trips_in_both_forms() {
-        // The syntax is what a KoSIT validator reads under BR-DE-18, so rendering
-        // and parsing have to be exact inverses — a `Display` that dropped the
-        // trailing `#`, or lost the two decimals on the percentage, would produce
-        // a field that still looks right to a human and fails validation.
-        for (rendered, days, percent) in [
-            ("#SKONTO#TAGE=10#PROZENT=2.00#", 10u32, dec!(2)),
-            ("#SKONTO#TAGE=0#PROZENT=100.00#", 0, dec!(100)),
-            ("#SKONTO#TAGE=365#PROZENT=0.50#", 365, dec!(0.5)),
-        ] {
-            let parsed: EarlyPaymentDiscount = rendered.parse().unwrap();
-            assert_eq!(parsed.days(), days);
-            assert_eq!(parsed.percent(), percent);
-            assert_eq!(parsed.to_string(), rendered);
-        }
-
-        let with_base = "#SKONTO#TAGE=10#PROZENT=2.50#BASISBETRAG=485.98#";
-        let parsed: EarlyPaymentDiscount = with_base.parse().unwrap();
-        assert_eq!(
-            parsed.base_amount(),
-            Some(Amount::parse("485.98000").unwrap())
-        );
-        assert_eq!(parsed.to_string(), with_base);
-    }
-
-    #[test]
-    fn malformed_segments_are_refused_rather_than_guessed_at() {
-        // Each of these is a form some hand-written emitter produces, and each is
-        // fatal under BR-DE-18. Accepting them here would move the failure from a
-        // `Result` in the caller's code to a rejected invoice at the access point.
-        for bad in [
-            "#skonto#TAGE=10#PROZENT=2.00#",       // lowercase
-            " #SKONTO#TAGE=10#PROZENT=2.00#",      // leading space
-            "#SKONTO#TAGE=10#PROZENT=2.00",        // no closing #
-            "#SKONTO#TAGE=10#",                    // no percentage
-            "#SKONTO#PROZENT=2.00#",               // no days
-            "#SKONTO#TAGE=ten#PROZENT=2.00#",      // days not a number
-            "#SKONTO#TAGE=10#PROZENT=2.00#FOO=1#", // unknown key
-            "#SKONTO#TAGE=10#PROZENT=0.00#",       // not a discount
-        ] {
-            assert!(
-                bad.parse::<EarlyPaymentDiscount>().is_err(),
-                "{bad:?} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn the_discount_is_taken_off_the_gross_amount_due() {
-        // Skonto is deducted from the payable amount *including* VAT, not from the
-        // net — that is what makes the later §17 UStG correction necessary at all.
-        let d = EarlyPaymentDiscount::new(14, dec!(2)).unwrap();
-        let due = Amount::<5>::parse("1190.00000").unwrap();
-        assert_eq!(
-            d.discount_on(due).unwrap(),
-            Amount::parse("23.80000").unwrap()
-        );
-        assert_eq!(
-            d.payable_on(due).unwrap(),
-            Amount::parse("1166.20000").unwrap()
-        );
-        assert_eq!(d.rate().unwrap(), dec!(0.02));
-    }
-
-    #[test]
-    fn a_stated_base_overrides_the_amount_due() {
-        let d = EarlyPaymentDiscount::new(10, dec!(2))
-            .unwrap()
-            .with_base_amount(Amount::parse("500.00000").unwrap())
-            .unwrap();
-        // 2 % of the stated 500.00, not of the 1000.00 due.
-        assert_eq!(
-            d.discount_on(Amount::parse("1000.00000").unwrap()).unwrap(),
-            Amount::parse("10.00000").unwrap()
-        );
-        assert_eq!(
-            d.payable_on(Amount::parse("1000.00000").unwrap()).unwrap(),
-            Amount::parse("990.00000").unwrap()
-        );
-    }
-
-    #[test]
-    fn a_base_the_syntax_cannot_write_is_refused() {
-        // `BASISBETRAG` is written with two decimals. Accepting 485.987 would emit
-        // `485.99` and quietly change the number the buyer computes against.
-        let d = EarlyPaymentDiscount::new(10, dec!(2)).unwrap();
-        assert!(
-            d.with_base_amount(Amount::parse("485.98700").unwrap())
-                .is_err()
-        );
-        assert!(
-            d.with_base_amount(Amount::parse("-1.00000").unwrap())
-                .is_err()
-        );
-        assert!(
-            d.with_base_amount(Amount::parse("485.98000").unwrap())
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn payment_terms_round_trip_through_the_bt20_field() {
-        let terms = PaymentTerms::text("Zahlbar in 30 Tagen.")
-            .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
-        let rendered = terms.to_string();
-        // The trailing newline is BR-DE-18's second assertion — see `Display`.
-        assert_eq!(
-            rendered,
-            "Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=3.00#\n#SKONTO#TAGE=20#PROZENT=2.00#\n"
-        );
-        assert_eq!(rendered.parse::<PaymentTerms>().unwrap(), terms);
-
-        // Segments only — no prose line survives, and the field starts with `#`.
-        let bare =
-            PaymentTerms::default().with_discount(EarlyPaymentDiscount::new(7, dec!(1.5)).unwrap());
-        assert_eq!(bare.to_string(), "#SKONTO#TAGE=7#PROZENT=1.50#\n");
-        assert_eq!(bare.to_string().parse::<PaymentTerms>().unwrap(), bare);
-        assert!(!bare.is_empty());
-        assert!(PaymentTerms::default().is_empty());
-        assert_eq!(PaymentTerms::default().to_string(), "");
-    }
-
-    #[test]
-    fn blank_prose_is_no_prose_at_all() {
-        // Storing `Some("")` would render a BT-20 field starting with an empty line,
-        // which `FromStr` then drops — so the value would not survive its own round
-        // trip. It would also make `is_empty` answer "no" for a field with nothing
-        // in it.
-        for blank in ["", "   ", "\t", "\n"] {
-            let terms = PaymentTerms::text(blank);
-            assert!(terms.is_empty(), "{blank:?} must count as empty");
-            assert_eq!(terms.prose(), None);
-            assert_eq!(terms.to_string(), "");
-        }
-
-        let with_segment =
-            PaymentTerms::text("  ").with_discount(EarlyPaymentDiscount::new(7, dec!(2)).unwrap());
-        assert_eq!(with_segment.to_string(), "#SKONTO#TAGE=7#PROZENT=2.00#\n");
-        assert_eq!(
-            with_segment.to_string().parse::<PaymentTerms>().unwrap(),
-            with_segment
-        );
-
-        // Real prose is kept verbatim, including internal blank lines.
-        let multi = PaymentTerms::text("Zeile 1\n\nZeile 3");
-        assert_eq!(multi.prose(), Some("Zeile 1\n\nZeile 3"));
-        assert_eq!(multi.to_string().parse::<PaymentTerms>().unwrap(), multi);
-    }
-
-    #[test]
-    fn the_discounts_accessor_returns_them_in_declaration_order() {
-        // Every other test compares whole `PaymentTerms` values with `assert_eq!`,
-        // which reads the private field directly — so the accessor itself had no
-        // test outside a doctest, and returning an empty slice passed the suite.
-        // Order is part of the contract: `Display` writes one `#SKONTO#` line per
-        // discount in this order, and BT-20 is read top to bottom.
-        let terms = PaymentTerms::default()
-            .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
-
-        let got = terms.discounts();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].days(), 10);
-        assert_eq!(got[0].percent(), dec!(3));
-        assert_eq!(got[1].days(), 20);
-        assert_eq!(got[1].percent(), dec!(2));
-
-        assert!(PaymentTerms::text("nur Text").discounts().is_empty());
-    }
-
-    #[test]
-    fn staged_terms_award_the_best_qualifying_discount() {
-        let terms = PaymentTerms::default()
-            .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
-        // Paying on day 5 qualifies for both windows; the buyer takes the larger.
-        assert_eq!(terms.discount_within(0).map(|d| d.percent()), Some(dec!(3)));
-        assert_eq!(
-            terms.discount_within(10).map(|d| d.percent()),
-            Some(dec!(3))
-        );
-        assert_eq!(
-            terms.discount_within(11).map(|d| d.percent()),
-            Some(dec!(2))
-        );
-        assert_eq!(
-            terms.discount_within(20).map(|d| d.percent()),
-            Some(dec!(2))
-        );
-        assert_eq!(terms.discount_within(21), None);
-    }
-
-    #[test]
-    fn the_best_discount_wins_even_when_it_is_declared_last() {
-        // Conventional terms list the shortest window first, so the largest
-        // percentage also comes first and "best" and "first" coincide — which
-        // makes every ordinary fixture blind to the difference. Nothing requires
-        // that order, and a supplier writing "2 % in 20 days, 3 % in 10" would
-        // otherwise have a buyer paying on day one quoted 2 %: an under-deduction,
-        // and a remittance that no longer matches the invoice.
-        let terms = PaymentTerms::default()
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(10, dec!(3)).unwrap());
-        assert_eq!(terms.discount_within(1).map(|d| d.percent()), Some(dec!(3)));
-        assert_eq!(
-            terms.discount_within(10).map(|d| d.percent()),
-            Some(dec!(3))
-        );
-        // Past the 10-day window only the 2 % stage still qualifies.
-        assert_eq!(
-            terms.discount_within(11).map(|d| d.percent()),
-            Some(dec!(2))
-        );
-
-        // A tie keeps the first declared — the shorter window, which is the one a
-        // buyer paying on day one is actually within.
-        let tied = PaymentTerms::default()
-            .with_discount(EarlyPaymentDiscount::new(7, dec!(2)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(30, dec!(2)).unwrap());
-        assert_eq!(tied.discount_within(1).map(|d| d.days()), Some(7));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn deserialisation_re_runs_the_constructor_checks() {
-        // Fields are private, but serde reconstructs them directly unless routed
-        // through `try_from` — which is the only thing standing between stored
-        // config and a percentage the BT-20 syntax cannot write.
-        let ok: EarlyPaymentDiscount =
-            serde_json::from_str(r#"{"days":10,"percent":"2.00"}"#).unwrap();
-        assert_eq!(ok.percent(), dec!(2.00));
-        assert!(
-            serde_json::from_str::<EarlyPaymentDiscount>(r#"{"days":10,"percent":"0"}"#).is_err()
-        );
-        assert!(
-            serde_json::from_str::<EarlyPaymentDiscount>(r#"{"days":10,"percent":"2.005"}"#)
-                .is_err()
-        );
-        assert!(
-            serde_json::from_str::<EarlyPaymentDiscount>(
-                r#"{"days":10,"percent":"2","base_amount":"1.001"}"#
-            )
-            .is_err()
-        );
-    }
-
-    /// A percentage only orders discounts when they share a base. `with_base_amount`
-    /// exists so that they need not, and once one is stated the higher rate can be
-    /// worth a fraction of the lower one — so the two accessors answer different
-    /// questions and must disagree here.
-    #[test]
-    fn the_largest_percentage_is_not_always_the_largest_deduction() {
-        let terms = PaymentTerms::default()
-            .with_discount(
-                EarlyPaymentDiscount::new(10, dec!(3))
-                    .unwrap()
-                    .with_base_amount(Amount::parse("100.00000").unwrap())
-                    .unwrap(),
-            )
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
-        let due = Amount::<5>::parse("1000.00000").unwrap();
-
-        assert_eq!(terms.discount_within(5).unwrap().percent(), dec!(3));
-        assert_eq!(
-            terms
-                .best_discount_within(5, due)
-                .unwrap()
-                .unwrap()
-                .percent(),
-            dec!(2)
-        );
-        // 3 % of the stated 100,00 is 3,00; 2 % of the amount due is 20,00.
-        assert_eq!(
-            terms.discount_within(5).unwrap().discount_on(due).unwrap(),
-            Amount::parse("3.00000").unwrap()
-        );
-        assert_eq!(
-            terms
-                .best_discount_within(5, due)
-                .unwrap()
-                .unwrap()
-                .discount_on(due)
-                .unwrap(),
-            Amount::parse("20.00000").unwrap()
-        );
-    }
-
-    #[test]
-    fn best_discount_within_filters_by_days_and_keeps_the_first_on_a_tie() {
-        let terms = PaymentTerms::default()
-            .with_discount(EarlyPaymentDiscount::new(10, dec!(2)).unwrap())
-            .with_discount(EarlyPaymentDiscount::new(20, dec!(2)).unwrap());
-        let due = Amount::<5>::parse("1000.00000").unwrap();
-
-        // Both qualify on day 5 and are worth the same — the first declared wins.
-        assert_eq!(
-            terms.best_discount_within(5, due).unwrap().unwrap().days(),
-            10
-        );
-        // Only the second still qualifies on day 15.
-        assert_eq!(
-            terms.best_discount_within(15, due).unwrap().unwrap().days(),
-            20
-        );
-        // Neither on day 30.
-        assert!(terms.best_discount_within(30, due).unwrap().is_none());
-    }
-
-    #[test]
-    fn interest_is_simple_and_scales_with_the_day_count() {
-        let p = LatePaymentPenalty::new(dec!(11.62)).unwrap();
-        let due = Amount::<5>::parse("1190.00000").unwrap();
-
-        // 1190 × 0.1162 × 30/365 = 11.365315068…
-        assert_eq!(
-            p.interest_on(due, 30).unwrap(),
-            Amount::parse("11.36532").unwrap()
-        );
-        // Simple, never compounded: 60 days is exactly twice 30 days.
-        let thirty = p.interest_on(due, 30).unwrap();
-        let sixty = p.interest_on(due, 60).unwrap();
-        assert!(
-            sixty
-                .checked_sub(thirty.checked_add(thirty).unwrap())
-                .unwrap()
-                .abs()
-                <= Amount::from_raw_units(1)
-        );
-        // A shorter year is a bigger daily rate.
-        assert!(
-            p.with_day_count(DayCountBasis::Actual360)
-                .interest_on(due, 30)
-                .unwrap()
-                > thirty
-        );
-        assert!(
-            p.with_day_count(DayCountBasis::Actual366)
-                .interest_on(due, 30)
-                .unwrap()
-                < thirty
-        );
-    }
-
-    /// Art. 6(1) makes the fixed sum contingent on interest having become payable,
-    /// so a payment made on the due date owes neither. Charging the fee at
-    /// `days_late == 0` would bill 40 € for being on time.
-    #[test]
-    fn nothing_is_owed_when_the_payment_is_not_late() {
-        let p = LatePaymentPenalty::new(dec!(11.62))
-            .unwrap()
-            .with_recovery_fee(Amount::parse("40.00000").unwrap())
-            .unwrap();
-        let due = Amount::<5>::parse("1190.00000").unwrap();
-        assert_eq!(p.interest_on(due, 0).unwrap(), Amount::ZERO);
-        assert_eq!(p.total_on(due, 0).unwrap(), Amount::ZERO);
-        assert_eq!(p.payable_on(due, 0).unwrap(), due);
-    }
-
-    /// The fee is charged once, not per day.
-    #[test]
-    fn the_recovery_fee_is_a_fixed_sum() {
-        let p = LatePaymentPenalty::new(dec!(11.62))
-            .unwrap()
-            .with_recovery_fee(Amount::parse("40.00000").unwrap())
-            .unwrap();
-        let due = Amount::<5>::parse("1190.00000").unwrap();
-        for days in [1u32, 30, 365] {
-            let delta = p
-                .total_on(due, days)
-                .unwrap()
-                .checked_sub(p.interest_on(due, days).unwrap())
-                .unwrap();
-            assert_eq!(delta, Amount::parse("40.00000").unwrap());
-        }
-    }
-
-    /// A credit balance is owed *to* the buyer. Charging interest on it would move
-    /// the money the wrong way, so it is refused rather than clamped — the same
-    /// direction rule `PercentageCharge` applies to a negative base.
-    #[test]
-    fn a_negative_overdue_amount_is_refused() {
-        let p = LatePaymentPenalty::new(dec!(11.62)).unwrap();
-        assert!(
-            p.interest_on(Amount::parse("-100.00000").unwrap(), 30)
-                .is_err()
-        );
-        assert!(
-            p.with_recovery_fee(Amount::parse("40.00000").unwrap())
-                .unwrap()
-                .total_on(Amount::parse("-100.00000").unwrap(), 30)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn a_percentage_out_of_range_or_a_negative_fee_is_refused() {
-        assert!(LatePaymentPenalty::new(dec!(0)).is_err());
-        assert!(LatePaymentPenalty::new(dec!(-1)).is_err());
-        assert!(LatePaymentPenalty::new(dec!(1000)).is_ok());
-        assert!(LatePaymentPenalty::new(dec!(1000.01)).is_err());
-        assert!(
-            LatePaymentPenalty::new(dec!(9))
-                .unwrap()
-                .with_recovery_fee(Amount::parse("-1.00000").unwrap())
-                .is_err()
-        );
-    }
-
-    /// Every accessor reports what the builder was handed. Trivial to write and
-    /// not trivial to skip: a getter that quietly returns a default is invisible
-    /// to a totals check, and is exactly what a serialiser reads.
-    #[test]
-    fn the_penalty_accessors_report_what_was_configured() {
-        let plain = LatePaymentPenalty::new(dec!(11.62)).unwrap();
-        assert_eq!(plain.annual_percent(), dec!(11.62));
-        assert_eq!(plain.annual_rate().unwrap(), dec!(0.1162));
-        assert_eq!(plain.day_count(), DayCountBasis::Actual365);
-        assert_eq!(plain.recovery_fee(), None);
-
-        let fee = Amount::<5>::parse("40.00000").unwrap();
-        let full = plain
-            .with_day_count(DayCountBasis::Actual360)
-            .with_recovery_fee(fee)
-            .unwrap();
-        assert_eq!(full.annual_percent(), dec!(11.62));
-        assert_eq!(full.day_count(), DayCountBasis::Actual360);
-        assert_eq!(full.recovery_fee(), Some(fee));
-        // A zero fee is stated, not absent — `None` and `Some(0)` mean different
-        // things to a serialiser deciding whether to emit the term at all.
-        assert_eq!(
-            plain
-                .with_recovery_fee(Amount::ZERO)
-                .unwrap()
-                .recovery_fee(),
-            Some(Amount::ZERO)
-        );
-    }
-
-    #[test]
-    fn day_count_denominators() {
-        assert_eq!(DayCountBasis::default(), DayCountBasis::Actual365);
-        assert_eq!(DayCountBasis::Actual365.days_in_year(), 365);
-        assert_eq!(DayCountBasis::Actual366.days_in_year(), 366);
-        assert_eq!(DayCountBasis::Actual360.days_in_year(), 360);
-    }
+    let p = principal.to_decimal().normalize();
+    let n = p.mantissa().checked_mul(sum).ok_or_else(overflow)?;
+    let q = 100i128
+        .checked_mul(i128::try_from(lcm).map_err(|_| overflow())?)
+        .ok_or_else(overflow)?;
+    units_to_amount(units_ratio((n, p.scale() + common), (q, 0), scale)?, scale)
 }
