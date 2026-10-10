@@ -140,16 +140,17 @@ fuzz-build:
     if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
         echo "skipped: needs nightly and cargo-fuzz (cargo install cargo-fuzz --locked)"; exit 0
     fi
-    cargo +nightly fuzz build
+    # The host triple, explicitly: a prebuilt cargo-fuzz defaults to its own (musl) target.
+    cargo +nightly fuzz build --target "$(rustc +nightly -vV | sed -n 's/^host: //p')"
 
 # Run one target (parse, split, serde). New inputs go to target/, seeds stay in fuzz/corpus/.
 fuzz TARGET SECS="60":
     mkdir -p target/fuzz-corpus/{{ TARGET }}
-    cargo +nightly fuzz run {{ TARGET }} "{{ justfile_directory() }}/target/fuzz-corpus/{{ TARGET }}" \
+    cargo +nightly fuzz run --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ TARGET }} "{{ justfile_directory() }}/target/fuzz-corpus/{{ TARGET }}" \
         "{{ justfile_directory() }}/fuzz/corpus/{{ TARGET }}" -- -max_total_time={{ SECS }}
 
 # ── Mutation testing (cargo-mutants; config in .cargo/mutants.toml) ───────────
-# The full sweep is local (`mutants-gate`, before a release); CI runs `mutants-diff-gate`.
+# Local only: the full sweep (`mutants-gate`) before a release, `mutants-diff` while working.
 # Baseline entries are `survivor  # reason`; the comparator strips the reason.
 
 mutants *ARGS:

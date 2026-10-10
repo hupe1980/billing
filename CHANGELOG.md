@@ -355,6 +355,8 @@ item is exported at the crate root: `billing::amount::Amount` becomes `billing::
 - `cargo-fuzz` targets (`parse`, `serde`, `split`), a `no_std` build for
   `thumbv7em-none-eabihf`, a direct-dependency count check, a minimal-versions job, and
   `citations.lock`, a hash lock of every cited rule's test.
+- Mutation testing is local only (`just mutants-gate` before a release, `just mutants-diff`
+  while working); the CI job is removed.
 - `cargo-deny` is the one advisory checker; `cargo-audit` and `.cargo/audit.toml` are gone.
 - Test suites rewritten around 0.16's invariants; `tests/rules.rs` checks the EN 16931
   rules on generated documents and their split shares.

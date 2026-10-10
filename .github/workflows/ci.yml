@@ -189,25 +189,3 @@ jobs:
         with:
           tool: just
       - run: just check-citations
-
-  # The full sweep is local (`just mutants-gate`). A pull request mutates only the
-  # lines it changed and fails on any survivor the baseline does not record.
-  mutants-diff:
-    name: Mutation testing (changed lines)
-    if: github.event_name == 'pull_request'
-    needs: [fmt, clippy]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-mutants,just
-      - name: Mutate the lines this pull request changed
-        run: |
-          mkdir -p target
-          git diff "${{ github.event.pull_request.base.sha }}...HEAD" > target/mutants.diff
-          just mutants-diff-gate target/mutants.diff

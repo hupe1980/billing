@@ -83,7 +83,7 @@ assert_eq!(twice.kind(), &ErrorKind::ConflictingSetting { setting: "default_vat"
 | Property tests | does the law hold for inputs I did not think of? | `proptest`: round-trips, split conservation and quota, sign symmetry, `negated`, `concat` |
 | Fuzzing | does anything panic on hostile input? | `cargo-fuzz` on the parser, the splitter and serde (`just fuzz <target>`) |
 | Doctests, site examples | is the documentation true? | README doctests; `just site-verify` runs every block on this site |
-| Mutation testing | would anything fail if the code did something else? | `cargo-mutants` against a baseline of justified survivors; full sweep before a release, diff-scoped in CI |
+| Mutation testing | would anything fail if the code did something else? | `cargo-mutants` against a baseline of justified survivors; run locally, full sweep before a release |
 | Citations | does the cited rule say what we claim? | every rule id is hash-locked against the pinned Schematron in `citations.lock` (`just check-citations`) |
 
 ## Comparison
