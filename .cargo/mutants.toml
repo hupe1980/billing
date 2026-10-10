@@ -1,75 +1,35 @@
 # cargo-mutants configuration — https://mutants.rs/
-#
-# Mutation testing answers the question the coverage report cannot: not "was
-# this line executed?" but "would anyone notice if it were wrong?". For a
-# billing engine that is the only question that matters — a rounding rule, a
-# comparison operator or a tolerance bound can all be executed by the tests and
-# still be silently incorrect.
-#
-# Run it with `just mutants` (see justfile). Schema: `cargo mutants --emit-schema=config`.
+# Run with `just mutants`. Schema: `cargo mutants --emit-schema=config`.
 
-# `serde` gates a large, invariant-critical surface (every validated type
-# re-runs its checks in `try_from` on deserialisation). Without this the whole
-# module would be invisible to both the mutator and the tests.
+# `serde` gates the deserialise-time revalidation; mutate and test it too.
 all_features = true
 
-# Mutants routinely produce dead code, unused bindings and unreachable
-# branches. Those are warnings about the *mutant*, not about the crate, and the
-# crate's own `-D warnings` gates already run in CI. Capping lints keeps a
-# mutant from being scored "unviable" for a reason that has nothing to do with
-# whether the tests would have caught it.
+# Mutants produce dead code and unused bindings; don't score them "unviable" for
+# warnings. The crate's own `-D warnings` gates run in CI.
 cap_lints = true
 
-# The baseline suite runs in about a second, so the auto-derived timeout
-# (5 × baseline) would land at the 20 s floor. Mutating a loop bound or a
-# `while` condition can produce a genuine non-terminating mutant; a slightly
-# higher floor keeps a cold cache or a loaded CI runner from reporting that as
-# a timeout when it is really just slow.
+# The baseline suite runs in ~1 s, so the auto timeout would hit the 20 s floor; a
+# higher floor keeps slow (not hung) mutants from timing out on a loaded runner.
 minimum_test_timeout = 30
 
-# Mutating an argument to `with_capacity` swaps one preallocation size for
-# another. The result is always correct and only ever differs in how many times
-# a `Vec` reallocates, so no test can — or should — distinguish it.
+# `with_capacity` argument mutants only change reallocation counts; no test can catch them.
 skip_calls_defaults = true
 
 # ── Speed ─────────────────────────────────────────────────────────────────────
-#
-# A full sweep compiles and tests the crate about a thousand times, so anything
-# paid per mutant is paid a thousand times. Three settings carry almost all of it,
-# and none of them changes which mutants are caught.
 
 # No debuginfo, no incremental state — see `[profile.mutants]` in Cargo.toml.
 profile = "mutants"
 
-# Doctests are excluded from mutation runs, and only from mutation runs.
-#
-# They are the most expensive third of `cargo test` here (163 of them, plus the
-# whole README compiled as one), and they are the *least* informative to a mutant:
-# a doctest exists to show a reader how a function is called, so it exercises the
-# happy path that the unit and integration suites already cover several times over.
-# Where that turned out to be false, the answer was a missing unit test rather than
-# a slower sweep: the first run with doctests excluded surfaced several functions
-# whose *only* coverage was an example. Each got a real test. That is the outcome to
-# repeat if a new survivor appears here — a function tested only by a doctest is a
-# gap whether or not the sweep is what reveals it.
-#
-# `just test` and CI still run every doctest on the unmutated tree, which is where
-# a broken example actually matters.
+# Doctests are excluded from mutation runs only: they are the slowest third of
+# `cargo test` and exercise happy paths the unit suites already cover. A function
+# covered only by a doctest needs a real test. `just test` and CI run every doctest.
 additional_cargo_test_args = ["--lib", "--tests"]
 
-# Parallelism is not set here: it belongs to the machine, not to the project. A
-# 4-core GitHub runner and a 14-core laptop want different numbers, and the wrong
-# one either idles cores or thrashes memory. `just mutants*` derives it from the
-# core count; CI sets CARGO_MUTANTS_JOBS per runner.
+# Parallelism is per machine, not per project: `just mutants*` derives it from the
+# core count; CI sets CARGO_MUTANTS_JOBS.
 
 # ── Known survivors ───────────────────────────────────────────────────────────
-#
-# There is deliberately no `exclude_re` here. An exclusion is a permanent blind
-# spot: the regex that hides `builder -> Default::default()` today also hides it
-# once `builder()` starts doing real work. Every mutant is generated, run and
-# reported.
-#
-# The survivors the project tolerates — and the reason each one is tolerated —
-# are recorded in `.cargo/mutants-baseline.txt`, which `just mutants-gate` diffs
-# the run against. A new survivor fails the gate; so does a recorded one that is
-# now caught.
+
+# No `exclude_re`: an exclusion is a permanent blind spot. Tolerated survivors and
+# their reasons live in `.cargo/mutants-baseline.txt`; `just mutants-gate` fails on
+# a new survivor and on a recorded one that is now caught.

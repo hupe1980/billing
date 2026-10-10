@@ -1,6 +1,6 @@
 +++
-title = "billing — a domain-agnostic Rust invoice and usage-billing engine"
-description = "Domain-agnostic billing engine for Rust: fixed-point money, tiered and time-of-use pricing, composable VAT layers, and invoice totals that satisfy EN 16931."
+title = "billing — EN 16931 invoice arithmetic for Rust"
+description = "EN 16931 invoice arithmetic for Rust: fixed-point money, sign-symmetric rounding, exact largest-remainder splits, tariffs, VAT derived by grouping, and documents whose totals are derived once from their inputs."
 template = "index.html"
 sort_by = "weight"
 +++
@@ -8,14 +8,13 @@ sort_by = "weight"
 <section class="hero">
 <div class="wrap">
 
-<p class="eyebrow">Rust · zero I/O · no async · no <code>unsafe</code></p>
+<p class="eyebrow">Rust · no_std · zero I/O · no <code>unsafe</code></p>
 
 # Invoice arithmetic a validator will accept
 
-**billing** is a pure, domain-agnostic calculation engine. It does the hard part —
-graduated pricing, compound tax layers, tax-inclusive prices, exact allocation, and
-totals that still add up after you round them to two decimals — and leaves every
-domain decision to your crate.
+**billing** computes the numbers on an EN 16931 invoice — line nets, allowances and
+charges, the VAT breakdown, the totals chain, payments and cash rounding. You state
+the inputs; every total is **derived once**, at the document's scale.
 
 <p class="cta">
 <a class="btn btn-primary" href="docs/getting-started/">Get started</a>
@@ -34,18 +33,10 @@ domain decision to your crate.
 
 ## The problem it solves
 
-Every e-invoicing standard asks for two things at once, and they fight. EN 16931 caps
-every monetary amount at **two decimals**, and it also requires the totals to reconcile
-**exactly** at that precision.
-
-Round at the serialiser and you fail. Three lines of `0.005` each become `0.01`,
-summing to `0.03`, while the exact total `0.015` becomes `0.02` — `BR-CO-10` violated.
-A net of `0.0042` with 19 % VAT gives `0.00 + 0.00 ≠ 0.01` — `BR-CO-15` violated. Both
-come from ordinary inputs.
-
-The only construction that satisfies both is to round the *leaves* and recompute every
-aggregate from them. That has to happen while the document is assembled, not on the way
-out — by the time you hold a finished document, the aggregates already exist.
+EN 16931 caps every amount at **two decimals** and requires the totals to reconcile
+**exactly** at that precision. Rounding at the serialiser breaks that (`BR-CO-10`,
+`BR-CO-15`). `billing` rounds each leaf once and derives every total from the rounded
+leaves.
 
 [How the precision model works →](docs/e-invoicing/)
 
@@ -53,27 +44,22 @@ out — by the time you hold a finished document, the aggregates already exist.
 <div>
 
 ```rust
-use billing::prelude::*;
+use billing::{Amount, AmountScale, Currency, Document, Line, Percent, Price, Quantity, UnitPrice, Vat};
 use rust_decimal::dec;
 
 // 1234.567 kWh × 0.28901 EUR/kWh = 356.80221 — five decimals.
-let doc = BillingDocument::builder()
-    .currency(Currency::EUR)
-    .amount_scale(AmountScale::EN16931)   // two decimals, everywhere
-    .positions(vec![LineItem::for_usage(
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::new(
         "Arbeit",
-        Quantity::new(dec!(1234.567), "kWh"),
-        UnitPrice::new(dec!(0.28901), "EUR/kWh"),
-    ).build()?])
-    .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.boxed())
+        Quantity::new(dec!(1234.567), "KWH"),
+        UnitPrice::new(Price::new(dec!(0.28901))),
+    ))
     .build()?;
 
-assert_eq!(doc.net_total(),   Amount::parse("356.80000")?);
-assert_eq!(doc.tax_total(),   Amount::parse("67.79000")?);
-assert_eq!(doc.gross_total(), Amount::parse("424.59000")?);
-
-assert!(doc.fits_amount_scale(2));  // emittable as EN 16931
-doc.assert_valid();                 // and the identities still hold
+assert_eq!(doc.line_net(0), Amount::parse("356.80")?); // BT-131, rounded once
+assert_eq!(doc.vat_total(), Amount::parse("67.79")?);  // BT-110: 356.80 × 19 %
+assert_eq!(doc.payable(), Amount::parse("424.59")?);   // BT-115
 ```
 
 </div>
@@ -90,61 +76,61 @@ doc.assert_valid();                 // and the identities still hold
 
 ### Fixed-point money
 
-`Amount<P>` is `i64 × 10⁻ᴾ` with the precision in the type. No `f64` anywhere in the
-arithmetic path, overflow is never silent, and rounding is always an explicit argument.
+`Amount<P>` is an `i64` count of `10⁻ᴾ`, with four sign-symmetric rounding modes and
+typed `Percent`s. Overflow never wraps.
 
-[Amounts and rounding →](docs/amounts/)
-
-</article>
-<article>
-
-### Pricing models
-
-Graduated, volume, block and capacity rate schedules; time-of-use bands; spot
-pricing; capacity-keyed rate tables; eight usage aggregators, including the
-95th-percentile burstable model.
-
-[Pricing models →](docs/pricing/)
+[Money and rounding →](docs/amounts/)
 
 </article>
 <article>
 
-### Tax and discount layers
+### Metering and tariffs
 
-Ordered, composable, compounding. Each layer sees every prior layer in its base — which
-is exactly what a per-unit excise sitting inside a VAT base requires.
+Ten aggregations with exact averages; per-unit, graduated, volume and package
+tariffs; spot series, a tariff per key, transaction fees, progressive billing and
+95th percentiles.
 
-[Tax layers →](docs/tax-and-discounts/)
-
-</article>
-<article>
-
-### VAT breakdown (BG-23)
-
-Per-rate taxable base and tax, the ten UNCL 5305 categories with their exemption rules,
-and per-position attribution checked back against the breakdown.
-
-[VAT breakdown →](docs/vat-breakdown/)
+[Pricing →](docs/pricing/)
 
 </article>
 <article>
 
-### Tax-inclusive prices
+### VAT as an attribute
 
-Consumer catalogues are quoted gross; EN 16931 is net. The conversion is the VAT
-fraction `r/(1+r)`, not `× r` — and that is the one people get wrong.
+Every line and adjustment carries a `Vat`; the breakdown (BG-23) is a group-by with
+the tax rounded once per group.
 
-[Gross to net →](docs/gross-pricing/)
+[VAT →](docs/vat-breakdown/)
 
 </article>
 <article>
 
-### Exact allocation
+### Gross prices
 
-Split a document across N recipients, or a raw quantity by fractions, with
-largest-remainder correction. No cent is created or lost.
+`split_gross` turns a shelf price into net and tax once; the halves re-add
+exactly.
 
-[Allocation →](docs/allocation/)
+[Gross prices →](docs/gross-pricing/)
+
+</article>
+<article>
+
+### Exact splitting
+
+Largest remainder in integer arithmetic, down to `Document::split`. No cent is
+created or lost.
+
+[Splitting →](docs/allocation/)
+
+</article>
+<article>
+
+### Corrections and settlement
+
+`negated`, `concat`, minimum and maximum bounds, advances, customer credits, cash
+rounding, Skonto and late-payment interest.
+
+[Settlement →](docs/settlement/)
 
 </article>
 </div>
@@ -158,35 +144,31 @@ largest-remainder correction. No cent is created or lost.
 <div class="grid grid-3">
 <article>
 
-### Self-validating documents
+### Derived, never stored
 
-`validate()` re-derives sixteen invariants from the positions, exactly and with no
-tolerance. Every constructor runs it, and so does deserialisation — so neither an
-awkward combination of layers nor untrusted JSON can produce a document that fails
-its own checks.
+A `Document` exists only through `build()`; every accessor is infallible and there
+is no `validate()`.
 
 </article>
 <article>
 
 ### Rules, cited
 
-Every EN 16931 and Peppol rule the engine enforces is named in the source beside the
-code that enforces it, so you can check it against the published Schematron instead of
-trusting a summary.
+Every error says why, where and which EN 16931 or Peppol rule it enforces; each rule
+id is hash-locked against the pinned Schematron.
 
 </article>
 <article>
 
-### Mutation-tested
+### Mutation-tested and fuzzed
 
-Property tests state the algebraic laws; `cargo-mutants` then rewrites the code and
-reports every rewrite the suite still accepts. Surviving mutants are recorded with the
-reason each one is tolerated.
+Property tests state the algebraic laws, fuzzers attack the parser, splitter and
+serde, and `cargo-mutants` checks the suite.
 
 </article>
 </div>
 
-[Design invariants and how correctness is checked →](docs/design/)
+[Design and how correctness is checked →](docs/design/)
 
 </section>
 
@@ -195,16 +177,10 @@ reason each one is tolerated.
 
 ## What it is not
 
-It is a *library*, not a platform. No subscription lifecycle, no event ingestion, no
-payment provider, no database, no scheduler. It does no I/O, spawns nothing, forbids
-`unsafe`, and has three dependencies.
-
-It also does not serialise XML. UBL, CII, XRechnung and ZUGFeRD need an XML writer, the
-UN/ECE and UNTDID code lists, and Schematron conformance fixtures — none of which
-belongs in a pricing engine, and all of which move on a different release cadence. Those
-live in [`en16931`](https://crates.io/crates/en16931) and
-[`en16931-formats`](https://crates.io/crates/en16931-formats), which are separate
-dependencies rather than a framework.
+A library of arithmetic — not a billing platform, not an invoice model. Invoice
+numbers, dates, parties, type codes and XML belong to
+[`en16931`](https://crates.io/crates/en16931) and
+[`en16931-formats`](https://crates.io/crates/en16931-formats).
 
 [Where this crate stops →](docs/e-invoicing/)
 

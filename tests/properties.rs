@@ -1,1351 +1,1355 @@
-//! Property-based tests for the monetary invariants.
-//!
-//! Hand-written tests check the cases we thought of. These check the ones we did
-//! not: every test below states a law that must hold for *all* inputs in range,
-//! and `proptest` searches for a counterexample, shrinking any it finds to a
-//! minimal case.
-//!
-//! The laws here are the ones a billing engine is actually judged on — money is
-//! neither created nor destroyed by splitting it, rounding is idempotent and
-//! bounded, and parsing round-trips exactly.
-//!
-//! Counterexamples are persisted to `proptest-regressions/` and replayed on every
-//! subsequent run, so a failure found once becomes a permanent regression test.
+//! Document properties over random inputs: BG-23 is a group-by, negation is an
+//! involution, concat ≡ build, split and segments conserve, concat(split(d))
+//! has d's totals, the builder is order-independent, bounds reach their
+//! target at scale, serde round-trips byte-identically; and the exact
+//! reductions (line price part, BT-111, Skonto correction, interest) against
+//! references written independently of the crate's arithmetic; metering
+//! (every aggregation kind, conversion, lines and tariffs priced from an exact
+//! usage) against an exact rational reference.
 
-use billing::prelude::*;
-use billing::{CashRounding, FixedRateTax, LineAllowanceCharge, TaxCategory};
+use billing::{
+    Advance, Amount, AmountScale, Basis, Bound, CashRounding, Currency, Decimal, Document,
+    DocumentAdjustment, DocumentBuilder, EarlyPaymentDiscount, Exemption, InterestSegment, Line,
+    LineAdjustment, Payment, Percent, Price, Quantity, Rounding, TaxCategory, UnitPrice, Vat,
+    VatAccounting, late_payment_interest,
+};
+use billing::{
+    Aggregation, Billed, Meter, PackageRounding, Percentile, Sample, Tariff, Tier, Tiers,
+    UnitConversion, Usage,
+};
 use proptest::prelude::*;
-use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use rust_decimal::dec;
 
-// ── Strategies ───────────────────────────────────────────────────────────────
+const MODES: [Rounding; 4] = [
+    Rounding::HalfAwayFromZero,
+    Rounding::HalfEven,
+    Rounding::AwayFromZero,
+    Rounding::TowardZero,
+];
 
-/// Raw `i64` values well inside `Amount<5>`'s range, so that sums of a handful of
-/// them cannot overflow and the properties test real behaviour rather than
-/// saturation.
-fn arb_raw() -> impl Strategy<Value = i64> {
-    -1_000_000_000_000i64..1_000_000_000_000i64
+fn strategy(r: Rounding) -> RoundingStrategy {
+    match r {
+        Rounding::HalfAwayFromZero => RoundingStrategy::MidpointAwayFromZero,
+        Rounding::HalfEven => RoundingStrategy::MidpointNearestEven,
+        Rounding::AwayFromZero => RoundingStrategy::AwayFromZero,
+        Rounding::TowardZero => RoundingStrategy::ToZero,
+    }
 }
 
-fn arb_amount() -> impl Strategy<Value = Amount<5>> {
-    arb_raw().prop_map(Amount::<5>::from_raw_units)
+fn dec_in(lo: i64, hi: i64, max_scale: u32) -> impl Strategy<Value = Decimal> {
+    (lo..=hi, 0..=max_scale).prop_map(|(m, s)| Decimal::new(m, s))
 }
 
-/// Non-negative amounts — the common case for prices and bases.
-fn arb_positive_amount() -> impl Strategy<Value = Amount<5>> {
-    (0i64..1_000_000_000_000i64).prop_map(Amount::<5>::from_raw_units)
-}
-
-/// A VAT rate in [0, 1] with at most 4 decimal places.
-/// A VAT rate in (0, 1], with four decimals.
-///
-/// Zero is excluded on purpose: these generators feed `FixedRateTax::new`, which
-/// defaults to category `S`, and BR-S-05 requires a standard-rated rate above
-/// zero. A supply taxed at zero is zero-*rated* (`Z`) and has its own constructor,
-/// `FixedRateTax::zero_rated`.
-fn arb_rate() -> impl Strategy<Value = Decimal> {
-    (1u32..=10_000u32).prop_map(|n| Decimal::new(n as i64, 4))
-}
-
-fn arb_strategy() -> impl Strategy<Value = RoundingStrategy> {
-    prop_oneof![
-        Just(RoundingStrategy::MidpointAwayFromZero),
-        Just(RoundingStrategy::MidpointToEven),
-        Just(RoundingStrategy::Ceiling),
-        Just(RoundingStrategy::Floor),
-        Just(RoundingStrategy::Truncate),
+fn vats() -> Vec<Vat> {
+    vec![
+        Vat::standard(Percent::new(dec!(19))).unwrap(),
+        Vat::standard(Percent::new(dec!(7))).unwrap(),
+        Vat::standard(Percent::new(dec!(7.7))).unwrap(),
+        Vat::zero_rated(),
+        Vat::exempt(TaxCategory::Exempt, Exemption::Text("§4".into())).unwrap(),
+        Vat::regional(TaxCategory::CanaryIslands, Percent::new(dec!(0))).unwrap(),
+        Vat::exempt(
+            TaxCategory::ReverseCharge,
+            Exemption::Code("VATEX-EU-AE".into()),
+        )
+        .unwrap(),
     ]
 }
 
-proptest! {
-    // ── Amount: algebraic laws ───────────────────────────────────────────────
-
-    #[test]
-    fn parse_display_roundtrips_exactly(raw in any::<i64>()) {
-        let a = Amount::<5>::from_raw_units(raw);
-        let reparsed = Amount::<5>::parse(&a.to_string()).unwrap();
-        prop_assert_eq!(a, reparsed);
-    }
-
-    #[test]
-    fn decimal_conversion_roundtrips_exactly(raw in any::<i64>()) {
-        let a = Amount::<5>::from_raw_units(raw);
-        // `into_decimal` never produces more than P digits, so the *exact*
-        // constructor must accept every value — no rounding involved.
-        prop_assert_eq!(Amount::<5>::checked_from_decimal(a.into_decimal()), Ok(a));
-    }
-
-    #[test]
-    fn addition_is_commutative(a in arb_amount(), b in arb_amount()) {
-        prop_assert_eq!(a.checked_add(b).unwrap(), b.checked_add(a).unwrap());
-    }
-
-    #[test]
-    fn addition_is_associative(a in arb_amount(), b in arb_amount(), c in arb_amount()) {
-        let left  = a.checked_add(b).unwrap().checked_add(c).unwrap();
-        let right = a.checked_add(b.checked_add(c).unwrap()).unwrap();
-        prop_assert_eq!(left, right);
-    }
-
-    #[test]
-    fn sub_then_add_is_identity(a in arb_amount(), b in arb_amount()) {
-        prop_assert_eq!(a.checked_sub(b).unwrap().checked_add(b).unwrap(), a);
-    }
-
-    #[test]
-    fn checked_ops_never_panic(a in any::<i64>(), b in any::<i64>(), qty in -1_000_000i64..1_000_000) {
-        // The whole point of the `checked_*` family: an Err is fine, a panic is not.
-        // `any::<i64>()` includes i64::MIN, the historical panic source.
-        let (a, b) = (Amount::<5>::from_raw_units(a), Amount::<5>::from_raw_units(b));
-        let _ = a.checked_add(b);
-        let _ = a.checked_sub(b);
-        let _ = a.checked_neg();
-        let _ = a.checked_abs();
-        let _ = a.checked_mul_qty(Decimal::from(qty));
-        let _ = a.checked_div(Decimal::from(qty));
-        let _ = a.checked_round_to::<2>(RoundingStrategy::MidpointAwayFromZero);
-    }
-
-    // ── Amount: conservation of money ────────────────────────────────────────
-
-    #[test]
-    fn distribute_conserves_the_total(a in arb_amount(), n in 1usize..64) {
-        let parts = a.distribute(n).unwrap();
-        prop_assert_eq!(parts.len(), n);
-        let sum = Amount::checked_sum(parts.iter().copied()).unwrap();
-        prop_assert_eq!(sum, a, "distribute must neither create nor destroy money");
-    }
-
-    #[test]
-    fn distribute_parts_differ_by_at_most_one_unit(a in arb_amount(), n in 1usize..64) {
-        let parts = a.distribute(n).unwrap();
-        let min = parts.iter().map(|p| p.to_raw()).min().unwrap();
-        let max = parts.iter().map(|p| p.to_raw()).max().unwrap();
-        prop_assert!(max - min <= 1, "parts spread too far: {} vs {}", min, max);
-    }
-
-    #[test]
-    fn allocate_conserves_the_total(
-        a in arb_amount(),
-        // Zero is included deliberately. A recipient allocated nothing — a tenant
-        // who moved in mid-period, a cost centre switched off for the month — is a
-        // routine input, and it is the one the old `1..1000` generator could never
-        // produce. Only an all-zero set is a genuine error.
-        ratios in prop::collection::vec(0u64..1000, 1..16),
-    ) {
-        match a.allocate(&ratios) {
-            Ok(parts) => {
-                prop_assert_eq!(parts.len(), ratios.len());
-                let sum = Amount::checked_sum(parts.iter().copied()).unwrap();
-                prop_assert_eq!(sum, a, "allocate must neither create nor destroy money");
-                // A zero ratio is a zero share — never a rounding crumb. The
-                // largest-remainder step hands out spare units by remainder, and a
-                // zero ratio has none, so it must never be served.
-                for (ratio, part) in ratios.iter().zip(&parts) {
-                    if *ratio == 0 {
-                        prop_assert_eq!(
-                            *part,
-                            Amount::<5>::ZERO,
-                            "a zero ratio must receive nothing"
-                        );
-                    }
-                }
-            }
-            Err(_) => prop_assert!(
-                ratios.iter().all(|r| *r == 0),
-                "the only ratios that may be refused are all-zero ones, got {:?}",
-                ratios
-            ),
-        }
-    }
-
-    #[test]
-    fn allocate_is_monotonic_in_the_ratios(a in arb_positive_amount()) {
-        // A larger ratio never yields a smaller share of a non-negative amount.
-        let parts = a.allocate(&[1, 2, 3]).unwrap();
-        prop_assert!(parts[0] <= parts[1]);
-        prop_assert!(parts[1] <= parts[2]);
-    }
-
-    #[test]
-    fn proportional_split_conserves_the_total(
-        total in 0u64..1_000_000_000,
-        weights in prop::collection::vec(1u32..100, 1..12),
-    ) {
-        // Build fractions that sum to exactly 1 by construction.
-        let sum: u32 = weights.iter().sum();
-        let mut fractions: Vec<Decimal> = weights
-            .iter()
-            .map(|w| Decimal::from(*w) / Decimal::from(sum))
-            .collect();
-        // Force an exact sum of 1 despite division rounding.
-        let drift: Decimal = fractions.iter().sum::<Decimal>() - Decimal::ONE;
-        let last = fractions.len() - 1;
-        fractions[last] -= drift;
-
-        let total = Decimal::from(total);
-        let parts = proportional_split(total, &fractions, 3).unwrap();
-        let got: Decimal = parts.iter().sum();
-        prop_assert_eq!(got, total, "Hamilton split must sum to the rounded total");
-    }
-
-    #[test]
-    fn proportional_split_conserves_the_total_when_the_shares_do_not_sum_to_one(
-        total in 0u64..1_000_000_000u64,
-        n in 1usize..12,
-        scale in 0u32..6,
-    ) {
-        // The test above builds fractions that sum to *exactly* one, which is the
-        // region where the interesting bug cannot occur: with no drift the deficit
-        // never exceeds one unit per fraction, so the branch that has to handle a
-        // larger one is unreachable from that generator.
-        //
-        // Real callers do not get exact fractions. `1/n` truncated to nine
-        // decimals is what a config file or a spreadsheet hands you, and it sums
-        // to slightly under one — which is the case the share-sum tolerance
-        // deliberately admits, and therefore the case the split has to honour.
-        let share = (Decimal::ONE / Decimal::from(n as u64))
-            .round_dp_with_strategy(9, rust_decimal::RoundingStrategy::ToZero);
-        let fractions = vec![share; n];
-        let total = Decimal::from(total);
-
-        // Whatever the tolerance decides, the guarantee is the same: this
-        // function either refuses the shares or splits them exactly. Returning a
-        // set of parts that sums to anything other than the total is the one
-        // outcome it must never produce — and an `Err` for shares it accepted is
-        // what the bug actually looked like.
-        if let Ok(parts) = proportional_split(total, &fractions, scale) {
-            prop_assert_eq!(parts.len(), n);
-            let got: Decimal = parts.iter().sum();
-            prop_assert_eq!(
-                got,
-                total.round_dp_with_strategy(
-                    scale,
-                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-                ),
-                "accepted shares must split exactly"
+fn line(vat: Option<usize>) -> impl Strategy<Value = Line> {
+    (
+        dec_in(-100_000, 100_000, 3),
+        dec_in(0, 1_000_000, 6),
+        prop::sample::select(vec![dec!(1), dec!(3), dec!(100)]),
+        prop::option::weighted(0.2, dec_in(-10_000, 10_000, 6)),
+        prop::collection::vec((any::<bool>(), dec_in(0, 2_000, 4)), 0..3),
+    )
+        .prop_map(move |(q, p, base, net, adj)| {
+            let mut l = Line::new(
+                "l",
+                Quantity::new(q, "KWH"),
+                UnitPrice::new(Price::new(p)).with_base_quantity(base),
             );
-            // The correction is spread, not concentrated: the deficit is under two
-            // units per fraction, so no part may run further than that from its
-            // ideal share.
-            let unit = Decimal::new(1, scale);
-            for part in &parts {
-                let ideal = total * share;
-                prop_assert!(
-                    (part - ideal).abs() <= unit * Decimal::from(2u64),
-                    "part {} strays more than two units from its ideal {}",
-                    part,
-                    ideal
-                );
+            if let Some(n) = net {
+                l = l.with_net(n);
             }
-        }
-    }
-
-    #[test]
-    fn proportional_split_never_rejects_evenly_truncated_thirds(
-        total in 0u64..29_999_999u64,
-        scale in 0u32..3,
-    ) {
-        // Held as a law rather than as a single example: three `0.333333333` shares
-        // are inside the documented tolerance, so they must split rather than fail —
-        // at every total the
-        // tolerance accepts, not merely at the one that was tested.
-        let fractions = [Decimal::new(333_333_333, 9); 3];
-        let total = Decimal::from(total);
-        let parts = proportional_split(total, &fractions, scale)
-            .map_err(|e| TestCaseError::fail(format!("rejected total {total}: {e}")))?;
-        let got: Decimal = parts.iter().sum();
-        prop_assert_eq!(
-            got,
-            total.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-        );
-    }
-
-    // ── Rounding laws ────────────────────────────────────────────────────────
-
-    #[test]
-    fn round_to_increment_is_idempotent(
-        a in arb_amount(),
-        inc in 1i64..100_000,
-        strat in arb_strategy(),
-    ) {
-        let inc = Amount::<5>::from_raw_units(inc);
-        let once = a.round_to_increment(inc, strat).unwrap();
-        let twice = once.round_to_increment(inc, strat).unwrap();
-        prop_assert_eq!(once, twice, "rounding an already-rounded value must not move it");
-    }
-
-    #[test]
-    fn round_to_increment_lands_on_a_multiple(
-        a in arb_amount(),
-        inc in 1i64..100_000,
-        strat in arb_strategy(),
-    ) {
-        let inc_amt = Amount::<5>::from_raw_units(inc);
-        let r = a.round_to_increment(inc_amt, strat).unwrap();
-        prop_assert_eq!(r.to_raw() % inc, 0, "{} is not a multiple of {}", r, inc_amt);
-    }
-
-    #[test]
-    fn round_to_increment_stays_within_one_increment(
-        a in arb_amount(),
-        inc in 1i64..100_000,
-        strat in arb_strategy(),
-    ) {
-        let inc_amt = Amount::<5>::from_raw_units(inc);
-        let r = a.round_to_increment(inc_amt, strat).unwrap();
-        prop_assert!(
-            (r.to_raw() - a.to_raw()).abs() < inc,
-            "rounding moved {} to {}, further than one increment {}",
-            a, r, inc_amt
-        );
-    }
-
-    #[test]
-    fn cash_rounding_difference_reconstructs_the_rounded_amount(
-        a in arb_amount(),
-        inc in 1i64..100_000,
-        strat in arb_strategy(),
-    ) {
-        let rule = CashRounding::new(Amount::<5>::from_raw_units(inc), strat).unwrap();
-        let rounded = rule.round(a).unwrap();
-        let diff = rule.difference(a).unwrap();
-        prop_assert_eq!(a.checked_add(diff).unwrap(), rounded);
-    }
-
-    // ── Document invariants ──────────────────────────────────────────────────
-
-    #[test]
-    fn documents_are_always_internally_consistent(
-        amounts in prop::collection::vec(arb_raw(), 0..12),
-        rate in arb_rate(),
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
-                    .build()
-                    .unwrap()
-            })
-            .collect();
-        let taxes: Vec<Box<dyn TaxLayer>> =
-            vec![Box::new(FixedRateTax::new("VAT", rate).unwrap())];
-        let doc = BillingDocument::from_positions(
-            DocumentMeta { currency: Currency::EUR, ..Default::default() },
-            positions, taxes, vec![],
-        ).unwrap();
-
-        prop_assert!(doc.validate().is_ok(), "constructed document failed validation");
-        // BR-CO-15: gross = net + tax.
-        prop_assert_eq!(
-            doc.net_total().checked_add(doc.tax_total()).unwrap(),
-            doc.gross_total()
-        );
-    }
-
-    /// The whole EN 16931 totals chain, spelled the way the standard spells it —
-    /// with BT-107 as a positive magnitude that BR-CO-13 *subtracts*.
-    ///
-    /// `documents_are_always_internally_consistent` above checks BR-CO-15 on a
-    /// document with neither allowances nor charges, where BT-107 and BT-108 are
-    /// both zero and the identity degenerates. This one puts a discount layer and a
-    /// levy on every document, so BR-CO-11, BR-CO-12 and BR-CO-13 are each doing
-    /// work — and it reads the allowance total through `allowance_total()`, which
-    /// is the accessor a consumer emits as the unsigned `cbc:AllowanceTotalAmount`.
-    #[test]
-    fn the_totals_chain_holds_with_allowances_and_charges_present(
-        amounts in prop::collection::vec(1i64..100_000_000, 1..8),
-        vat_rate in arb_rate(),
-        discount_rate in (0u32..=100).prop_map(|p| Decimal::new(p as i64, 2)),
-        levy_raw in 0i64..500_000,
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                LineItem::for_usage(
-                    format!("Item {i}"),
-                    Quantity::new(Decimal::new(*raw, 5), "kWh"),
-                    UnitPrice::new(Decimal::ONE, "EUR/kWh"),
-                )
-                .build()
-                .unwrap()
-            })
-            .collect();
-
-        let doc = BillingDocument::builder()
-            .currency(Currency::EUR)
-            .positions(positions)
-            .extra_discount(PercentageDiscount::new("Rabatt", discount_rate).unwrap().boxed())
-            // A per-unit levy is a BG-21 charge: it feeds BT-108, not BT-110.
-            .extra_tax(
-                PerUnitLevy::new("Abgabe", Amount::<5>::from_raw_units(levy_raw), "kWh")
-                    .unwrap()
-                    .boxed(),
-            )
-            .extra_tax(FixedRateTax::new("MwSt", vat_rate).unwrap().boxed())
-            .build()
-            .unwrap();
-
-        let bt106 = doc.line_total().unwrap();
-        let bt107 = doc.allowance_total().unwrap();
-        let bt108 = doc.charge_total().unwrap();
-        let bt109 = doc.taxable_total().unwrap();
-        let bt110 = doc.vat_total().unwrap();
-
-        // BT-107 is a magnitude, never a negative number.
-        prop_assert!(!bt107.is_negative(), "BT-107 must be stated as a magnitude");
-        // …and it is exactly the negation of the engine's signed view.
-        prop_assert_eq!(bt107, doc.discount_total().checked_neg().unwrap());
-
-        // BR-CO-13: BT-109 = BT-106 − BT-107 + BT-108.
-        prop_assert_eq!(
-            bt109,
-            bt106.checked_sub(bt107).unwrap().checked_add(bt108).unwrap()
-        );
-        // BR-CO-15: BT-112 = BT-109 + BT-110. This is the identity that fails if a
-        // charge is mistaken for VAT, which is why BT-108 and BT-110 are separate.
-        prop_assert_eq!(bt109.checked_add(bt110).unwrap(), doc.gross_total());
-        // BR-CO-14: BT-110 = Σ BT-117.
-        doc.verify_vat_attribution().unwrap();
-    }
-
-    #[test]
-    fn allocation_conserves_every_total_and_keeps_documents_valid(
-        amounts in prop::collection::vec(1i64..100_000_000, 1..8),
-        rate in arb_rate(),
-        n in 1usize..9,
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
-                    .build()
-                    .unwrap()
-            })
-            .collect();
-        let taxes: Vec<Box<dyn TaxLayer>> =
-            vec![Box::new(FixedRateTax::new("VAT", rate).unwrap())];
-        let doc = BillingDocument::from_positions(
-            DocumentMeta { currency: Currency::EUR, ..Default::default() },
-            positions, taxes, vec![],
-        ).unwrap();
-
-        let docs = EqualAllocation::new(n).unwrap().allocate(&doc).unwrap();
-
-        // Every recipient document is self-consistent...
-        for (i, d) in docs.iter().enumerate() {
-            prop_assert!(d.validate().is_ok(), "recipient {} invalid: {:?}", i, d.validate());
-        }
-        // ...and nothing leaks or is invented across the split.
-        let net: Amount<5> = docs.iter().map(|d| d.net_total()).sum();
-        let tax: Amount<5> = docs.iter().map(|d| d.tax_total()).sum();
-        let gross: Amount<5> = docs.iter().map(|d| d.gross_total()).sum();
-        prop_assert_eq!(net, doc.net_total());
-        prop_assert_eq!(tax, doc.tax_total());
-        prop_assert_eq!(gross, doc.gross_total());
-
-        // The VAT breakdown splits exactly too.
-        for (idx, src) in doc.tax_breakdown().iter().enumerate() {
-            let base: Amount<5> = docs.iter().map(|d| d.tax_breakdown()[idx].taxable_base).sum();
-            let amt: Amount<5> = docs.iter().map(|d| d.tax_breakdown()[idx].tax_amount).sum();
-            prop_assert_eq!(base, src.taxable_base);
-            prop_assert_eq!(amt, src.tax_amount);
-        }
-    }
-
-    #[test]
-    fn reversal_is_an_involution_and_nets_to_zero(
-        amounts in prop::collection::vec(arb_raw(), 1..8),
-        rate in arb_rate(),
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
-                    .build()
-                    .unwrap()
-            })
-            .collect();
-        let taxes: Vec<Box<dyn TaxLayer>> =
-            vec![Box::new(FixedRateTax::new("VAT", rate).unwrap())];
-        let doc = BillingDocument::from_positions(
-            DocumentMeta { currency: Currency::EUR, ..Default::default() },
-            positions, taxes, vec![],
-        ).unwrap();
-
-        let credit = doc.reverse(DocumentMeta::default()).unwrap();
-        prop_assert!(credit.validate().is_ok());
-
-        // An invoice plus its credit note settles to nothing.
-        prop_assert_eq!(
-            doc.gross_total().checked_add(credit.gross_total()).unwrap(),
-            Amount::<5>::ZERO
-        );
-        // Reversing twice returns the original figures.
-        let back = credit.reverse(DocumentMeta::default()).unwrap();
-        prop_assert_eq!(back.net_total(), doc.net_total());
-        prop_assert_eq!(back.gross_total(), doc.gross_total());
-    }
-
-    #[test]
-    fn amount_due_follows_br_co_16(
-        gross_raw in 0i64..1_000_000_000,
-        prepaid_raw in 0i64..1_000_000_000,
-        inc in 1i64..100_000,
-    ) {
-        let doc = BillingDocument::from_positions(
-            DocumentMeta { currency: Currency::EUR, ..Default::default() },
-            vec![LineItem::fixed("Item", Amount::<5>::from_raw_units(gross_raw))
-                .build().unwrap()],
-            vec![], vec![],
-        ).unwrap();
-
-        let prepaid = Amount::<5>::from_raw_units(prepaid_raw);
-        let rule = CashRounding::new(
-            Amount::<5>::from_raw_units(inc),
-            RoundingStrategy::MidpointAwayFromZero,
-        ).unwrap();
-        let doc = doc.with_prepaid(prepaid).unwrap().with_cash_rounding(rule).unwrap();
-
-        // BT-115 = BT-112 − BT-113 + BT-114, exactly.
-        let expected = doc.gross_total()
-            .checked_sub(doc.prepaid()).unwrap()
-            .checked_add(doc.rounding()).unwrap();
-        prop_assert_eq!(doc.amount_due().unwrap(), expected);
-
-        // Prepayments must not disturb the taxable base.
-        prop_assert_eq!(doc.gross_total(), Amount::<5>::from_raw_units(gross_raw));
-    }
-
-    // ── Schedule invariants ──────────────────────────────────────────────────
-
-    #[test]
-    fn graduated_split_bills_every_unit_exactly_once(
-        qty in 0u64..10_000_000,
-        p1 in 1i64..500_000,
-        p2 in 1i64..500_000,
-    ) {
-        let sched = RateSchedule::graduated()
-            .unit("kWh")
-            .currency(Currency::EUR)
-            .band(RateBand::up_to(Decimal::from(500), Amount::<5>::from_raw_units(p1)))
-            .band(RateBand::over(Decimal::from(500), Amount::<5>::from_raw_units(p2)))
-            .build()
-            .unwrap();
-
-        let qty = Decimal::from(qty);
-        let items = sched.split(qty).unwrap();
-        // The tiers partition the quantity: no unit billed twice, none dropped.
-        let billed: Decimal = items.iter().filter_map(|i| i.quantity_value()).sum();
-        prop_assert_eq!(billed, qty);
-    }
-
-    // ── Tax invariants ───────────────────────────────────────────────────────
-
-    #[test]
-    fn vat_breakdown_matches_the_tax_it_reports(
-        amounts in prop::collection::vec(0i64..100_000_000, 1..8),
-        rate in arb_rate(),
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
-                    .build()
-                    .unwrap()
-            })
-            .collect();
-        let taxes: Vec<Box<dyn TaxLayer>> =
-            vec![Box::new(FixedRateTax::new("VAT", rate).unwrap())];
-        let doc = BillingDocument::from_positions(
-            DocumentMeta { currency: Currency::EUR, ..Default::default() },
-            positions, taxes, vec![],
-        ).unwrap();
-
-        // A single VAT layer produces exactly one breakdown line, whose base is the
-        // net total and whose tax equals the document's tax total.
-        prop_assert_eq!(doc.tax_breakdown().len(), 1);
-        let entry = &doc.tax_breakdown()[0];
-        prop_assert_eq!(entry.category, TaxCategory::Standard);
-        prop_assert_eq!(entry.taxable_base, doc.net_total());
-        prop_assert_eq!(entry.tax_amount, doc.tax_total());
-    }
+            for (charge, amount) in adj {
+                l = l.with_adjustment(if charge {
+                    LineAdjustment::charge(amount)
+                } else {
+                    LineAdjustment::allowance(amount)
+                });
+            }
+            if let Some(v) = vat {
+                l = l.with_vat(vats()[v].clone());
+            }
+            l
+        })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Parser robustness
-//
-// `Amount::parse` is the crate's only string parser and its only untrusted-input
-// surface. These stand in for a fuzz target: `proptest` shrinks counterexamples
-// and runs on stable, whereas `cargo-fuzz` needs nightly and finds the same
-// class of defect here (this crate has no `unsafe`, so the reachable bugs are
-// panics and logic errors, not memory unsafety).
-// ─────────────────────────────────────────────────────────────────────────────
+/// A random valid document builder at a random scale (2..=5 decimals).
+fn document() -> impl Strategy<Value = DocumentBuilder> {
+    (
+        2u8..=5,
+        prop::sample::select(MODES.to_vec()),
+        any::<bool>(),
+        prop::collection::vec(prop::option::of(0..7usize), 1..8),
+        prop::collection::vec(
+            (
+                any::<bool>(),
+                dec_in(0, 5_000, 3),
+                prop::option::of(0..7usize),
+            ),
+            0..3,
+        ),
+        prop::option::of(dec_in(-50_000, 50_000, 2)),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_flat_map(|(dp, mode, vat_free, line_vats, adjs, pre, cash, acct)| {
+            let lines: Vec<_> = line_vats
+                .iter()
+                .map(|v| line(if vat_free { None } else { *v }))
+                .collect();
+            (Just((dp, mode, vat_free, adjs, pre, cash, acct)), lines)
+        })
+        .prop_map(|((dp, mode, vat_free, adjs, pre, cash, acct), lines)| {
+            let mut b =
+                Document::builder(Currency::EUR, AmountScale::new(dp, mode).unwrap()).lines(lines);
+            if !vat_free {
+                b = b.default_vat(Vat::standard(Percent::new(dec!(19))).unwrap());
+            }
+            for (charge, amount, v) in adjs {
+                let mut a = if charge {
+                    DocumentAdjustment::charge("c", amount)
+                } else {
+                    DocumentAdjustment::allowance("a", amount)
+                };
+                if let (false, Some(v)) = (vat_free, v) {
+                    a = a.with_vat(vats()[v].clone());
+                }
+                b = b.adjustment(a);
+            }
+            if let Some(p) = pre {
+                b = b.payment(Payment::Gross {
+                    description: "prepayment".into(),
+                    amount: p,
+                });
+            }
+            if cash {
+                b = b.cash_rounding(CashRounding {
+                    increment: dec!(0.05),
+                    rounding: mode,
+                });
+            }
+            if acct {
+                b = b.vat_accounting(VatAccounting {
+                    currency: Currency::new("PLN").unwrap(),
+                    rate: dec!(4.2817),
+                });
+            }
+            b
+        })
+}
+
+fn weights() -> impl Strategy<Value = Vec<Decimal>> {
+    prop::collection::vec(dec_in(0, 1_000, 2), 1..6)
+        .prop_filter("not all zero", |w| w.iter().any(|x| !x.is_zero()))
+}
+
+fn round(x: Decimal, s: AmountScale) -> Decimal {
+    x.round_dp_with_strategy(u32::from(s.decimals), strategy(s.rounding))
+}
 
 proptest! {
-    #[test]
-    fn parse_never_panics_on_arbitrary_input(s in ".*") {
-        // Any string at all: an Err is fine, an abort is not.
-        let _ = Amount::<5>::parse(&s);
-        let _ = Amount::<0>::parse(&s);
-        let _ = Amount::<18>::parse(&s);
-    }
+    #![proptest_config(ProptestConfig::with_cases(300))]
 
+    /// BG-23 is the group-by of lines and adjustments by (category, rate),
+    /// and BT-117 = round(BT-116 × rate / 100) once (oracle: rust_decimal).
     #[test]
-    fn parse_never_panics_on_numeric_looking_input(
-        sign in "[+-]?",
-        whole in "[0-9]{0,25}",
-        sep in "[.,]?",
-        frac in "[0-9]{0,25}",
-    ) {
-        let s = format!("{sign}{whole}{sep}{frac}");
-        let _ = Amount::<5>::parse(&s);
-    }
-
-    #[test]
-    fn parse_accepts_what_display_produces_for_every_precision(raw in any::<i64>()) {
-        // Display/parse must round-trip at every supported precision, including the
-        // extremes where the i128 intermediate matters.
-        prop_assert_eq!(
-            Amount::<0>::parse(&Amount::<0>::from_raw_units(raw).to_string()).unwrap().to_raw(),
-            raw
-        );
-        prop_assert_eq!(
-            Amount::<2>::parse(&Amount::<2>::from_raw_units(raw).to_string()).unwrap().to_raw(),
-            raw
-        );
-        prop_assert_eq!(
-            Amount::<18>::parse(&Amount::<18>::from_raw_units(raw).to_string()).unwrap().to_raw(),
-            raw
-        );
-    }
-
-    #[test]
-    fn comma_and_dot_separators_are_equivalent(
-        whole in "[0-9]{1,10}",
-        frac in "[0-9]{1,5}",
-    ) {
-        let dot = Amount::<5>::parse(&format!("{whole}.{frac}"));
-        let comma = Amount::<5>::parse(&format!("{whole},{frac}"));
-        prop_assert_eq!(dot.is_ok(), comma.is_ok());
-        if let (Ok(a), Ok(b)) = (dot, comma) {
-            prop_assert_eq!(a, b);
+    fn vat_breakdown_is_a_group_by(b in document()) {
+        let d = b.build().unwrap();
+        let s = d.scale();
+        for g in d.vat_groups() {
+            let key = (g.category(), g.rate_percent());
+            let of = |v: Option<&Vat>| v.is_some_and(|v| (v.category(), v.rate_percent()) == key);
+            let mut base = Decimal::ZERO;
+            for (i, l) in d.lines().iter().enumerate() {
+                if of(l.vat()) { base += d.line_net(i).to_decimal(); }
+            }
+            for (i, a) in d.adjustments().iter().enumerate() {
+                if of(a.vat()) {
+                    let x = d.adjustment_amount(i).to_decimal();
+                    base += if a.kind() == billing::AdjustmentKind::Charge { x } else { -x };
+                }
+            }
+            prop_assert_eq!(g.taxable_base().to_decimal(), base);
+            prop_assert_eq!(g.tax().to_decimal(), round(base * g.rate_percent().value() / dec!(100), s));
+        }
+        let members = d.lines().iter().filter_map(Line::vat).chain(d.adjustments().iter().filter_map(DocumentAdjustment::vat));
+        for v in members {
+            prop_assert!(d.vat_groups().iter().any(|g| g.vat().category() == v.category() && g.rate_percent() == v.rate_percent()));
         }
     }
 
-    /// The two entry points must agree on **exactly** what is representable.
-    ///
-    /// `Amount::parse` and `Amount::checked_from_decimal` are documented as the
-    /// text and `Decimal` halves of one conversion — *"a value refused as text is
-    /// refused as a `Decimal`"*. Nothing enforced that across arbitrary inputs, and
-    /// they can disagree in ways no example catches: `Decimal::from_str` accepts an
-    /// omitted integer part, so a `parse` that refused `".5"` would reject as text
-    /// what it accepts as a `Decimal` — the exact shape a CSV export produces.
-    ///
-    /// Comparing acceptance rather than the value is what makes this a real check:
-    /// it fails whichever of the two is the stricter one.
+    /// Each line's BT-131 is the sum of its leaves, each rounded once.
     #[test]
-    fn parse_and_checked_from_decimal_accept_the_same_strings(
-        sign in "[+-]?",
-        whole in "[0-9]{0,12}",
-        sep in "[.,]?",
-        frac in "[0-9]{0,8}",
-    ) {
-        let text = format!("{sign}{whole}{sep}{frac}");
-        let from_text = Amount::<5>::parse(&text);
+    fn line_net_rounds_each_leaf_once(b in document()) {
+        let d = b.build().unwrap();
+        let s = d.scale();
+        for (i, l) in d.lines().iter().enumerate() {
+            let pp = match l.stated_net() {
+                Some(n) => round(n, s),
+                None => round(l.quantity().value() * l.price().price().value() / l.price().base_quantity(), s),
+            };
+            let mut net = pp;
+            for a in l.adjustments() {
+                let r = round(a.amount(), s);
+                net += if a.kind() == billing::AdjustmentKind::Charge { r } else { -r };
+            }
+            prop_assert_eq!(d.line_net(i).to_decimal(), net);
+        }
+    }
 
-        // `Decimal` only knows the dot, so normalise the separator the same way
-        // `parse` does before handing it over.
-        let normalised = text.replace(',', ".");
-        let Ok(d) = Decimal::from_str_exact(&normalised) else {
-            // Not a number to `Decimal` either — `parse` must refuse it too.
-            prop_assert!(
-                from_text.is_err(),
-                "parse accepted {text:?}, which Decimal rejects"
-            );
+    /// negated() is an involution, negates every total, and equals building
+    /// the negated inputs (all roundings are sign-symmetric).
+    #[test]
+    fn negation_is_an_exact_involution(b in document()) {
+        let d = b.build().unwrap();
+        let n = d.negated();
+        prop_assert_eq!(&n.negated(), &d);
+        prop_assert_eq!(n.payable(), -d.payable());
+        prop_assert_eq!(n.vat_total(), -d.vat_total());
+        prop_assert_eq!(n.rounding(), -d.rounding());
+        prop_assert_eq!(n.clone().into_builder().build().unwrap(), n);
+    }
+
+    /// concat ≡ build of the concatenated inputs.
+    #[test]
+    fn concat_equals_build(b in document(), cut in 0usize..8) {
+        let d = b.build().unwrap();
+        let cut = cut.min(d.lines().len());
+        let with = |lines: &[Line], adjustments: bool, settlement: bool| {
+            let mut x = Document::builder(d.currency(), d.scale()).lines(lines.to_vec());
+            if adjustments { x = x.adjustments(d.adjustments().to_vec()); }
+            if settlement { x = x.payments(d.payments().to_vec()); }
+            if let Some(c) = d.cash_rounding() { x = x.cash_rounding(*c); }
+            if let Some(v) = d.vat_accounting() { x = x.vat_accounting(*v); }
+            x.build()
+        };
+        let (Ok(first), Ok(second)) = (with(&d.lines()[..cut], true, true), with(&d.lines()[cut..], false, false)) else {
+            return Ok(()); // a half that is VAT-free next to a VAT half
+        };
+        let c = Document::concat([first, second]).unwrap();
+        prop_assert_eq!(c, with(d.lines(), true, true).unwrap());
+    }
+
+    /// split: every conserved total sums to the parent exactly; each share's
+    /// line nets are within their leaves' quota; every share's partitioned tax
+    /// is within one unit of its own derivation; shares hold R120.
+    #[test]
+    fn split_conserves_and_keeps_quota(b in document(), w in weights()) {
+        let d = b.build().unwrap();
+        let shares = d.split(&w).unwrap();
+        prop_assert_eq!(shares.len(), w.len());
+        let sum = |f: fn(&Document) -> Amount| shares.iter().map(f).sum::<Amount>();
+        prop_assert_eq!(sum(Document::line_total), d.line_total());
+        prop_assert_eq!(sum(Document::allowance_total), d.allowance_total());
+        prop_assert_eq!(sum(Document::charge_total), d.charge_total());
+        prop_assert_eq!(sum(Document::tax_exclusive_total), d.tax_exclusive_total());
+        prop_assert_eq!(sum(Document::vat_total), d.vat_total());
+        prop_assert_eq!(sum(Document::tax_inclusive_total), d.tax_inclusive_total());
+        prop_assert_eq!(sum(Document::prepaid), d.prepaid());
+        if d.cash_rounding().is_none() {
+            prop_assert_eq!(sum(Document::payable), d.payable());
+        }
+        let total_w: Decimal = w.iter().sum();
+        let unit = Decimal::new(1, u32::from(d.scale().decimals));
+        for (j, s) in shares.iter().enumerate() {
+            let parent = d.price_inconsistent();
+            prop_assert!(s.price_inconsistent().iter().all(|i| parent.contains(i)));
+            for (k, g) in s.vat_groups().iter().enumerate() {
+                prop_assert_eq!(g.vat(), d.vat_groups()[k].vat());
+                let own = round(g.taxable_base().to_decimal() * g.rate_percent().value() / dec!(100), d.scale());
+                prop_assert!((g.tax().to_decimal() - own).abs() <= unit);
+            }
+            for (i, l) in d.lines().iter().enumerate() {
+                let leaves = Decimal::from(1 + l.adjustments().len());
+                let exact = d.line_net(i).to_decimal() * w[j] / total_w;
+                prop_assert!((s.line_net(i).to_decimal() - exact).abs() < leaves * unit);
+            }
+        }
+        for (k, g) in d.vat_groups().iter().enumerate() {
+            let base: Amount = shares.iter().map(|s| s.vat_groups()[k].taxable_base()).sum();
+            let tax: Amount = shares.iter().map(|s| s.vat_groups()[k].tax()).sum();
+            prop_assert_eq!((base, tax), (g.taxable_base(), g.tax()));
+        }
+    }
+
+    /// segments conserve the line's BT-131 and quantity exactly.
+    #[test]
+    fn segments_conserve(l in line(Some(0)), w in weights(), dp in 2u8..=5) {
+        let s = AmountScale::new(dp, Rounding::HalfEven).unwrap();
+        let whole = Document::builder(Currency::EUR, s).line(l.clone()).build().unwrap();
+        let segs = l.segments(&w, s).unwrap();
+        let parts = Document::builder(Currency::EUR, s).lines(segs.clone()).build().unwrap();
+        prop_assert_eq!(parts.line_total(), whole.line_total());
+        prop_assert_eq!(segs.iter().map(|x| x.quantity().value()).sum::<Decimal>(), l.quantity().value());
+        if !whole.price_inconsistent().is_empty() { return Ok(()); }
+        prop_assert!(parts.price_inconsistent().is_empty());
+    }
+
+    /// A minimum (or maximum) on the gross is reached (or kept) exactly at
+    /// the scale, under every rounding, by the smallest (largest) whole-unit
+    /// line; on the net the line is exact.
+    #[test]
+    fn bounds_reach_their_target_minimally(
+        nets in prop::collection::vec((dec_in(0, 5_000, 2), 0..3usize), 1..4),
+        target in dec_in(1, 50_000, 2),
+        mode in prop::sample::select(MODES.to_vec()),
+        gross in any::<bool>(),
+        minimum in any::<bool>(),
+        bound_vat in 0..3usize,
+    ) {
+        let s = AmountScale::new(2, mode).unwrap();
+        let v = vats();
+        let lines: Vec<Line> = nets.iter().map(|(n, k)| Line::fixed("l", *n).with_vat(v[*k].clone())).collect();
+        let basis = if gross { Basis::Gross } else { Basis::Net };
+        let bound = if minimum { Bound::minimum(basis, target, "b") } else { Bound::maximum(basis, target, "b") }
+            .with_vat(v[bound_vat].clone());
+        let plain = Document::builder(Currency::EUR, s).lines(lines.clone()).build().unwrap();
+        let built = Document::builder(Currency::EUR, s).lines(lines.clone()).bound(bound).build();
+        let Ok(d) = built else {
+            prop_assert!(minimum && plain.tax_exclusive_total().is_negative());
             return Ok(());
         };
-        let from_decimal = Amount::<5>::checked_from_decimal(d);
-
-        prop_assert_eq!(
-            from_text.is_ok(),
-            from_decimal.is_ok(),
-            "parse and checked_from_decimal disagree on {:?}: {:?} vs {:?}",
-            text, from_text, from_decimal
-        );
-        if let (Ok(a), Ok(b)) = (from_text, from_decimal) {
-            prop_assert_eq!(a, b, "same input, different value: {:?}", text);
+        let value = |d: &Document| if gross { d.tax_inclusive_total() } else { d.tax_exclusive_total() }.to_decimal();
+        if d.bound_lines() == 0 {
+            let held = if minimum { value(&d) >= target } else { value(&d) <= target };
+            prop_assert!(held);
+            return Ok(());
         }
-    }
-
-    #[test]
-    fn parse_rejects_precision_it_cannot_represent(
-        whole in "[0-9]{1,8}",
-        frac in "[0-9]{6,12}",
-    ) {
-        // A 6th+ fractional digit is representable at P=5 only if it is zero.
-        let s = format!("{whole}.{frac}");
-        let excess_is_all_zero = frac[5..].bytes().all(|b| b == b'0');
-        prop_assert_eq!(Amount::<5>::parse(&s).is_ok(), excess_is_all_zero);
-    }
-
-    // ── Formatting ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn display_honours_width_and_never_truncates(raw in arb_raw(), width in 0usize..40) {
-        let a = Amount::<5>::from_raw_units(raw);
-        let plain = a.to_string();
-        let padded = format!("{a:>width$}");
-        // Padding may extend, never shorten or mangle.
-        prop_assert!(padded.chars().count() >= plain.chars().count());
-        prop_assert!(padded.chars().count() >= width || plain.chars().count() >= width);
-        prop_assert!(padded.trim_start().starts_with(&plain));
-        // And it matches what the equivalent string formatting would produce.
-        prop_assert_eq!(padded, format!("{plain:>width$}"));
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PEPPOL-EN16931-R120 — one derivation, two precisions
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// `LineItemBuilder::build` and `BillingDocument::reduce_position` both evaluate
-//
-//     BT-131 = BT-129 × (BT-146 ÷ BT-149) + Σ BG-28 − Σ BG-27
-//
-// at different precisions. They are meant to share one implementation
-// (`line_item::compose_bt131`) precisely because they once drifted: BT-149 and
-// BG-27 / BG-28 were added to `build` and not to `reduce_position`, which then
-// stopped recognising such a line, fell back to reducing the already-rounded
-// five-decimal amount, and rounded **twice** — silently, and by up to a whole
-// minor unit.
-//
-// The law below re-derives the expression independently of both, so any future
-// drift fails here rather than in a customer's invoice.
-
-/// Divisors chosen so the quotient is usually non-terminating: that is exactly
-/// where rounding once and rounding twice disagree.
-fn arb_base_quantity() -> impl Strategy<Value = Option<Decimal>> {
-    prop_oneof![
-        Just(None),
-        Just(Some(Decimal::from(3))),
-        Just(Some(Decimal::from(7))),
-        Just(Some(Decimal::from(100))),
-        Just(Some(Decimal::from(1000))),
-    ]
-}
-
-/// Six-decimal prices, so `quantity × price` carries a long tail into the
-/// division and the two-decimal boundary is approached from every side.
-fn arb_long_tail_price() -> impl Strategy<Value = Decimal> {
-    (1i64..2_000_000i64).prop_map(|n| Decimal::new(n, 6))
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2048))]
-
-    /// Reducing a line to the interchange scale must round the whole R120
-    /// expression **once**, from its exact value — never the stored five-decimal
-    /// amount, and never each half by a different route.
-    #[test]
-    fn line_reduction_rounds_the_r120_expression_exactly_once(
-        qty_raw in 1i64..1_000_000i64,
-        price in arb_long_tail_price(),
-        base in arb_base_quantity(),
-        allowance_raw in 0i64..500_000i64,
-        charge_raw in 0i64..500_000i64,
-        credit in any::<bool>(),
-    ) {
-        let quantity = Quantity::new(Decimal::new(qty_raw, 3), "pcs");
-        let mut unit_price = UnitPrice::new(price, "EUR/pcs");
-        if let Some(b) = base {
-            unit_price = unit_price.per(b);
-        }
-        // BT-136 and BT-141, at the engine's precision.
-        let allowance = Amount::<5>::from_raw_units(allowance_raw);
-        let charge = Amount::<5>::from_raw_units(charge_raw);
-
-        let mut builder = if credit {
-            LineItem::credit_for_usage("Ware", quantity.clone(), unit_price.clone())
-        } else {
-            LineItem::for_usage("Ware", quantity.clone(), unit_price.clone())
-        };
-        builder = builder
-            .line_allowance(LineAllowanceCharge::allowance(allowance, "Rabatt"))
-            .line_allowance(LineAllowanceCharge::charge(charge, "Verpackung"));
-        let line = builder.build().unwrap();
-
-        let doc = BillingDocument::builder()
-            .currency(Currency::EUR)
-            .amount_scale(AmountScale::EN16931)
-            .positions(vec![line])
+        let held = if minimum { value(&d) >= target } else { value(&d) <= target };
+        prop_assert!(held);
+        // One unit less (more) misses.
+        let x = d.lines().last().unwrap().exact_net().unwrap();
+        let step = if minimum { dec!(-0.01) } else { dec!(0.01) };
+        let other = Document::builder(Currency::EUR, s)
+            .lines(lines)
+            .line(Line::fixed("m", x + step).with_vat(v[bound_vat].clone()))
             .build()
             .unwrap();
-        let reduced = &doc.net_positions()[0];
-
-        // Re-derive R120 here, from the inputs, independently of the engine.
-        let exact = quantity.value * price / base.unwrap_or(Decimal::ONE);
-        let round2 = |d: Decimal| d.round_dp_with_strategy(
-            2, rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-        );
-        let expected_unsigned =
-            round2(exact) - round2(allowance.into_decimal()) + round2(charge.into_decimal());
-        let expected = if credit && expected_unsigned > Decimal::ZERO {
-            -expected_unsigned
-        } else {
-            expected_unsigned
-        };
-
-        prop_assert_eq!(
-            reduced.net_amount.into_decimal(),
-            expected,
-            "R120 was not rounded once from the exact value \
-             (qty={}, price={}, base={:?})",
-            quantity.value, price, base,
-        );
-
-        // The emitted parts reproduce the emitted total — what a validator checks.
-        prop_assert!(reduced.net_amount.fits_scale(2));
-        for lac in &reduced.line_allowances {
-            prop_assert!(lac.amount.fits_scale(2));
-        }
-        prop_assert!(doc.fits_amount_scale(2));
-    }
-
-    // ── Tax-inclusive amounts ────────────────────────────────────────────────
-
-    /// The gross split is *lossless*: the net and the tax always re-sum to the
-    /// price that was quoted, under every rate and every rounding strategy.
-    ///
-    /// This is only true because the net is defined as the remainder. Rounding
-    /// `gross / (1 + rate)` and `gross * rate / (1 + rate)` independently fails
-    /// here for roughly half of all inputs, and the symptom on a real invoice is
-    /// a cent that appears or vanishes between the shelf price and BT-112.
-    #[test]
-    fn a_gross_amount_splits_into_net_and_tax_without_loss(
-        gross in arb_amount(),
-        rate in arb_rate(),
-        strategy in arb_strategy(),
-    ) {
-        let tax = gross.extract_tax(rate, strategy).unwrap();
-        let net = gross.net_of_tax(rate, strategy).unwrap();
-        prop_assert_eq!(net.checked_add(tax).unwrap(), gross);
-
-        // The extracted tax never exceeds the amount it came out of, and shares
-        // its sign — a gross of 119 cannot contain 130 of tax, nor -19.
-        prop_assert_eq!(tax.is_negative(), gross.is_negative() && !tax.is_zero());
-        prop_assert!(tax.checked_abs().unwrap() <= gross.checked_abs().unwrap());
-    }
-
-    /// `TaxBreakdownEntry::from_gross` produces a group a validator accepts:
-    /// BT-116 + BT-117 is the quoted gross, and BR-CO-17 holds on the result.
-    #[test]
-    fn a_breakdown_built_from_a_gross_price_satisfies_br_co_17(
-        gross in arb_positive_amount(),
-        rate in arb_rate(),
-    ) {
-        let entry = TaxBreakdownEntry::from_gross(
-            TaxCategory::Standard, rate, gross, AmountScale::EN16931,
-        ).unwrap();
-        prop_assert_eq!(
-            entry.taxable_base.checked_add(entry.tax_amount).unwrap(),
-            gross
-        );
-        prop_assert!(entry.validate().is_ok());
+        let missed = if minimum { value(&other) < target } else { value(&other) > target };
+        prop_assert!(missed);
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Allocation preserves the per-position VAT attribution (BR-S-08)
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// An allocated share satisfies `verify_vat_attribution` whenever the document
-    /// it came from did — **BR-S-08** and **BR-CO-14**, per recipient.
-    ///
-    /// It needs a *multi-group* document to be interesting. Splitting the breakdown
-    /// per group while correcting the positions in aggregate happens to agree on a
-    /// single VAT group, and lands a minor unit apart for roughly 45 % of recipients
-    /// on two — so a single-group generator would pass against a broken split, which
-    /// is exactly the way a property test can be strong and still prove nothing.
-    #[test]
-    fn allocation_preserves_br_s_08_on_a_multi_rate_document(
-        full in prop::collection::vec(1i64..50_000_000, 1..5),
-        reduced in prop::collection::vec(1i64..50_000_000, 1..5),
-        n in 2usize..8,
-        prepaid_raw in 0i64..1_000_000,
-    ) {
-        let position = |i: usize, raw: i64, tag: &str| {
-            LineItem::fixed(format!("{tag}-{i}"), Amount::<5>::from_raw_units(raw))
-                .tag(tag.to_string())
-                .build()
-                .unwrap()
-        };
-        let positions: Vec<LineItem> = full
-            .iter()
-            .enumerate()
-            .map(|(i, r)| position(i, *r, "full"))
-            .chain(reduced.iter().enumerate().map(|(i, r)| position(i, *r, "reduced")))
-            .collect();
-
-        let doc = BillingDocument::builder()
-            .currency(Currency::EUR)
-            .positions(positions)
-            .extra_tax(FixedRateTax::new("MwSt", dec!(0.19)).unwrap().with_tag("full").boxed())
-            .extra_tax(FixedRateTax::new("MwSt", dec!(0.07)).unwrap().with_tag("reduced").boxed())
-            .build()
-            .unwrap()
-            .with_prepaid(Amount::<5>::from_raw_units(prepaid_raw))
-            .unwrap();
-
-        // The source satisfies it, so every share must too.
-        doc.verify_vat_attribution().unwrap();
-
-        let parts = EqualAllocation::new(n).unwrap().allocate(&doc).unwrap();
-        prop_assert_eq!(parts.len(), n);
-
-        for (i, part) in parts.iter().enumerate() {
-            prop_assert!(part.validate().is_ok(), "recipient {} invalid: {:?}", i, part.validate());
-            prop_assert!(
-                part.verify_vat_attribution().is_ok(),
-                "recipient {} broke BR-S-08: {:?}",
-                i,
-                part.verify_vat_attribution()
-            );
-        }
-
-        // …and nothing leaks or is invented across the split.
-        let sum = |f: fn(&BillingDocument) -> Amount<5>| -> Amount<5> {
-            parts.iter().map(f).sum()
-        };
-        prop_assert_eq!(sum(|d| d.net_total()), doc.net_total());
-        prop_assert_eq!(sum(|d| d.tax_total()), doc.tax_total());
-        prop_assert_eq!(sum(|d| d.gross_total()), doc.gross_total());
-        prop_assert_eq!(sum(|d| d.prepaid()), doc.prepaid());
-        for (g, src) in doc.tax_breakdown().iter().enumerate() {
-            let base: Amount<5> = parts.iter().map(|d| d.tax_breakdown()[g].taxable_base).sum();
-            let tax: Amount<5> = parts.iter().map(|d| d.tax_breakdown()[g].tax_amount).sum();
-            prop_assert_eq!(base, src.taxable_base);
-            prop_assert_eq!(tax, src.tax_amount);
-        }
-    }
-
-    /// Every position is split exactly, not merely every total — which is what the
-    /// group-level guarantee above is built on.
-    #[test]
-    fn allocation_splits_each_position_exactly(
-        amounts in prop::collection::vec(-50_000_000i64..50_000_000, 1..8),
-        n in 2usize..8,
-    ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                let amount = Amount::<5>::from_raw_units(*raw);
-                if *raw < 0 {
-                    LineItem::credit_fixed(format!("C{i}"), amount).build().unwrap()
-                } else {
-                    LineItem::fixed(format!("D{i}"), amount).build().unwrap()
-                }
-            })
-            .collect();
-        let doc = BillingDocument::builder()
-            .currency(Currency::EUR)
-            .positions(positions)
-            .build()
-            .unwrap();
-
-        let parts = EqualAllocation::new(n).unwrap().allocate(&doc).unwrap();
-        for (p, source) in doc.net_positions().iter().enumerate() {
-            let rebuilt: Amount<5> = parts.iter().map(|d| d.net_positions()[p].net_amount).sum();
-            prop_assert_eq!(
-                rebuilt, source.net_amount,
-                "position {} does not reassemble from its shares", p
-            );
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Percentile billing — every figure billed is a rate that actually occurred
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Nearest-rank never interpolates, so the answer is always one of the samples.
-    /// The other common percentile definition averages the two neighbours, which
-    /// would bill a throughput figure the link never carried.
-    #[test]
-    fn a_percentile_is_always_a_sample_that_occurred(
-        values in prop::collection::vec(0i64..1_000_000, 1..64),
-        percent in 0u32..=100,
-    ) {
-        use billing::aggregation::{PercentileAggregator, UsageAggregator};
-        let agg = PercentileAggregator::new(
-            Decimal::from(percent),
-            |v: &i64| Decimal::from(*v),
-        ).unwrap();
-        let got = agg.aggregate(&values).unwrap();
-        prop_assert!(values.iter().any(|v| Decimal::from(*v) == got));
-    }
-
-    /// A higher percentile never bills less, and 100 % is the peak.
-    #[test]
-    fn percentiles_are_monotonic_and_top_out_at_the_maximum(
-        values in prop::collection::vec(0i64..1_000_000, 1..64),
-        a in 0u32..=100,
-        b in 0u32..=100,
-    ) {
-        use billing::aggregation::{MaxAggregator, PercentileAggregator, UsageAggregator};
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let at = |p: u32| PercentileAggregator::new(Decimal::from(p), |v: &i64| Decimal::from(*v))
-            .unwrap()
-            .aggregate(&values)
-            .unwrap();
-        prop_assert!(at(lo) <= at(hi));
-        prop_assert_eq!(
-            at(100),
-            MaxAggregator::new(|v: &i64| Decimal::from(*v)).aggregate(&values).unwrap()
-        );
-    }
-
-    /// "Discard the top 5 %, bill the highest one left" is the settlement rule every
-    /// transit contract states, and `ceil(0.95 × n)` is that rule as an index.
-    #[test]
-    fn p95_is_the_highest_sample_left_after_the_top_five_percent_is_discarded(
-        values in prop::collection::vec(0i64..1_000_000, 1..200),
-    ) {
-        use billing::aggregation::{PercentileAggregator, UsageAggregator};
-        let got = PercentileAggregator::p95(|v: &i64| Decimal::from(*v))
-            .aggregate(&values)
-            .unwrap();
-
-        let mut sorted = values.clone();
-        sorted.sort_unstable();
-        // `n - ceil(0.95n)` is what "the top 5 %" rounds down to.
-        let keep = (values.len() * 95).div_ceil(100).max(1);
-        sorted.truncate(keep);
-        prop_assert_eq!(got, Decimal::from(*sorted.last().unwrap()));
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Dynamic pricing rounds once over the whole sequence
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// An interval is not a leaf — it never becomes its own invoice line — so the
-    /// products are accumulated exactly and reduced **once**. Rounding each one
-    /// first drifts in a single direction, because commercial rounding is not
-    /// unbiased on a repeated fractional part.
-    #[test]
-    fn dynamic_pricing_is_the_single_rounding_of_the_exact_sum(
-        intervals in prop::collection::vec((1i64..1_000_000i64, 1i64..100_000i64), 1..40),
-    ) {
-        let mut builder = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
-        let mut exact = Decimal::ZERO;
-        for (qty_raw, price_raw) in &intervals {
-            // Quantities carry three decimals, prices five — the shape a spot
-            // sequence actually has, and enough for the product to exceed five.
-            let qty = Decimal::new(*qty_raw, 3);
-            let price = Amount::<5>::from_raw_units(*price_raw);
-            exact += qty * price.into_decimal();
-            builder = builder.interval(qty, price);
-        }
-        let net = builder.build().unwrap().calculate().unwrap().net_amount;
-        prop_assert_eq!(
-            net,
-            Amount::<5>::from_decimal_rounded(exact, RoundingStrategy::MidpointAwayFromZero).unwrap()
-        );
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Late payment interest
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Simple interest, never compounded — art. 2(6) of Directive 2011/7/EU says
-    /// so and §289 BGB forbids the alternative outright. Doubling the days doubles
-    /// the interest, up to the one rounding at the end.
-    #[test]
-    fn late_payment_interest_is_linear_in_the_days(
-        overdue in arb_positive_amount(),
-        percent in 1u32..=100_000,
-        days in 1u32..1_000,
-    ) {
-        let penalty = LatePaymentPenalty::new(Decimal::new(percent as i64, 4)).unwrap();
-        let once = penalty.interest_on(overdue, days).unwrap();
-        let twice = penalty.interest_on(overdue, days * 2).unwrap();
-        let doubled = once.checked_add(once).unwrap();
-        // Both sides round once at five decimals, so they can differ by one unit.
-        let gap = twice.checked_sub(doubled).unwrap().abs();
-        prop_assert!(gap <= Amount::<5>::from_raw_units(1), "gap {gap}");
-    }
-
-    /// The whole point of the type: an invoice's own totals never move, and paying
-    /// late costs strictly more than paying on the due date.
-    #[test]
-    fn a_penalty_only_ever_adds_to_what_is_payable(
-        overdue in arb_positive_amount(),
-        percent in 1u32..=100_000,
-        days in 0u32..1_000,
-        fee_raw in 0i64..10_000_000,
-    ) {
-        let penalty = LatePaymentPenalty::new(Decimal::new(percent as i64, 4))
-            .unwrap()
-            .with_recovery_fee(Amount::<5>::from_raw_units(fee_raw))
-            .unwrap();
-        let payable = penalty.payable_on(overdue, days).unwrap();
-        prop_assert!(payable >= overdue);
-        if days == 0 {
-            prop_assert_eq!(payable, overdue);
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Every position the engine generates is emittable as an invoice line
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// The crate states this as a design invariant. The arithmetic half of it is
-    /// `PEPPOL-EN16931-R120` — **fatal** — which requires BT-131 to equal
-    /// `BT-129 × (BT-146 ÷ BT-149)` plus the BG-27 / BG-28 leaves, within ±0.02.
-    ///
-    /// Every generator in the crate is exercised here, because the one that fails it
-    /// is the one whose price is *derived* rather than quoted.
-    #[test]
-    fn every_generated_position_satisfies_r120(
-        qty_raw in 1i64..100_000_000i64,
-        price_raw in 1i64..10_000_000i64,
-        block_raw in 1i64..1_000_000i64,
-        intervals in prop::collection::vec((1i64..1_000_000i64, 1i64..100_000i64), 1..40),
-    ) {
-        let qty = Decimal::new(qty_raw, 3);
-        let price = Amount::<5>::from_raw_units(price_raw);
-        let check = |item: &LineItem| item.check_price_consistency();
-
-        // Graduated, volume and block schedules.
-        for schedule in [
-            RateSchedule::graduated()
-                .unit("kWh").currency(Currency::EUR)
-                .band(RateBand::up_to(Decimal::new(qty_raw / 2 + 1, 3), price))
-                .band(RateBand::over(Decimal::new(qty_raw / 2 + 1, 3), price))
-                .build().unwrap(),
-            RateSchedule::volume()
-                .unit("kWh").currency(Currency::EUR)
-                .band(RateBand::over(Decimal::ZERO, price))
-                .build().unwrap(),
-            RateSchedule::block()
-                .unit("GB").currency(Currency::EUR)
-                .band(RateBand::block(Decimal::new(block_raw, 3), price))
-                .build().unwrap(),
-        ] {
-            for item in schedule.split(qty).unwrap() {
-                prop_assert!(check(&item).is_ok(), "{:?}: {:?}", item.description, check(&item));
-            }
-        }
-
-        // Capacity — a flat fee, so R120 holds as `1 × amount`.
-        let capacity = RateSchedule::capacity()
-            .unit("Mbps").currency(Currency::EUR)
-            .band(RateBand::over(Decimal::ZERO, price))
-            .build().unwrap();
-        prop_assert!(check(&capacity.apply_peak(qty).unwrap()).is_ok());
-
-        // Time-of-use bands.
-        let tou = TimeOfUsePricing::builder()
-            .unit("kWh").currency(Currency::EUR)
-            .band(TimeBand::new("peak", price))
-            .build().unwrap();
-        for item in tou.calculate(&[("peak", qty)]).unwrap() {
-            prop_assert!(check(&item).is_ok());
-        }
-
-        // Dynamic pricing — the aggregate line, whose BT-146 is a weighted average
-        // with a long non-terminating expansion. This is the one that can fail.
-        let mut b = DynamicPricing::builder().unit("kWh").currency(Currency::EUR);
-        for (q, p) in &intervals {
-            b = b.interval(Decimal::new(*q, 3), Amount::<5>::from_raw_units(*p));
-        }
-        let dynamic = b.build().unwrap().calculate().unwrap();
-        prop_assert!(check(&dynamic).is_ok(), "dynamic: {:?}", check(&dynamic));
-
-        // …and it still holds once the document is reduced to EN 16931's two
-        // decimals, which is where the amount moves and the price does not.
-        let doc = BillingDocument::builder()
-            .currency(Currency::EUR)
-            .amount_scale(AmountScale::EN16931)
-            .positions(vec![dynamic])
-            .build().unwrap();
-        prop_assert_eq!(doc.price_inconsistent_positions().count(), 0);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// A gross minimum charge reaches its target
-// ─────────────────────────────────────────────────────────────────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// `minimum_charge_gross` tops the document up to `minimum_gross` at the rate
-    /// the contract names. The net top-up is one rounding of the exact quotient, so
-    /// the gross that comes back lands within a rounding unit of the target — never
-    /// the 5 % short that deriving it by hand at the wrong rate produced.
-    #[test]
-    fn a_gross_minimum_lands_on_its_target(
-        base_raw in 1i64..1_000_000_000i64,
-        extra_raw in 1i64..1_000_000_000i64,
-        rate in arb_rate(),
-    ) {
-        use billing::{TaxCategory, minimum_charge_gross};
-
-        let base = Amount::<5>::from_raw_units(base_raw);
-        let vat = LineVat::new(TaxCategory::Standard, rate).unwrap();
-        let layers = || -> Vec<Box<dyn billing::TaxLayer>> {
-            vec![FixedRateTax::new("VAT", rate).unwrap().boxed()]
-        };
-        let positions = vec![LineItem::fixed("Verbrauch", base).build().unwrap()];
-        let meta = || DocumentMeta { currency: Currency::EUR, ..Default::default() };
-
-        let provisional =
-            BillingDocument::from_positions(meta(), positions.clone(), layers(), vec![]).unwrap();
-        // A minimum strictly above the current gross, so a top-up is always due.
-        let minimum = provisional
-            .gross_total()
-            .checked_add(Amount::<5>::from_raw_units(extra_raw))
-            .unwrap();
-
-        let top_up = minimum_charge_gross(&provisional, minimum, vat, "Mindestbetrag",
-                                          Currency::EUR).unwrap().unwrap();
-        prop_assert!(!top_up.net_amount.is_negative());
-
-        let mut positions = positions;
-        positions.push(top_up);
-        let doc = BillingDocument::from_positions(meta(), positions, layers(), vec![]).unwrap();
-
-        // Two roundings stand between the exact quotient and BT-112 — the net top-up
-        // at five decimals and the tax on it — so the target is met to within them.
-        let gap = doc.gross_total().checked_sub(minimum).unwrap().abs();
-        prop_assert!(gap <= Amount::<5>::from_raw_units(2), "gap {gap}");
-        doc.verify_vat_attribution().unwrap();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// serde round trip
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "serde")]
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// `from_str(to_string(doc)) == doc`, for a document carrying every field the
-    /// header and the settlement chain have.
-    ///
-    /// Worth stating as a law rather than as a handful of examples, because almost
-    /// every type in this crate deserialises through `#[serde(try_from = …)]` and
-    /// re-runs its constructor. That is what keeps an invalid document out of the
-    /// process — and it is also what makes a field that serialises but is never read
-    /// back look exactly like a field that works. A `Vec` without `#[serde(default)]`
-    /// fails loudly; one *with* it silently comes back empty if the writer spelled
-    /// the key differently.
+    /// JSON round-trip is byte-identical (documents and split shares).
     #[test]
-    fn a_document_survives_a_json_round_trip(
-        amounts in prop::collection::vec(1i64..100_000_000, 1..6),
-        rate in arb_rate(),
-        prepaid_raw in 0i64..1_000_000,
-        note in "[a-zA-Z ]{0,24}",
-        preceding in prop::collection::vec("[A-Z]{2}-[0-9]{4}", 0..3),
+    fn serde_round_trip_is_byte_identical(b in document(), w in weights()) {
+        let d = b.build().unwrap();
+        for doc in core::iter::once(d.clone()).chain(d.split(&w).unwrap()) {
+            let json = serde_json::to_string(&doc).unwrap();
+            let back: Document = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(&back, &doc);
+            prop_assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+}
+
+// ── Independent integer references ───────────────────────────────────────────
+
+/// `n / d` (d > 0) rounded by `mode`, from the integer quotient and remainder.
+/// Written independently of the crate's `Rounding::div`.
+fn rational_round(n: i128, d: i128, mode: Rounding) -> i128 {
+    assert!(d > 0);
+    let neg = n < 0;
+    let (q, r) = (n.abs() / d, n.abs() % d);
+    let twice = 2 * r;
+    let bump = match mode {
+        Rounding::TowardZero => false,
+        Rounding::AwayFromZero => r != 0,
+        Rounding::HalfAwayFromZero => twice >= d,
+        Rounding::HalfEven => twice > d || (twice == d && q % 2 == 1),
+    };
+    let m = q + i128::from(bump);
+    if neg { -m } else { m }
+}
+
+fn pow10(e: u32) -> i128 {
+    10i128.pow(e)
+}
+
+/// A decimal as (mantissa, scale).
+fn parts(d: Decimal) -> (i128, u32) {
+    (d.mantissa(), d.scale())
+}
+
+/// The order-independent builder inputs, applied in any permutation.
+#[derive(Debug, Clone)]
+enum Op {
+    Lines(Vec<Line>),
+    Adjustments(Vec<DocumentAdjustment>),
+    DefaultVat(Vat),
+    Payment(Payment),
+    Cash(CashRounding),
+    Accounting(VatAccounting),
+    Bound(Bound),
+}
+
+fn apply(b: DocumentBuilder, op: Op) -> DocumentBuilder {
+    match op {
+        Op::Lines(l) => b.lines(l),
+        Op::Adjustments(a) => b.adjustments(a),
+        Op::DefaultVat(v) => b.default_vat(v),
+        Op::Payment(p) => b.payment(p),
+        Op::Cash(c) => b.cash_rounding(c),
+        Op::Accounting(v) => b.vat_accounting(v),
+        Op::Bound(x) => b.bound(x),
+    }
+}
+
+fn ops() -> impl Strategy<Value = (AmountScale, Vec<Op>)> {
+    (
+        2u8..=5,
+        prop::sample::select(MODES.to_vec()),
+        prop::collection::vec(line(None), 1..5),
+        prop::collection::vec((any::<bool>(), dec_in(0, 5_000, 2)), 0..3),
+        prop::option::of(dec_in(-5_000, 5_000, 2)),
+        any::<bool>(),
+        any::<bool>(),
+        prop::option::of((any::<bool>(), any::<bool>(), dec_in(1, 500_000, 2))),
+    )
+        .prop_flat_map(|(dp, mode, lines, adjs, pre, cash, acct, bound)| {
+            let mut ops = vec![
+                Op::Lines(lines),
+                Op::Adjustments(
+                    adjs.into_iter()
+                        .map(|(c, x)| {
+                            if c {
+                                DocumentAdjustment::charge("c", x)
+                            } else {
+                                DocumentAdjustment::allowance("a", x)
+                            }
+                        })
+                        .collect(),
+                ),
+                Op::DefaultVat(Vat::standard(Percent::new(dec!(19))).unwrap()),
+            ];
+            if let Some(p) = pre {
+                ops.push(Op::Payment(Payment::Gross {
+                    description: "prepayment".into(),
+                    amount: p,
+                }));
+            }
+            if cash {
+                ops.push(Op::Cash(CashRounding {
+                    increment: dec!(0.05),
+                    rounding: mode,
+                }));
+            }
+            if acct {
+                ops.push(Op::Accounting(VatAccounting {
+                    currency: Currency::new("PLN").unwrap(),
+                    rate: dec!(4.2817),
+                }));
+            }
+            if let Some((gross, minimum, x)) = bound {
+                let basis = if gross { Basis::Gross } else { Basis::Net };
+                ops.push(Op::Bound(if minimum {
+                    Bound::minimum(basis, x, "b")
+                } else {
+                    Bound::maximum(basis, x, "b")
+                }));
+            }
+            let scale = AmountScale::new(dp, mode).unwrap();
+            (Just(scale), Just(ops).prop_shuffle())
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// The builder is order-independent: every permutation of the inputs
+    /// (lines, adjustments, default VAT, prepayment, cash rounding, VAT
+    /// accounting, a bound) builds the same document, or the same error.
+    #[test]
+    fn builder_is_order_independent((scale, shuffled) in ops()) {
+        let mut canonical = shuffled.clone();
+        canonical.sort_by_key(|op| match op {
+            Op::Lines(_) => 0,
+            Op::Adjustments(_) => 1,
+            Op::DefaultVat(_) => 2,
+            Op::Payment(_) => 3,
+            Op::Cash(_) => 4,
+            Op::Accounting(_) => 5,
+            Op::Bound(_) => 6,
+        });
+        let build = |ops: Vec<Op>| {
+            ops.into_iter()
+                .fold(Document::builder(Currency::EUR, scale), apply)
+                .build()
+        };
+        prop_assert_eq!(build(shuffled), build(canonical));
+    }
+
+    /// `concat(split(d))` has every total of d, BT-117 per group included.
+    #[test]
+    fn concat_of_split_restores_every_total(b in document(), w in weights()) {
+        let d = b.build().unwrap();
+        let c = Document::concat(d.split(&w).unwrap()).unwrap();
+        let totals = |x: &Document| (
+            x.line_total(), x.allowance_total(), x.charge_total(), x.tax_exclusive_total(),
+            x.vat_total(), x.tax_inclusive_total(), x.prepaid(), x.rounding(), x.payable(),
+        );
+        prop_assert_eq!(totals(&c), totals(&d));
+        prop_assert_eq!(c.vat_groups(), d.vat_groups());
+        prop_assert_eq!(c.vat_accounting_total(), d.vat_accounting_total());
+    }
+
+    /// BT-111 is BT-110 × rate rounded once at the document scale (oracle:
+    /// the exact integer product, rounded by remainder).
+    #[test]
+    fn vat_accounting_rounds_once(
+        lines in prop::collection::vec((dec_in(-100_000, 100_000, 2), 0..3usize), 1..5),
+        dp in 0u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+        rate in dec_in(1, 10_000_000, 6),
     ) {
-        let positions: Vec<LineItem> = amounts
-            .iter()
+        let s = AmountScale::new(dp, mode).unwrap();
+        let v = vats();
+        let d = Document::builder(Currency::EUR, s)
+            .lines(lines.iter().map(|(n, k)| Line::fixed("l", *n).with_vat(v[*k].clone())))
+            .vat_accounting(VatAccounting { currency: Currency::new("PLN").unwrap(), rate })
+            .build()
+            .unwrap();
+        let (vm, vs) = parts(d.vat_total().to_decimal());
+        let (rm, rs) = parts(rate);
+        // vat × rate × 10^dp / 10^(vs + rs)
+        let units = rational_round(vm * rm * pow10(u32::from(dp)), pow10(vs + rs), mode);
+        let (_, bt111) = d.vat_accounting_total().unwrap();
+        prop_assert_eq!(bt111.to_decimal(), Decimal::from_i128_with_scale(units, u32::from(dp)));
+        if d.vat_total().is_zero() {
+            prop_assert!(bt111.is_zero());
+        }
+    }
+}
+
+/// A small VAT document for the 5 000-case properties: 1–4 lines at S 19,
+/// S 7 or Z, one sign, a prepayment, any scale and mode.
+fn small_document() -> impl Strategy<Value = Document> {
+    (
+        prop::collection::vec((dec_in(0, 1_000_000, 3), 0..3usize), 1..5),
+        any::<bool>(),
+        prop::option::of(dec_in(-100_000, 100_000, 2)),
+        2u8..=5,
+        prop::sample::select(MODES.to_vec()),
+    )
+        .prop_map(|(lines, credit, pre, dp, mode)| {
+            let v = [
+                Vat::standard(Percent::new(dec!(19))).unwrap(),
+                Vat::standard(Percent::new(dec!(7))).unwrap(),
+                Vat::zero_rated(),
+            ];
+            let mut b = Document::builder(Currency::EUR, AmountScale::new(dp, mode).unwrap())
+                .lines(lines.iter().map(|(n, k)| {
+                    Line::fixed("l", if credit { -*n } else { *n }).with_vat(v[*k].clone())
+                }));
+            if let Some(p) = pre {
+                b = b.payments(
+                    vec![Advance {
+                        vat: v[0].clone(),
+                        net: p,
+                        tax: Decimal::ZERO,
+                    }]
+                    .into_iter()
+                    .map(Payment::Advance),
+                );
+            }
+            b.build().unwrap()
+        })
+}
+
+fn segment() -> impl Strategy<Value = InterestSegment> {
+    (
+        dec_in(-50_000, 250_000, 4),
+        0u32..=400,
+        prop::sample::select(vec![360u32, 365, 366]),
+    )
+        .prop_map(|(annual_percent, days, year_days)| InterestSegment {
+            annual_percent: Percent::new(annual_percent),
+            days,
+            year_days,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5_000))]
+
+    /// Σ (base + tax) over the Skonto VAT correction is the Skonto amount,
+    /// exactly, and the amount is BT-115 × percent / 100 rounded once.
+    #[test]
+    fn vat_correction_sums_to_the_discount(d in small_document(), percent in (0i64..=10_000).prop_map(|m| Decimal::new(m, 2))) {
+        let skonto = EarlyPaymentDiscount { percent: Percent::new(percent) };
+        let amount = skonto.amount(&d).unwrap();
+        let s = d.scale();
+        let (pm, ps) = parts(d.payable().to_decimal());
+        let (qm, qs) = parts(percent);
+        let units = rational_round(pm * qm * pow10(u32::from(s.decimals)), 100 * pow10(ps + qs), s.rounding);
+        prop_assert_eq!(amount.to_decimal(), Decimal::from_i128_with_scale(units, u32::from(s.decimals)));
+        let all_zero = d.vat_groups().iter().all(|g| (g.taxable_base() + g.tax()).is_zero());
+        if all_zero && !amount.is_zero() {
+            // Only a prepayment makes BT-115 non-zero here: no weight to split by.
+            prop_assert!(skonto.vat_correction(&d).is_err());
+            return Ok(());
+        }
+        let rows = skonto.vat_correction(&d).unwrap();
+        prop_assert_eq!(rows.len(), d.vat_groups().len());
+        let sum: Amount = rows.iter().map(|g| g.taxable_base() + g.tax()).sum();
+        prop_assert_eq!(sum, amount);
+    }
+
+    /// Late-payment interest is the exact Σ P × pᵢ/100 × dᵢ/yᵢ rounded once,
+    /// at every scale and mode. Reference: one fraction over the product of the
+    /// year lengths (the crate uses their lcm), rounded by remainder.
+    #[test]
+    fn interest_matches_an_exact_rational_reference(
+        principal in dec_in(-100_000_000, 100_000_000, 2),
+        segments in prop::collection::vec(segment(), 1..5),
+        dp in 0u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+    ) {
+        let s = AmountScale::new(dp, mode).unwrap();
+        let got = late_payment_interest(Amount::from_decimal(principal).unwrap(), &segments, s).unwrap();
+        let (pm, ps) = parts(principal);
+        let a_max = segments.iter().map(|x| x.annual_percent.value().scale()).max().unwrap();
+        let prod: i128 = segments.iter().map(|x| i128::from(x.year_days)).product();
+        let mut n: i128 = 0;
+        for x in &segments {
+            let (am, as_) = parts(x.annual_percent.value());
+            n += am * pow10(a_max - as_) * i128::from(x.days) * (prod / i128::from(x.year_days));
+        }
+        let num = pm * n * pow10(u32::from(dp));
+        let den = 100 * prod * pow10(ps + a_max);
+        let units = rational_round(num, den, mode);
+        prop_assert_eq!(got.to_decimal(), Decimal::from_i128_with_scale(units, u32::from(dp)));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// SC-007: the price part of a line (no adjustments) is q × p / base
+    /// reduced once, against an integer reference: mantissas in i128, rounded
+    /// by remainder, bases {1, 3, 7, 1000}, every scale 0–5 and every mode.
+    #[test]
+    fn line_price_part_matches_an_integer_reference(
+        q in dec_in(-1_000_000, 1_000_000, 3),
+        p in dec_in(0, 1_000_000, 6),
+        base in prop::sample::select(vec![1i64, 3, 7, 1000]),
+        dp in 0u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+    ) {
+        let s = AmountScale::new(dp, mode).unwrap();
+        let line = Line::new(
+            "l",
+            Quantity::new(q, "KWH"),
+            UnitPrice::new(Price::new(p)).with_base_quantity(Decimal::from(base)),
+        );
+        let d = Document::builder(Currency::EUR, s).line(line).build().unwrap();
+        let (qm, qs) = parts(q);
+        let (pm, ps) = parts(p);
+        // q × p / base × 10^dp = qm × pm × 10^dp / (base × 10^(qs + ps))
+        let units = rational_round(qm * pm * pow10(u32::from(dp)), i128::from(base) * pow10(qs + ps), mode);
+        prop_assert_eq!(d.line_net(0).to_decimal(), Decimal::from_i128_with_scale(units, u32::from(dp)));
+    }
+}
+
+// ── Metering (spec 027) against an exact rational reference ─────────────────
+
+/// An exact rational `n / d`, `d > 0`, in `i128` — independent of the crate.
+#[derive(Debug, Clone, Copy)]
+struct Q {
+    n: i128,
+    d: i128,
+}
+
+impl Q {
+    fn of(x: Decimal) -> Self {
+        let (m, s) = parts(x);
+        Self { n: m, d: pow10(s) }
+    }
+    fn int(n: i128) -> Self {
+        Self { n, d: 1 }
+    }
+    fn add(self, o: Self) -> Self {
+        Self {
+            n: self.n * o.d + o.n * self.d,
+            d: self.d * o.d,
+        }
+        .reduced()
+    }
+    fn mul(self, o: Self) -> Self {
+        Self {
+            n: self.n * o.n,
+            d: self.d * o.d,
+        }
+        .reduced()
+    }
+    fn div(self, o: Self) -> Self {
+        assert!(o.n != 0);
+        let (n, d) = (self.n * o.d, self.d * o.n);
+        let s = if d < 0 { -1 } else { 1 };
+        Self { n: n * s, d: d * s }.reduced()
+    }
+    fn reduced(self) -> Self {
+        fn gcd(a: i128, b: i128) -> i128 {
+            if b == 0 { a.abs() } else { gcd(b, a % b) }
+        }
+        let g = gcd(self.n, self.d).max(1);
+        Self {
+            n: self.n / g,
+            d: self.d / g,
+        }
+    }
+    fn eq(self, o: Self) -> bool {
+        self.n * o.d == o.n * self.d
+    }
+    fn le(self, o: Self) -> bool {
+        self.n * o.d <= o.n * self.d
+    }
+    /// Rounded once to `dp` decimals by `mode`.
+    fn round(self, dp: u8, mode: Rounding) -> Decimal {
+        let units = rational_round(self.n * pow10(u32::from(dp)), self.d, mode);
+        Decimal::from_i128_with_scale(units, u32::from(dp))
+    }
+}
+
+fn usage_q(u: Usage) -> Q {
+    Q::of(u.numerator()).div(Q::of(u.denominator()))
+}
+
+fn readings() -> impl Strategy<Value = Vec<(Decimal, Decimal)>> {
+    prop::collection::vec((dec_in(-10_000, 10_000, 3), dec_in(0, 1_000, 2)), 0..25)
+}
+
+fn nearest_rank_ref(values: &[Decimal], p: u8) -> Option<Decimal> {
+    let mut v = values.to_vec();
+    v.sort();
+    let n = v.len();
+    if n == 0 {
+        return None;
+    }
+    let rank = (usize::from(p) * n).div_ceil(100);
+    Some(v[rank - 1])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1_000))]
+
+    /// SC-002: every kind equals the exact rational reference; Min ≤ v ≤ Max,
+    /// Latest = last, unit weights give Sum and Mean, Percentile(100) = Max,
+    /// Percentile(1) = Min.
+    #[test]
+    fn meter_every_kind_matches_an_exact_reference(r in readings(), p in 1u8..=100) {
+        let values: Vec<Decimal> = r.iter().map(|x| x.0).collect();
+        let weighted = || r.iter().map(|&(v, w)| Sample::new(v).with_weight(w));
+        let plain = || values.iter().map(|&v| Sample::new(v));
+        let get = |a: Aggregation, weighted_input: bool| {
+            if weighted_input { a.apply(weighted()) } else { a.apply(plain()) }.unwrap()
+        };
+        let n = values.len();
+        let sum = values.iter().fold(Q::int(0), |a, &v| a.add(Q::of(v)));
+        let wsum = r.iter().fold(Q::int(0), |a, &(v, w)| a.add(Q::of(v).mul(Q::of(w))));
+        let wtot = r.iter().fold(Q::int(0), |a, &(_, w)| a.add(Q::of(w)));
+        let same = |u: Option<Usage>, q: Q| u.is_some_and(|u| usage_q(u).eq(q));
+
+        prop_assert!(same(get(Aggregation::Sum, false), sum));
+        prop_assert!(same(get(Aggregation::Count, false), Q::int(n as i128)));
+        prop_assert!(same(get(Aggregation::WeightedSum, true), wsum));
+        prop_assert!(same(get(Aggregation::WeightedSum, false), sum));
+        if n == 0 {
+            for k in [Aggregation::Min, Aggregation::Max, Aggregation::Latest, Aggregation::Mean, Aggregation::WeightedMean] {
+                prop_assert_eq!(get(k, false), None);
+            }
+        } else {
+            let mean = sum.div(Q::int(n as i128));
+            prop_assert!(same(get(Aggregation::Mean, false), mean));
+            prop_assert_eq!(get(Aggregation::WeightedMean, false), get(Aggregation::Mean, false));
+            let min = get(Aggregation::Min, false).unwrap().to_decimal();
+            let max = get(Aggregation::Max, false).unwrap().to_decimal();
+            prop_assert!(values.iter().all(|&v| min <= v && v <= max));
+            prop_assert!(values.contains(&min) && values.contains(&max));
+            prop_assert_eq!(get(Aggregation::Latest, false).unwrap().to_decimal(), values[n - 1]);
+            let pc = |p: u8| get(Aggregation::Percentile(Percentile::new(p).unwrap()), false).map(|u| u.to_decimal());
+            prop_assert_eq!(pc(p), nearest_rank_ref(&values, p));
+            prop_assert_eq!(pc(100), Some(max));
+            prop_assert_eq!(pc(1), Some(min));
+        }
+        let wm = get(Aggregation::WeightedMean, true);
+        if wtot.n == 0 {
+            prop_assert_eq!(wm, None);
+        } else {
+            prop_assert!(same(wm, wsum.div(wtot)));
+        }
+    }
+
+    /// SC-002: UniqueCount is the number of distinct keys.
+    #[test]
+    fn meter_unique_count_counts_distinct_keys(keys in prop::collection::vec("[a-e]{1,2}", 0..30)) {
+        let u = Aggregation::UniqueCount
+            .apply(keys.iter().map(|k| Sample::new(dec!(1)).with_key(k.as_str())))
+            .unwrap()
+            .unwrap();
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        prop_assert_eq!(u.to_decimal(), Decimal::from(distinct.len()));
+    }
+
+    /// SC-006: a converted usage is the exact aggregate ÷ divisor rounded once,
+    /// for all four modes (Mean included: rounded from the fraction).
+    #[test]
+    fn meter_conversion_rounds_once_from_the_exact_aggregate(
+        r in readings(),
+        divisor in dec_in(1, 100_000, 2),
+        dp in 0u8..=4,
+        mode in prop::sample::select(MODES.to_vec()),
+        mean in any::<bool>(),
+    ) {
+        let kind = if mean { Aggregation::Mean } else { Aggregation::Sum };
+        let c = UnitConversion::new(divisor, dp, mode).unwrap();
+        let s = || r.iter().map(|&(v, _)| Sample::new(v));
+        let exact = kind.apply(s()).unwrap();
+        let converted = Meter::new(kind).with_conversion(c).apply(s()).unwrap();
+        match exact {
+            None => prop_assert_eq!(converted, None),
+            Some(u) => {
+                let expected = usage_q(u).div(Q::of(divisor)).round(dp, mode);
+                let got = converted.unwrap();
+                prop_assert_eq!(got.denominator(), Decimal::ONE);
+                prop_assert_eq!(got.to_decimal(), expected);
+            }
+        }
+    }
+
+    /// SC-002: a line built from a Mean usage has the net of the exact
+    /// fraction × price rounded once, at every scale 2–5 and mode.
+    #[test]
+    fn meter_line_from_usage_rounds_once(
+        r in readings(),
+        p in dec_in(0, 1_000_000, 6),
+        dp in 2u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+    ) {
+        let Some(u) = Aggregation::Mean.apply(r.iter().map(|&(v, _)| Sample::new(v))).unwrap() else {
+            return Ok(());
+        };
+        let s = AmountScale::new(dp, mode).unwrap();
+        let line = Line::from_usage("avg", u, "C62", UnitPrice::new(Price::new(p)));
+        let d = Document::builder(Currency::EUR, s).line(line).build().unwrap();
+        prop_assert_eq!(d.line_net(0).to_decimal(), usage_q(u).mul(Q::of(p)).round(dp, mode));
+    }
+
+    /// SC-007: pricing a fractional usage through every tariff shape equals the
+    /// exact rational computation, each piece rounded once.
+    #[test]
+    fn meter_tariff_of_a_fraction_matches_an_exact_reference(
+        r in prop::collection::vec(dec_in(-3_000, 3_000, 1), 1..8),
+        b0 in 1i64..50,
+        prices in (dec_in(0, 100_000, 4), dec_in(0, 100_000, 4)),
+        size in dec_in(1, 5_000, 2),
+        up in any::<bool>(),
+        dp in 2u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+    ) {
+        let u = Aggregation::Mean.apply(r.iter().map(|&v| Sample::new(v))).unwrap().unwrap();
+        let x = usage_q(u);
+        let neg = x.n < 0;
+        let q = Q { n: x.n.abs(), d: x.d };
+        let b0 = Decimal::from(b0);
+        let tiers = Tiers::new([
+            Tier::up_to(b0, Price::new(prices.0)),
+            Tier::above(Price::new(prices.1)),
+        ]).unwrap();
+        let rounding = if up { PackageRounding::Up } else { PackageRounding::Down };
+        let pr = |x: Decimal| Q::of(x);
+        let piece = |qty: Q, price: Decimal| -> Decimal {
+            let signed = if neg { Q { n: -qty.n, d: qty.d } } else { qty };
+            signed.mul(pr(price)).round(dp, mode)
+        };
+        // Graduated: [0, b0] at prices.0, the rest at prices.1.
+        let graduated = if q.le(pr(b0)) {
+            piece(q, prices.0)
+        } else {
+            piece(pr(b0), prices.0) + piece(q.add(Q { n: -pr(b0).n, d: pr(b0).d }), prices.1)
+        };
+        let volume = piece(q, if q.le(pr(b0)) { prices.0 } else { prices.1 });
+        let ratio = q.div(pr(size));
+        let whole = ratio.n / ratio.d;
+        let count = if up && ratio.n % ratio.d != 0 { whole + 1 } else { whole };
+        let package = piece(Q::int(count), prices.0);
+        let cases = [
+            (Tariff::PerUnit(Price::new(prices.0)), piece(q, prices.0)),
+            (Tariff::Graduated(tiers.clone()), graduated),
+            (Tariff::Volume(tiers), volume),
+            (Tariff::Package { size, price: Price::new(prices.0), rounding }, package),
+        ];
+        let s = AmountScale::new(dp, mode).unwrap();
+        for (tariff, expected) in cases {
+            let lines: Vec<Line> = tariff.rate(u).unwrap().into_iter().flat_map(|p| p.into_lines("u", "C62")).collect();
+            let got = if lines.is_empty() {
+                Decimal::ZERO
+            } else {
+                Document::builder(Currency::EUR, s).lines(lines).build().unwrap().line_total().to_decimal()
+            };
+            prop_assert_eq!(got, expected, "{:?}", tariff);
+        }
+    }
+}
+
+// ── Credits and the residual VAT statement (spec 029) ─────────────────────────
+
+/// Credits at two decimals (they fit every scale `document()` draws), each with
+/// a unique description so its allowances can be found.
+fn credits() -> impl Strategy<Value = Vec<billing::Credit>> {
+    prop::collection::vec((any::<bool>(), 1i64..=200_000), 1..5).prop_map(|cs| {
+        cs.into_iter()
             .enumerate()
-            .map(|(i, raw)| {
-                LineItem::fixed(format!("Item {i}"), Amount::<5>::from_raw_units(*raw))
-                    .period("2026-06-01", "2026-06-30")
-                    .meta("malo_id", "52435677816")
-                    .build()
-                    .unwrap()
+            .map(|(i, (before, m))| {
+                let d = format!("credit {i}");
+                let balance = Decimal::new(m, 2);
+                if before {
+                    billing::Credit::before_tax(d, balance)
+                } else {
+                    billing::Credit::after_tax(d, balance)
+                }
+            })
+            .collect()
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn credit_draw_down_conserves_and_never_overdraws(b in document(), cs in credits()) {
+        let Ok(base) = b.clone().build() else { return Ok(()) };
+        let doc = cs.iter().cloned().fold(b, |b, c| b.credit(c)).build().unwrap();
+        let apps = doc.credit_applications();
+        prop_assert_eq!(apps.len(), cs.len());
+        let (mut applied, mut balances) = (Amount::ZERO, Decimal::ZERO);
+        let (mut before, mut after) = (Amount::ZERO, Amount::ZERO);
+        for (i, (c, app)) in cs.iter().zip(apps).enumerate() {
+            prop_assert_eq!(app.credit, i);
+            prop_assert!(!app.applied.is_negative());
+            prop_assert_eq!((app.applied + app.remaining).to_decimal(), c.balance);
+            applied += app.applied;
+            balances += c.balance;
+            let n = doc.adjustments().len();
+            let allowances: Amount = (n - doc.credit_adjustments()..n)
+                .filter(|&k| doc.adjustments()[k].description() == c.description)
+                .map(|k| doc.adjustment_amount(k))
+                .sum();
+            match c.placement {
+                billing::CreditPlacement::BeforeTax => {
+                    prop_assert_eq!(allowances, app.applied);
+                    before += app.applied;
+                }
+                billing::CreditPlacement::AfterTax => {
+                    prop_assert!(allowances.is_zero());
+                    after += app.applied;
+                }
+            }
+        }
+        prop_assert!(applied.to_decimal() <= balances);
+        if base.tax_exclusive_total().is_positive() {
+            prop_assert!(!doc.tax_exclusive_total().is_negative());
+        } else {
+            prop_assert!(applied.is_zero());
+        }
+        prop_assert_eq!(doc.tax_exclusive_total(), base.tax_exclusive_total() - before);
+        let base_prepaid = base.prepaid();
+        prop_assert_eq!(doc.prepaid(), base_prepaid + after);
+        if after.is_positive() {
+            prop_assert!(!doc.payable().is_negative());
+        }
+        // VAT on the credited bases, rounded once per group: the materialised
+        // document (credits as ordinary allowances and prepayment) agrees.
+        let flat = Document::concat([doc.clone()]).unwrap();
+        prop_assert_eq!(flat.vat_groups(), doc.vat_groups());
+        prop_assert_eq!(flat.prepaid(), doc.prepaid());
+        prop_assert_eq!(flat.payable(), doc.payable());
+        // Rebuilding from the recovered builder is idempotent.
+        prop_assert_eq!(doc.clone().into_builder().build().unwrap(), doc);
+    }
+
+    #[test]
+    fn credit_residual_vat_plus_advances_is_the_breakdown(
+        b in document(),
+        shares in prop::collection::vec((0i64..=100_000, 0i64..=20_000), 1..4),
+    ) {
+        let Ok(base) = b.clone().build() else { return Ok(()) };
+        let groups = base.vat_groups().to_vec();
+        let advances: Vec<Advance> = groups
+            .iter()
+            .cycle()
+            .zip(&shares)
+            .map(|(g, &(net, tax))| Advance {
+                vat: g.vat().clone(),
+                net: Decimal::new(net, 2),
+                tax: Decimal::new(tax, 2),
             })
             .collect();
-
-        let meta = DocumentMeta {
-            invoice_number: "INV-2026-001".into(),
-            currency: Currency::EUR,
-            period: Some(Period::new("2026-06-01", "2026-06-30")),
-            issue_date: Some("2026-07-01".into()),
-            due_date: Some("2026-07-31".into()),
-            payment_terms: Some(
-                PaymentTerms::text("Zahlbar in 30 Tagen.")
-                    .with_discount(EarlyPaymentDiscount::new(10, dec!(2)).unwrap()),
-            ),
-            issuer_id: Some(PartyIdentifier::scheme("0088", "4004404000018")),
-            recipient_id: Some(PartyIdentifier::new("KND-4711")),
-            preceding: preceding
-                .iter()
-                .map(|n| PrecedingInvoice::new(n).unwrap().with_issue_date("2026-05-31"))
-                .collect(),
-            notes: vec![Note::coded("AAI", note)],
-            ..Default::default()
+        // Appended beside any gross payment: it carries no VAT.
+        let doc = b.payments(advances.clone().into_iter().map(Payment::Advance)).build().unwrap();
+        let r = doc.residual_vat().unwrap();
+        prop_assert_eq!(doc.vat_groups(), groups.as_slice());
+        prop_assert_eq!(r.len(), groups.len());
+        let sum = |v: &[billing::VatGroup], f: fn(&billing::VatGroup) -> Amount| -> Amount {
+            v.iter().map(f).sum()
         };
+        let nets: Decimal = advances.iter().map(|a| a.net).sum();
+        let taxes: Decimal = advances.iter().map(|a| a.tax).sum();
+        prop_assert_eq!(
+            sum(&r, billing::VatGroup::taxable_base).to_decimal() + nets,
+            sum(&groups, billing::VatGroup::taxable_base).to_decimal()
+        );
+        prop_assert_eq!(
+            sum(&r, billing::VatGroup::tax).to_decimal() + taxes,
+            sum(&groups, billing::VatGroup::tax).to_decimal()
+        );
+    }
+}
 
-        let taxes: Vec<Box<dyn TaxLayer>> =
-            vec![FixedRateTax::new("MwSt", rate).unwrap().boxed()];
-        let doc = BillingDocument::from_positions(meta, positions, taxes, vec![]).unwrap();
-        // BT-111 is BT-110 converted, so `PEPPOL-EN16931-R055` (shared sign) holds.
-        let bt111 = VatAccountingCurrency::converted(
-            Currency::new("PLN").unwrap(),
-            doc.vat_total().unwrap(),
-            dec!(4.30),
-            AmountScale::EN16931,
-        ).unwrap();
-        let doc = doc
-            .with_prepaid(Amount::<5>::from_raw_units(prepaid_raw))
-            .unwrap()
-            .with_vat_accounting_currency(bt111)
+// ── Pricing models (spec 028) ───────────────────────────────────────────────
+
+/// Every tariff shape over three tiers with flat fees (some zero), from drawn
+/// bounds and prices.
+fn pricing_tariffs() -> impl Strategy<Value = Vec<Tariff>> {
+    (
+        (1i64..40, 1i64..40),
+        prop::collection::vec(dec_in(0, 5_000, 3), 3),
+        prop::collection::vec(prop::option::of(dec_in(0, 500, 3)), 3),
+        dec_in(1, 300, 1),
+        any::<bool>(),
+    )
+        .prop_map(|((b0, w), prices, flats, size, up)| {
+            let (b0, b1) = (Decimal::from(b0), Decimal::from(b0 + w));
+            let tier = |t: Tier, i: usize| match flats[i] {
+                Some(f) => t.with_flat(f),
+                None => t,
+            };
+            let tiers = Tiers::new([
+                tier(Tier::up_to(b0, Price::new(prices[0])), 0),
+                tier(Tier::up_to(b1, Price::new(prices[1])), 1),
+                tier(Tier::above(Price::new(prices[2])), 2),
+            ])
             .unwrap();
+            vec![
+                Tariff::PerUnit(Price::new(prices[0])),
+                Tariff::Graduated(tiers.clone()),
+                Tariff::Volume(tiers),
+                Tariff::Package {
+                    size,
+                    price: Price::new(prices[1]),
+                    rounding: if up {
+                        PackageRounding::Up
+                    } else {
+                        PackageRounding::Down
+                    },
+                },
+            ]
+        })
+}
 
-        let json = serde_json::to_string(&doc).unwrap();
-        // Non-vacuity: the field has to be *on the wire* for the round trip to mean
-        // anything. Comparing two values that both lost it would still pass.
-        for reference in &preceding {
-            prop_assert!(json.contains(reference.as_str()), "BT-25 {reference} missing from {json}");
+/// A non-decreasing cumulative sequence `c₁ ≤ … ≤ cₙ` of exact usages
+/// `mᵢ / d` (d = 1, 2, 3 or 7: fractional averages included), billed from
+/// `Billed::Nothing`; a quarter of the sequences stay at zero throughout
+/// (idle periods: 030 US1).
+fn cumulative() -> impl Strategy<Value = Vec<Usage>> {
+    let any = (
+        prop::collection::vec(0i64..=300, 1..7),
+        prop::sample::select(vec![1usize, 2, 3, 7]),
+    )
+        .prop_map(|(mut ms, d)| {
+            ms.sort_unstable();
+            ms.into_iter()
+                .map(|m| {
+                    let mut r = vec![Sample::new(Decimal::new(m, 1))];
+                    r.resize(d, Sample::new(Decimal::ZERO));
+                    Aggregation::Mean.apply(r).unwrap().unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+    let idle = (1usize..6).prop_map(|n| vec![Usage::from(Decimal::ZERO); n]);
+    prop_oneof![3 => any, 1 => idle]
+}
+
+fn piece_q(p: &billing::Piece) -> Q {
+    usage_q(p.quantity)
+        .mul(Q::of(p.unit_price.value()))
+        .add(Q::of(p.flat.unwrap_or_default()))
+}
+
+fn pieces_q(ps: &[billing::Piece]) -> Q {
+    ps.iter().fold(Q::int(0), |acc, p| acc.add(piece_q(p)))
+}
+
+/// Σ line nets of `lines` at `s` (0 without lines).
+fn lines_total(lines: Vec<Line>, s: AmountScale) -> Decimal {
+    if lines.is_empty() {
+        return Decimal::ZERO;
+    }
+    Document::builder(Currency::EUR, s)
+        .lines(lines)
+        .build()
+        .unwrap()
+        .line_total()
+        .to_decimal()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// SC-002 (030): the exact increments of every shape, billed from
+    /// `Billed::Nothing`, telescope to rating the last cumulative value —
+    /// without exception, all-zero sequences (the first-tier flat fee) included.
+    /// Each returned state is `UpTo(c)`.
+    #[test]
+    fn pricing_exact_increments_telescope(tariffs in pricing_tariffs(), cs in cumulative()) {
+        let last = *cs.last().unwrap();
+        for t in &tariffs {
+            let mut sum = Q::int(0);
+            let mut billed = Billed::Nothing;
+            for c in &cs {
+                let (pieces, next) = t.rate_increment(billed, *c).unwrap();
+                prop_assert_eq!(next, Billed::UpTo(*c));
+                sum = sum.add(pieces_q(&pieces));
+                billed = next;
+            }
+            let want = pieces_q(&t.rate(last).unwrap());
+            prop_assert!(sum.eq(want), "{:?}: {:?} vs {:?}", t, sum, want);
         }
-        // `PaymentTerms` persists as its two structured halves, not as the BT-20
-        // rendering — `Display`/`FromStr` are the wire syntax, serde is storage.
-        prop_assert!(json.contains("Zahlbar in 30 Tagen."));
-        prop_assert!(json.contains("\"days\":10"));
-        prop_assert!(json.contains("4004404000018"));
+    }
 
-        let back: BillingDocument = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(&back, &doc);
+    /// SC-002/SC-006 (030): the rounded increment lines of every shape, billed
+    /// from `Billed::Nothing`, telescope to the lines of the whole range, at
+    /// scales 0–5 and every rounding mode, all-zero sequences included.
+    #[test]
+    fn pricing_rounded_increments_telescope(
+        tariffs in pricing_tariffs(),
+        cs in cumulative(),
+        dp in 0u8..=5,
+        mode in prop::sample::select(MODES.to_vec()),
+    ) {
+        let s = AmountScale::new(dp, mode).unwrap();
+        let last = *cs.last().unwrap();
+        for t in &tariffs {
+            let mut total = Decimal::ZERO;
+            let mut billed = Billed::Nothing;
+            for c in &cs {
+                let (lines, next) = t.increment_lines(billed, *c, s, "u", "KWH").unwrap();
+                total += lines_total(lines, s);
+                billed = next;
+            }
+            let (lines, _) = t.increment_lines(Billed::Nothing, last, s, "u", "KWH").unwrap();
+            let at_once = lines_total(lines, s);
+            prop_assert_eq!(total, at_once, "{:?}", t);
+            // The whole range rounds each piece of rating `last` once, at zero too.
+            let leaves: Decimal = t.rate(last).unwrap().iter().map(|p| {
+                let usage = usage_q(p.quantity).mul(Q::of(p.unit_price.value())).round(dp, mode);
+                usage + Q::of(p.flat.unwrap_or_default()).round(dp, mode)
+            }).sum();
+            prop_assert_eq!(at_once, leaves, "{:?}", t);
+        }
+    }
 
-        // The header fields specifically, because `PartialEq` on the whole document
-        // would still pass if *both* sides lost the same field to a `default`.
-        prop_assert_eq!(back.meta.preceding.len(), doc.meta.preceding.len());
-        prop_assert_eq!(back.meta.payment_terms.as_ref(), doc.meta.payment_terms.as_ref());
-        prop_assert_eq!(back.meta.issuer_id.as_ref(), doc.meta.issuer_id.as_ref());
-        prop_assert_eq!(back.meta.notes.len(), 1);
-        prop_assert_eq!(back.prepaid(), doc.prepaid());
+    /// SC-002: keyed pricing equals pricing each key's summed usage alone, in
+    /// first-appearance order.
+    #[test]
+    fn pricing_keyed_equals_each_key_alone(
+        tariffs in pricing_tariffs(),
+        usage in prop::collection::vec((0u8..4, dec_in(-500, 2_000, 1)), 0..12),
+    ) {
+        let map: std::collections::BTreeMap<u8, Tariff> =
+            tariffs.iter().cloned().enumerate().map(|(i, t)| (i as u8, t)).collect();
+        let rated = billing::rate_by_key(&map, usage.clone()).unwrap();
+        let mut order: Vec<u8> = Vec::new();
+        for (k, _) in &usage {
+            if !order.contains(k) {
+                order.push(*k);
+            }
+        }
+        let alone: Vec<(u8, Vec<billing::Piece>)> = order
+            .into_iter()
+            .map(|k| {
+                let sum: Decimal = usage.iter().filter(|(j, _)| *j == k).map(|(_, q)| *q).sum();
+                (k, map[&k].rate(sum).unwrap())
+            })
+            .filter(|(_, ps)| !ps.is_empty())
+            .collect();
+        prop_assert_eq!(rated, alone);
+    }
 
-        // And it is validated on the way in, not merely reconstructed.
-        back.validate().unwrap();
+    /// SC-003: each charged fee's magnitude lies within the bounds, refunds
+    /// mirror purchases, and the total is the exact sum after the free ones.
+    #[test]
+    fn pricing_fee_bounds_hold_and_refunds_mirror(
+        percent in (0i64..=10_000).prop_map(|m| Decimal::new(m, 2)),
+        fixed in dec_in(0, 500, 2),
+        bounds in (prop::option::of(dec_in(0, 300, 2)), prop::option::of(dec_in(0, 3_000, 2))),
+        free in 0u32..4,
+        amounts in prop::collection::vec(dec_in(-100_000, 100_000, 2), 0..10),
+    ) {
+        let (min, max) = match bounds {
+            (Some(a), Some(b)) => (Some(a.min(b)), Some(a.max(b))),
+            other => other,
+        };
+        let mut fee = billing::TransactionFee::new(Percent::new(percent)).with_fixed(fixed);
+        if let Some(m) = min { fee = fee.with_min(m); }
+        if let Some(m) = max { fee = fee.with_max(m); }
+        let mut want = Decimal::ZERO;
+        let mut base = Decimal::ZERO;
+        for (i, &a) in amounts.iter().enumerate() {
+            let one = fee.rate([a]).unwrap().fee;
+            prop_assert!(min.is_none_or(|m| one.abs() >= m), "{} below min", one);
+            prop_assert!(max.is_none_or(|m| one.abs() <= m), "{} above max", one);
+            // The reference: |a| × percent / 100 + fixed, clamped, signed.
+            let mut mag = a.abs() * percent / dec!(100) + fixed;
+            if let Some(m) = min { mag = mag.max(m); }
+            if let Some(m) = max { mag = mag.min(m); }
+            prop_assert_eq!(one, if a < Decimal::ZERO { -mag } else { mag });
+            if !a.is_zero() {
+                prop_assert_eq!(fee.rate([-a]).unwrap().fee, -one);
+            }
+            if i >= free as usize {
+                want += one;
+                base += a;
+            }
+        }
+        let total = fee.with_free_transactions(free).rate(amounts.clone()).unwrap();
+        prop_assert_eq!(total.fee, want);
+        prop_assert_eq!(total.base, base);
+        prop_assert_eq!(total.transactions, amounts.len() as u64);
+        prop_assert_eq!(total.charged, amounts.len().saturating_sub(free as usize) as u64);
+    }
+}
+
+/// A document with mixed paid entries (030): `document()`'s optional gross
+/// payment, advances matched to its VAT groups, and drawn credits.
+fn paid_document() -> impl Strategy<Value = Document> {
+    (
+        document(),
+        prop::collection::vec((0i64..=100_000, 0i64..=20_000), 0..4),
+        credits(),
+    )
+        .prop_filter_map("buildable", |(b, advances, cs)| {
+            let groups = b.clone().build().ok()?.vat_groups().to_vec();
+            let advances: Vec<Payment> = groups
+                .iter()
+                .cycle()
+                .zip(&advances)
+                .map(|(g, &(net, tax))| {
+                    Payment::Advance(Advance {
+                        vat: g.vat().clone(),
+                        net: Decimal::new(net, 2),
+                        tax: Decimal::new(tax, 2),
+                    })
+                })
+                .collect();
+            cs.into_iter()
+                .fold(b.payments(advances), |b, c| b.credit(c))
+                .build()
+                .ok()
+        })
+}
+
+/// An entry's amounts, in split-leaf order.
+fn entry_leaves(p: &Payment) -> Vec<Decimal> {
+    match p {
+        Payment::Advance(a) => vec![a.net, a.tax],
+        Payment::Gross { amount, .. } => vec![*amount],
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// SC-003 (030): split shares' paid entries sum exactly, entry by entry
+    /// and leaf by leaf, to the parent's; each share keeps every entry's kind,
+    /// VAT and description; the shares' residual VAT sums to the parent's per
+    /// group.
+    #[test]
+    fn us030_split_partitions_every_paid_entry(doc in paid_document(), w in weights()) {
+        let parent = doc.paid_entries();
+        let shares = doc.split(&w).unwrap();
+        for s in &shares {
+            let entries = s.paid_entries();
+            prop_assert_eq!(entries.len(), parent.len());
+            for (e, p) in entries.iter().zip(&parent) {
+                match (e, p) {
+                    (Payment::Advance(x), Payment::Advance(y)) => prop_assert_eq!(&x.vat, &y.vat),
+                    (Payment::Gross { description: x, .. }, Payment::Gross { description: y, .. }) => {
+                        prop_assert_eq!(x, y);
+                    }
+                    _ => prop_assert!(false, "entry kind changed: {:?} vs {:?}", e, p),
+                }
+            }
+            prop_assert!(s.credits().is_empty());
+        }
+        for (k, p) in parent.iter().enumerate() {
+            let want = entry_leaves(p);
+            let mut got = vec![Decimal::ZERO; want.len()];
+            for s in &shares {
+                for (g, l) in got.iter_mut().zip(entry_leaves(&s.paid_entries()[k])) {
+                    *g += l;
+                }
+            }
+            prop_assert_eq!(got, want, "entry {}", k);
+        }
+        let prepaid: Amount = shares.iter().map(Document::prepaid).sum();
+        prop_assert_eq!(prepaid, doc.prepaid());
+        let r = doc.residual_vat().unwrap();
+        for (k, g) in r.iter().enumerate() {
+            let (mut base, mut tax) = (Amount::ZERO, Amount::ZERO);
+            for s in &shares {
+                let sr = s.residual_vat().unwrap();
+                prop_assert_eq!(sr[k].vat(), g.vat());
+                base += sr[k].taxable_base();
+                tax += sr[k].tax();
+            }
+            prop_assert_eq!((base, tax), (g.taxable_base(), g.tax()), "group {}", k);
+        }
+    }
+
+    /// SC-003 (030): negating twice is the identity on the paid entries (and
+    /// on the residual); concatenation keeps every entry of every document, in
+    /// order.
+    #[test]
+    fn us030_negate_and_concat_keep_every_paid_entry(doc in paid_document()) {
+        let neg = doc.negated();
+        let negated: Vec<Payment> = doc.paid_entries().iter().map(|p| match p {
+            Payment::Advance(a) => Payment::Advance(Advance { vat: a.vat.clone(), net: -a.net, tax: -a.tax }),
+            Payment::Gross { description, amount } => Payment::Gross { description: description.clone(), amount: -*amount },
+        }).collect();
+        prop_assert_eq!(neg.paid_entries(), negated);
+        prop_assert_eq!(neg.prepaid(), -doc.prepaid());
+        prop_assert_eq!(neg.negated().paid_entries(), doc.paid_entries());
+        let r = doc.residual_vat().unwrap();
+        let back = neg.negated().residual_vat().unwrap();
+        prop_assert_eq!(back, r.clone());
+        let neg_r = neg.residual_vat().unwrap();
+        for (x, y) in neg_r.iter().zip(&r) {
+            prop_assert_eq!((x.taxable_base(), x.tax()), (-y.taxable_base(), -y.tax()));
+        }
+        let joined = Document::concat([doc.clone(), neg.clone()]).unwrap();
+        let mut want = doc.paid_entries();
+        want.extend(neg.paid_entries());
+        prop_assert_eq!(joined.paid_entries(), want);
+        prop_assert_eq!(joined.prepaid(), Amount::ZERO);
     }
 }

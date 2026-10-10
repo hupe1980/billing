@@ -1,14 +1,15 @@
 +++
-title = "Amounts and rounding"
-description = "Fixed-point money with the precision in the type: no floating point, no silent overflow, and no rounding you did not ask for by name."
+title = "Money and rounding"
+description = "Amount<P>, the four sign-symmetric rounding modes, AmountScale and reducing once, and why a Price is not money until it is multiplied by a quantity."
 weight = 20
 +++
 
 ## `Amount<P>`
 
-`Amount<P>` stores money as an `i64` scaled by `10^P`. The precision is a const
+`Amount<P>` stores money as an `i64` count of `10⁻ᴾ`. The precision is a const
 generic, so `Amount<5>` and `Amount<2>` are different types and cannot be added by
-accident.
+accident. `P` defaults to 5, the engine's precision: every amount a `Document`
+returns is an `Amount<5>` (written `Amount`) that already fits the document's scale.
 
 | Value | `P` | Raw `i64` |
 |---|---|---|
@@ -16,264 +17,197 @@ accident.
 | 49.99 | 2 | 4 999 |
 | −100.00 | 5 | −10 000 000 |
 
-There is **no `f64`** anywhere in the arithmetic path. `P > 18` is a compile-time
-error, because `10¹⁹` exceeds `i64::MAX`.
+There is no `f64` anywhere. `P ≤ 18` is checked at compile time: every way to obtain
+an `Amount<P>` evaluates the bound, so `Amount::<19>::ZERO` does not compile.
 
 ### Range
-
-Precision is bought with range, one digit at a time:
 
 | `P` | Smallest step | `Amount::MAX` |
 |---|---|---|
 | 2 | 0.01 | 92 233 720 368 547 758.07 |
 | 5 | 0.00001 | 92 233 720 368 547.75807 |
-| 9 | 0.000000001 | 9 223 372 036.854775807 |
 | 18 | 10⁻¹⁸ | 9.223372036854775807 |
 
-`Amount<5>` therefore tops out around 92 trillion currency units — far
-above any single invoice, which is why the backing type is `i64` rather than `i128`.
-If you do aggregate past it, sum at a coarser precision rather than reaching for a
-wider integer.
+At `P = 5` that is about 92 trillion units — enough for EUR, not necessarily for IRR,
+VND or LBP. Past the range every operation fails with `ErrorKind::Overflow`.
 
-> There is deliberately no `EuroAmount` or `InvoiceAmt` alias. `Amount<5>` says what
-> the first would without claiming a currency this crate is careful never to assume,
-> and `Amount<2>` says what the second would without implying two decimals is "the
-> invoice precision" — documents are assembled at `Amount<5>` and reduced with
-> `AmountScale`.
+## Parsing and printing
+
+`parse` accepts exactly `[+-]digits[.digits]`: `.` is the only separator, with at
+least one digit on each side, no exponent, no spaces, no grouping. Acceptance is by
+**value** — trailing zeros past `P` are fine, a non-zero digit past `P` is refused.
+
+```rust
+use billing::{Amount, ErrorKind};
+
+assert_eq!(Amount::<2>::parse("1.500")?.to_string(), "1.50");
+assert!(matches!(Amount::<2>::parse("1.505").unwrap_err().kind(), ErrorKind::ExcessPrecision { .. }));
+// A thousands separator is refused, not misread as a decimal point.
+assert!(matches!(Amount::<2>::parse("1,000").unwrap_err().kind(), ErrorKind::Malformed { .. }));
+assert!(Amount::<2>::parse(".5").is_err());
+
+// Display: P decimals by default; a precision rounds half away from zero.
+let a = Amount::<5>::parse("-1234.56789")?;
+assert_eq!(a.to_string(), "-1234.56789");
+assert_eq!(format!("{a:.2}"), "-1234.57");
+assert_eq!(format!("{:.2}", Amount::<5>::parse("-0.004")?), "0.00"); // no "-0.00"
+```
+
+Display rounding is presentation only; reduce emitted or summed amounts with
+`AmountScale` or `round_to`.
+
+## No multiplication on `Amount`
+
+There is no `Amount × Decimal` or `Amount ÷ Decimal`: both would hide a rounding.
+Multiply `Decimal`s, then reduce **once**:
+
+```rust
+use billing::{Amount, AmountScale};
+use rust_decimal::dec;
+
+// 10.02629 × 0.19 = 1.9049951 → 1.90.
+let tax: Amount = AmountScale::EN16931.reduce(dec!(10.02629) * dec!(0.19))?;
+assert_eq!(tax, Amount::parse("1.90")?);
+
+// Rounding to five decimals first gives 1.90500, which then rounds to 1.91.
+let twice = AmountScale::EN16931.reduce::<5>(dec!(1.90500))?;
+assert_eq!(twice, Amount::parse("1.91")?);
+```
+
+Inside a document every leaf — line net, allowance, charge, group tax — is reduced
+this way, from its exact value.
 
 ## Overflow is visible, never silent
 
-Every operation is either infallible-and-panicking or fallible-and-total. Nothing
-wraps and nothing saturates.
-
 | Operation | On overflow |
 |---|---|
-| `+`, `-`, `+=`, `-=`, unary `-`, `sum()` | **panics** |
-| `from_int`, `abs`, `mul_qty`, `round_to` | **panics** |
-| every `checked_*`, `from_decimal_rounded`, `distribute`, `allocate`, `round_to_increment` | returns `Err` |
+| `+`, `-`, `+=`, `-=`, unary `-`, `Sum` | **panics** |
+| `checked_add`, `checked_sub`, `checked_neg`, `checked_abs`, `checked_sum` | `Err(Overflow)` |
+| `parse`, `from_decimal`, `from_decimal_rounded`, `round_to`, `round_to_increment`, `rescale`, `exact`, `split` | `Err`, never a panic |
 
-The `checked_*` family is **total**: it returns `Err` and never panics, including
-where the underlying `rust_decimal` operators would. That matters more than it
-sounds — `Decimal`'s `Mul`, `Div` and `Sum` panic on overflow rather than saturating,
-so a method that merely forwarded to them would break its own `Result` contract on
-attacker-controlled input.
+Use the `checked_*` family for anything fed by untrusted input.
 
-## Rounding is always explicit
-
-`RoundingStrategy` is a required parameter. There is no implicit `round()` anywhere
-in the crate, and the two `Decimal` conversion paths agree about it:
+## `Rounding`: four modes, all sign-symmetric {#rounding}
 
 ```rust
-use billing::{Amount, BillingError, RoundingStrategy};
+use billing::{Amount, Rounding};
 use rust_decimal::dec;
 
-// Exact conversion: excess precision is refused, not rounded away.
-assert!(matches!(
-    Amount::<5>::checked_from_decimal(dec!(0.123456)),
-    Err(BillingError::PrecisionLoss { .. })
-));
-// The same value is refused when it arrives as text.
-assert!(Amount::<5>::parse("0.123456").is_err());
+let r = |x, m| Amount::<2>::from_decimal_rounded(x, m).map(|a| a.to_string());
+assert_eq!(r(dec!(2.345), Rounding::HalfAwayFromZero)?, "2.35"); // commercial; EN 16931
+assert_eq!(r(dec!(2.345), Rounding::HalfEven)?, "2.34");         // banker's
+assert_eq!(r(dec!(2.341), Rounding::AwayFromZero)?, "2.35");
+assert_eq!(r(dec!(2.349), Rounding::TowardZero)?, "2.34");
 
-// Rounding is the opt-in, and it makes you name the strategy.
-assert_eq!(
-    Amount::<5>::from_decimal_rounded(dec!(0.123456), RoundingStrategy::MidpointAwayFromZero)?,
-    Amount::parse("0.12346")?
-);
+// round(−x) == −round(x) for every mode.
+assert_eq!(r(dec!(-2.345), Rounding::HalfAwayFromZero)?, "-2.35");
+assert_eq!(r(dec!(-2.341), Rounding::AwayFromZero)?, "-2.35");
 ```
 
-Rounding the `Decimal` conversion while `parse` rejects it would refuse an
-unrepresentable price arriving as text and quietly alter the same one arriving as a
-`Decimal`. The two paths agree instead.
+There is no floor or ceiling: with a sign-symmetric mode a credit rounds exactly like
+the mirrored debit, which is what makes [`Document::negated`](../corrections/) exact.
 
-### Which of the three, and never through a string
+## `AmountScale`
 
-`parse` is the **text** boundary — a price from a CSV, a JSON string, a config file.
-If you are holding a `Decimal`, going through `to_string()` is a round trip that can
-only lose, and the excess-precision refusal then reads as an obstacle to work around
-rather than as the signal it is. The shape that grows out of that misreading is a
-`parse` with a `format!("{:.5}", …)` fallback — two conversions, one of which
-[panics on a large enough value](../pricing/).
-
-| You have | Excess precision should | Use |
-|---|---|---|
-| a string | be refused | `parse`, or `FromStr` |
-| a `Decimal` | be refused | `checked_from_decimal` |
-| a `Decimal` | be rounded away | `from_decimal_rounded` |
-
-The first two rows agree on every value by construction — that is what the refusal is
-for. The third is the one you want whenever the value was *derived*: a statutory rate
-in ct/kWh divided by 100, a unit price from `total ÷ quantity`, an exchange
-conversion.
+An `AmountScale` is a document's interchange scale: how many decimals derived amounts
+carry (0 to 5) and how they are rounded. It belongs to the *format*, not the currency.
 
 ```rust
-use billing::{Amount, RoundingStrategy};
+use billing::{Amount, AmountScale, ErrorKind, Rounding};
 use rust_decimal::dec;
 
-// A statutory EEG rate in ct/kWh, as EUR/kWh. One named rounding, no text.
-let eur_per_kwh = dec!(12.03) / dec!(100);
-assert_eq!(
-    Amount::<5>::from_decimal_rounded(eur_per_kwh, RoundingStrategy::MidpointAwayFromZero)?,
-    Amount::parse("0.12030")?,
-);
+assert_eq!(AmountScale::EN16931, AmountScale::new(2, Rounding::HalfAwayFromZero)?);
+
+let whole_yen = AmountScale::new(0, Rounding::HalfAwayFromZero)?;
+assert_eq!(whole_yen.reduce::<5>(dec!(1234.5))?, Amount::parse("1235")?);
+
+// More decimals than the engine's precision is refused.
+assert_eq!(AmountScale::new(6, Rounding::HalfEven).unwrap_err().kind(), &ErrorKind::ScaleMismatch);
 ```
 
-### The five strategies
+## Narrowing an `Amount`
 
-`MidpointAwayFromZero` (commercial), `MidpointToEven` (banker's), `Ceiling`, `Floor`,
-`Truncate`. They differ only at the midpoint and in sign handling, and the crate
-never picks one for you at a boundary where the choice is visible.
-
-## Narrowing without losing money
-
-Three operations, three different answers to "what if it does not fit":
-
-| Method | If the value does not fit | Use when |
+| You want | Use | If it does not fit |
 |---|---|---|
-| `exact_to::<Q>()` | `Err` | losing precision would be a bug |
-| `checked_round_to::<Q>(strategy)` | rounds | losing precision is a decision you are making |
-| `fits_scale(n)` | — (returns `bool`) | you want to ask before acting |
+| fewer decimals, same type | `round_to(decimals, rounding)` | rounds |
+| another precision, rounding | `rescale::<Q>(rounding)` | rounds |
+| another precision, exactly | `exact::<Q>()` | `Err(ExcessPrecision)` |
+| to a cash increment | `round_to_increment(increment, rounding)` | rounds |
+| to know | `fits(decimals)` | `false` |
 
 ```rust
-use billing::Amount;
+use billing::{Amount, Rounding};
 
-let exact = Amount::<5>::parse("356.80000")?;
-assert_eq!(exact.exact_to::<2>()?, Amount::<2>::parse("356.80")?);
+let a = Amount::<5>::parse("10.03456")?;
+assert_eq!(a.round_to(2, Rounding::HalfEven)?.to_string(), "10.03000");
+assert_eq!(a.rescale::<2>(Rounding::HalfAwayFromZero)?.to_string(), "10.03");
+assert!(a.exact::<2>().is_err());
+assert!(!a.fits(2));
 
-// 356.80221 does not fit two decimals — say so rather than round it away.
-let inexact = Amount::<5>::parse("356.80221")?;
-assert!(inexact.exact_to::<2>().is_err());
-assert!(!inexact.fits_scale(2));
+let five = Amount::<5>::parse("0.05")?;
+assert_eq!(a.round_to_increment(five, Rounding::HalfAwayFromZero)?.to_string(), "10.05000");
+assert_eq!((-a).round_to_increment(five, Rounding::HalfAwayFromZero)?.to_string(), "-10.05000");
 ```
 
-The right response to that `Err` on a document is **not** to round: rounding the
-leaves and the aggregates independently breaks the totals identities. Rebuild with
-[`amount_scale`](../e-invoicing/) instead.
+Splitting an amount exactly — `Amount::split` and the free `split` — is on
+[Splitting](../allocation/).
 
-## Splitting money exactly
+## `Price`, `UnitPrice`, `Quantity`, `Percent`
 
-Naive division loses or invents cents. Both splitters here are exact by construction.
+A **price is not money.** 0.123456 EUR/kWh is a lawful item net price (BT-146); it
+becomes money only when multiplied by a quantity and reduced once. So `Price` wraps an
+exact `Decimal` of any precision.
+
+| Type | Business terms | Notes |
+|---|---|---|
+| `Price` | BT-146 | exact `Decimal`; must be ≥ 0 where it is used (`BR-27`) |
+| `UnitPrice` | BT-146, BT-149, BT-150 | a `Price` per base quantity (default 1) in an optional unit |
+| `Quantity` | BT-129, BT-130 | signed value and a unit code; **the sign is the direction** |
+| `Percent` | BT-96, BT-119, BT-138 … | `Percent::new(dec!(19))` is 19 %; every percentage input takes one, a bare `Decimal` does not compile |
 
 ```rust
-use billing::Amount;
+use billing::{Line, Price, Quantity, UnitPrice};
+use rust_decimal::dec;
 
-// 0.10 three ways — not 0.033… three times.
-let parts = Amount::<2>::parse("0.10")?.distribute(3)?;
-assert_eq!(parts, vec![
-    Amount::<2>::parse("0.04")?,
-    Amount::<2>::parse("0.03")?,
-    Amount::<2>::parse("0.03")?,
-]);
+// 12.00 per 100 kg, 250 kg delivered: 250 × 12 / 100 = 30.
+let per_100kg = UnitPrice::new(Price::new(dec!(12))).with_base_quantity(dec!(100)).with_unit("KGM");
+let line = Line::new("gravel", Quantity::new(dec!(250), "KGM"), per_100kg);
+assert_eq!(line.exact_net()?, dec!(30));
 
-// By integer ratios, largest-remainder: someone takes the extra cent.
-let seats = Amount::<2>::parse("100.00")?.allocate(&[1, 1, 1])?;
-assert_eq!(seats[0], Amount::<2>::parse("33.34")?);
-let sum: Amount<2> = seats.into_iter().sum();
-assert_eq!(sum, Amount::<2>::parse("100.00")?);
+// A refund is a negative quantity at a non-negative price.
+let refund = Line::fixed("refund", dec!(-50));
+assert_eq!(refund.quantity().value(), dec!(-1));
+assert_eq!(refund.price().price().value(), dec!(50));
 ```
 
-`distribute` spreads the indivisible remainder one smallest-unit at a time, so no
-part absorbs it all. `allocate` uses the largest-remainder (Hamilton) method with
-ties broken by position — deterministic, no hidden randomness.
+Constructors are infallible; the EN 16931 checks on them — price ≥ 0 (`BR-27`), base
+quantity > 0 (`PEPPOL-EN16931-R121`), price unit = quantity unit
+(`PEPPOL-EN16931-R130`) — run inside `build()` and come back with the line's
+[location](../errors/).
 
-For a physical quantity rather than money, use
-[`proportional_split`](../allocation/#splitting-a-raw-quantity); for a whole document,
-[`AllocationRule`](../allocation/).
+## `Currency`
 
-## Cash rounding
-
-Several jurisdictions withdrew their smallest coins and round the amount actually
-*tendered*: 0.05 in Switzerland, Belgium, Ireland, Italy, Canada and Australia; 0.10
-in New Zealand; 0.50 in Denmark; 1.00 in Sweden and Norway.
-
-```rust
-use billing::{Amount, RoundingStrategy};
-
-let increment = Amount::<5>::parse("0.05000")?;
-assert_eq!(
-    Amount::<5>::parse("12.34000")?
-        .round_to_increment(increment, RoundingStrategy::MidpointAwayFromZero)?,
-    Amount::parse("12.35000")?
-);
-```
-
-There is deliberately **no** `for_currency` helper and no default increment: the
-increment is a payment-law fact, not a currency fact. CHF has two ISO minor units but
-rounds cash to 0.05; EUR rounds to 0.05 in Belgium and not at all in Germany. The
-midpoint rule varies too — Norway legislates 0.50 up, Denmark leaves 0.25 and 0.75
-undefined in the statute, and New Zealand leaves the 5-cent case to the retailer.
-
-At document level this is `CashRounding`, which stores the rule so that a later change
-to the paid amount recomputes the adjustment instead of leaving a stale one. See
-[The totals chain](../totals/#settlement-bt-113-bt-114-bt-115).
-
-## Comparing amounts
-
-`within_tolerance_ppm` returns `bool`, not `Result`:
-
-```rust
-use billing::Amount;
-
-let stated   = Amount::<5>::parse("100.00000")?;
-let computed = Amount::<5>::parse("100.50000")?;
-assert!(stated.within_tolerance_ppm(computed, 10_000));   // within 1 %
-assert!(!stated.within_tolerance_ppm(computed, 4_000));   // not within 0.4 %
-```
-
-It returns `bool`, not `Result`. A fallible signature here collapses at every real
-call site into `.unwrap_or(false)`, which reports *"outside tolerance"* for what is
-actually an internal arithmetic failure — in exactly the checks written to catch
-billing discrepancies. Widening the subtraction to `i128` removes the failure mode
-rather than reporting it.
-
-## Currency
-
-`Currency` is an ISO 4217 alphabetic code stored as three bytes — `Copy`, no
-allocation. It performs no conversion and no rate lookup. It exists for two reasons:
-generated unit-price labels (`"EUR/kWh"`), and refusing to combine documents that are
-denominated differently.
-
-The default is `Currency::XXX`, ISO 4217 for *"no currency involved"* — deliberately
-not `EUR`. A document that reaches production still labelled `XXX` is a visible bug; a
-silent `EUR` default is not.
-
-`minor_units()` reports the ISO exponent, and distinguishes *zero decimals* (JPY) from
-*no fractional subdivision at all* (`XAU`, `XXX`), which are not the same thing.
-
-### Two boundary questions, and neither answers the other
-
-`Currency::new` accepts any three ASCII letters, and keeps doing so on purpose: this
-crate bills things that are not EN 16931 invoices, and a private clearing unit is a
-legitimate thing to denominate an internal document in. What it must not do is let
-such a code reach an *invoice* unremarked — `BR-CL-03`, `BR-CL-04` and `BR-CL-05` are
-fatal, and they are enforced at an access point rather than at a boundary you control.
-
-So ask both questions before you emit:
+A `Currency` is three ASCII letters, stored uppercase. The ISO 4217 code list
+(`BR-CL-04`) is the format layer's check. There is no `Default`.
 
 ```rust
 use billing::Currency;
 
-// Is it a code EN 16931 admits? (BR-CL-04, fatal)
-assert!(Currency::EUR.is_iso4217());
-assert!(!Currency::new("XBT").unwrap().is_iso4217());  // well-formed, and fatal
-
-// Was a currency actually configured?
-assert!(Currency::XXX.is_unset());
-assert!(Currency::XXX.is_iso4217());                   // XXX *is* in the list
+assert_eq!(Currency::new("pln")?.code(), "PLN");
+assert!(Currency::new("EURO").is_err());
+const NOK: Currency = Currency::of(*b"NOK").unwrap(); // a bad code fails to compile
+assert_eq!(NOK.to_string(), "NOK");
 ```
-
-The 178-code list is transcribed verbatim from the `contains(' AED AFN … ZWG ')` in
-`BR-CL-03` of the pinned CEN artefact, so it answers the question a validator will
-actually ask. It also makes `minor_units()` honest: its fall-back to `Some(2)` is a
-documented default for the codes `is_iso4217()` rejects, not an unmarked guess.
 
 ## Serialisation
 
-With the `serde` feature, `Amount<P>` serialises as a decimal **string**
-(`"0.03456"`), never as its raw scaled integer and never as a JSON number.
+With the `serde` feature, `Amount`, `Price` and every `Decimal` field serialise as
+decimal **strings** in the `parse` grammar; JSON numbers are refused.
 
-The raw integer would be meaningless without knowing `P` out of band — `3456` is
-`0.03456` at `P = 5` and `34.56` at `P = 2`, so a change of precision would silently
-rescale every stored value. A JSON number invites float round-tripping, which is the
-one thing a fixed-point monetary type exists to prevent. Deserialisation goes through
-`parse`, so excess precision is rejected rather than truncated.
+```rust
+use billing::Amount;
+
+let a: Amount = serde_json::from_str("\"12.50\"")?;
+assert_eq!(serde_json::to_string(&a)?, "\"12.50000\"");
+assert!(serde_json::from_str::<Amount>("12.5").is_err());
+```

@@ -4,20 +4,13 @@
 # ── Graph configuration ──────────────────────────────────────────────────────
 [graph]
 targets = []          # check all targets
-all-features = false  # check default features; CI runs --all-features separately
+all-features = false  # `just deny` / CI pass --all-features
 
 # ── Security advisories ──────────────────────────────────────────────────────
 [advisories]
-# Reject crates with known security vulnerabilities (RustSec advisory-db).
+# The project's one advisory checker (RustSec). It resolves features, so inactive
+# optional dependencies are not flagged. Add an ignore only with its reason.
 version = 2
-#
-# Deliberately empty, even though `.cargo/audit.toml` ignores RUSTSEC-2026-0235.
-# The two tools do not see the same set of crates: cargo-deny resolves **features**
-# (`[graph] all-features = false` below), so an optional dependency nothing activates
-# is simply not in its graph, while `cargo audit` reads `Cargo.lock` directly and sees
-# every optional dependency listed there. rkyv is the case in point — deny never
-# flagged it, and an ignore here would be an entry that matches nothing and quietly
-# stops meaning anything.
 ignore = []
 
 # ── License policy ───────────────────────────────────────────────────────────

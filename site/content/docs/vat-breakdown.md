@@ -1,210 +1,147 @@
 +++
-title = "VAT breakdown (BG-23)"
-description = "A single tax total is not a lawful invoice. The per-rate breakdown, the ten UNCL 5305 categories and their exemption rules, and per-position attribution."
-weight = 50
+title = "VAT"
+description = "VAT as an attribute of every line and adjustment: the ten UNCL 5305 categories, exemption reasons, and the BG-23 breakdown derived by grouping with the tax rounded once per group."
+weight = 40
 +++
 
-## Why a breakdown is not optional
+## VAT is an attribute, the breakdown is a group-by
 
-A lump `tax_total` cannot satisfy the law on any invoice carrying more than one rate.
-EU VAT Directive 2006/112/EC art. 226(8)–(10) requires the taxable amount **per rate
-or exemption** and the tax **per rate**; §14 Abs. 4 Nr. 7–8 UStG says the same. A
-reduced-rate line beside a standard-rate line, a reverse-charge position, an exempt
-feed-in credit — each needs its own line.
+Every line (BT-151/152) and document allowance or charge (BT-95/96, BT-102/103)
+carries a `Vat`, or takes the builder's `default_vat`. The breakdown (BG-23,
+`vat_groups()`) is a **group-by** per (category, rate): BT-116 is the sum of the
+members, BT-117 is `round(base × rate / 100)` **once per group**, never per line.
 
-That structure is EN 16931's **BG-23**, and it is what XRechnung, ZUGFeRD/Factur-X and
-Peppol BIS all serialise:
+```rust
+use billing::{Amount, AmountScale, Currency, Document, Line, Percent, TaxCategory, Vat};
+use rust_decimal::dec;
 
-| Field | Term | Meaning |
-|---|---|---|
-| `category` | BT-118 | VAT category code |
-| `rate` | BT-119 | VAT category rate |
-| `taxable_base` | BT-116 | taxable amount for this category and rate |
-| `tax_amount` | BT-117 | tax charged on it |
-| `exemption_reason` | BT-120 | exemption reason, free text |
-| `exemption_reason_code` | BT-121 | exemption reason, CEF VATEX code |
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::fixed("energy", dec!(400)))
+    .line(Line::fixed("water", dec!(100)).with_vat(Vat::standard(Percent::new(dec!(7)))?))
+    .build()?;
 
-The engine produces the breakdown. It does **not** decide which category applies —
-that is a jurisdictional question and stays with you.
+let groups = doc.vat_groups(); // ordered by category code, then rate
+assert_eq!(groups.len(), 2);
+assert_eq!((groups[0].category(), groups[0].rate_percent()), (TaxCategory::Standard, Percent::new(dec!(7))));
+assert_eq!((groups[0].taxable_base(), groups[0].tax()), (Amount::parse("100")?, Amount::parse("7")?));
+assert_eq!(groups[1].tax(), Amount::parse("76")?);
+assert_eq!(doc.vat_total(), Amount::parse("83.00")?); // BT-110 = Σ BT-117 (BR-CO-14)
+```
 
-## One line per `(category, rate)`
+Two lines of 0.03 at 19 %: rounding per line gives 0.01 + 0.01, but the group's exact
+tax 0.0114 rounds to 0.01 — which is what a validator recomputes:
 
-Entries sharing a category and rate are merged. The requirement comes from two
-different places depending on the category, and the asymmetry is deliberate:
+```rust
+use billing::{Amount, AmountScale, Currency, Document, Line, Percent, Vat};
+use rust_decimal::dec;
 
-| Categories | Rule | Wording |
-|---|---|---|
-| `S`, `L`, `M` | BR-S-08, BR-AF-08, BR-AG-08 | *"For each different value of VAT category rate … the VAT category taxable amount shall equal the sum of …"* — the equality only holds if entries at that rate are merged |
-| `Z`, `E`, `AE`, `K`, `G`, `O` | BR-Z-01 and siblings | *"… shall contain in the VAT breakdown **exactly one** VAT category code equal with …"* |
+let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+    .line(Line::fixed("a", dec!(0.03)).with_vat(Vat::standard(Percent::new(dec!(19.00)))?)) // same rate, other spelling
+    .line(Line::fixed("b", dec!(0.03)))
+    .build()?;
+assert_eq!(doc.vat_groups().len(), 1); // the rate is normalised: 19.00 == 19
+assert_eq!(doc.vat_total(), Amount::parse("0.01")?);
+```
 
-The taxed categories say *"at least one"* because they can legitimately appear at
-several rates; the zero-tax categories say *"exactly one"* because they cannot.
+`BR-CO-17` and the per-category base rules (`BR-S-08` and siblings) therefore hold by
+construction.
 
-The rate is **normalised** before comparison. Peppol specifies that only significant
-decimals count for the VAT rate, so `0.19` and `0.190` are one group. Without
-normalising they would produce two breakdown lines for one rate — an invalid invoice.
+## The rate is a `Percent`
 
-## The ten categories
+`Vat::standard(Percent::new(dec!(19)))` is 19 %, as BT-152 states it; a bare `Decimal`
+does not compile, so `0.19` can never be mistaken for 19 %, and Corsica's 0.9 % is
+`Percent::new(dec!(0.9))`. Rates are normalised (`19.00` → `19`).
 
-`BR-CL-17` and `BR-CL-18` restrict BT-118 and BT-151 to exactly ten UNCL 5305 codes,
-and `TaxCategory` is that closed set. It is deliberately **not** `#[non_exhaustive]`:
-it mirrors an externally-governed code list, and consumers legitimately need
-exhaustive matching when mapping to an output format.
+## Constructors, and the ten categories
 
-| Code | Meaning | Levies tax | Exemption reason |
+Every `Vat` comes from a validating constructor, so it satisfies its category's rate
+and reason rules:
+
+| Constructor | Categories | Rate | Exemption reason |
 |---|---|---|---|
-| `S` | standard rate | yes | forbidden |
-| `Z` | zero-rated | no | **forbidden** |
-| `E` | exempt | no | **required** |
-| `AE` | reverse charge | no | required |
-| `K` | intra-Community supply | no | required |
-| `G` | free export item | no | required |
-| `O` | outside the scope of VAT | no | required |
-| `L` | Canary Islands IGIC | yes | forbidden |
-| `M` | Ceuta and Melilla IPSI | yes | forbidden |
-| `B` | split payment (Italy) | **yes** | neither |
-
-Three of those rows are the ones implementers get wrong.
-
-**`Z` and `E` both carry zero tax, but `Z` must *not* have an exemption reason and `E`
-must.** Zero-rating and exemption are legally distinct — input tax stays deductible
-under `Z` and generally not under `E`. The crate gives them separate constructors
-(`FixedRateTax::zero_rated` and `FixedRateTax::exempt`) precisely so the difference is
-not an `Option` you can leave `None`.
-
-**`B` is not `AE`.** Both mean "someone else pays", but under split payment the supply
-is taxed at the normal rate and the tax **is** stated; only the settlement route
-differs. The artefacts make this observable by omission: `B` is the one category with
-no `BR-B-05`, no `BR-B-09` and no `BR-B-10`, so nothing constrains its rate, forces
-BT-117 to zero, or requires a reason. It is therefore also the only category where
-both `requires_exemption_reason()` and `forbids_exemption_reason()` are `false` —
-code that assumes exactly one of the two holds is wrong on `B`.
-
-**`S` requires a rate strictly above zero** (`BR-S-05`), while `L` and `M` explicitly
-permit zero (`BR-AF-05`, `BR-AG-05`). Treating all taxed categories alike wrongly
-rejects a lawful 0 % IGIC line — and a `(S, 0 %)` breakdown group is *unsatisfiable*
-rather than merely unusual, because `BR-S-08` defines its base as the sum of lines
-that `BR-S-05` forbids to exist.
-
-### `O` and the rate that must be absent
-
-`O` is the only category where a line, allowance or charge must **not state its rate
-at all**. The others say the rate *"shall be 0 (zero)"* — present, and zero. `BR-O-05`
-says the opposite: an invoice line with category `O` *shall not contain* an invoiced
-item VAT rate. `BR-O-06` and `BR-O-07` say the same for BT-96 and BT-103.
-
-`LineVat::rate` is a plain `Decimal`, so an `O` position stores `0`. A consumer
-emitting UBL or CII must **suppress the element** rather than write
-`<cbc:Percent>0</cbc:Percent>`, which is a fatal violation. `TaxCategory::states_rate()`
-is that instruction in code.
-
-It does **not** apply to BT-119. The breakdown rate is a different term governed by
-different rules, no `BR-O` rule suppresses it, and XRechnung's `BR-DE-14` requires it
-unconditionally — fatal, with no category exception. Suppressing BT-119 for `O` on the
-strength of `BR-O-05` is a validation failure, not a safe simplification.
-
-## Exemption reasons: text *or* code
-
-`BR-E-10`, `BR-AE-10`, `BR-IC-10`, `BR-G-10` and `BR-O-10` each require *"a VAT
-exemption reason code (BT-121) **or** a VAT exemption reason text (BT-120)"*. They are
-alternatives. A caller holding only the machine-readable code — the one a validator
-can actually check against `BR-CL-22` — should not have to invent prose:
+| `Vat::standard(rate)` | `S` | > 0 (`BR-S-05`) | forbidden (`BR-S-10`) |
+| `Vat::zero_rated()` | `Z` | 0 (`BR-Z-05`) | forbidden (`BR-Z-10`) |
+| `Vat::exempt(category, why)` | `E`, `AE`, `K`, `G`, `O` | 0 | **required** (`BR-E-10`, `BR-AE-10`, `BR-IC-10`, `BR-G-10`, `BR-O-10`) |
+| `Vat::regional(category, rate)` | `L`, `M`, `B` | ≥ 0 (`BR-AF-05`, `BR-AG-05`) | forbidden for `L`, `M` (`BR-AF-10`, `BR-AG-10`) |
 
 ```rust
-use billing::{FixedRateTax, TaxCategory, TaxLayer};
-
-let ic = FixedRateTax::exempt_coded(
-    "Innergemeinschaftliche Lieferung",
-    TaxCategory::IntraCommunity,
-    "VATEX-EU-IC",
-)?;
-let entry = ic.breakdown(&[])?.unwrap();
-assert_eq!(entry.exemption_reason_code.as_deref(), Some("VATEX-EU-IC"));
-assert_eq!(entry.exemption_reason, None);
-```
-
-Conversely `BR-S-10`, `BR-Z-10`, `BR-AF-10` and `BR-AG-10` forbid **both** forms, so
-checking only the text would let a VATEX code through. The engine checks both.
-
-The crate does not validate VATEX membership: it carries no copy of the list, and a
-stale embedded copy would be worse than none. The same reasoning applies to UNCL 5189,
-UNCL 7161, UN/ECE Rec 20/21 and UNTDID 1001.
-
-## Per-position attribution
-
-EN 16931 wants the category and rate on every position too — BT-151/152 on a line
-(`BR-CO-04`), BT-95/96 on an allowance (`BR-32`), BT-102/103 on a charge (`BR-37`) —
-and `BR-S-08` checks the breakdown against them. The engine fills this in during
-assembly from the layer whose base the position falls in:
-
-```rust
-use billing::prelude::*;
+use billing::{ErrorKind, Exemption, Percent, TaxCategory, Vat, VatError};
 use rust_decimal::dec;
 
-let doc = BillingDocument::builder()
-    .currency(Currency::EUR)
-    .amount_scale(AmountScale::EN16931)
-    .positions(vec![
-        LineItem::fixed("Beratung", Amount::parse("400.00000")?).tag("full").build()?,
-        LineItem::fixed("Fachbuch", Amount::parse("100.00000")?).tag("reduced").build()?,
-    ])
-    .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.with_tag("full").boxed())
-    .extra_tax(FixedRateTax::new("MwSt", dec!(0.07))?.with_tag("reduced").boxed())
-    .build()?;
+let err = Vat::standard(Percent::new(dec!(0))).unwrap_err();
+assert!(matches!(err.kind(), ErrorKind::InvalidVat(VatError::Rate { .. })));
+assert_eq!(err.rule(), Some("BR-S-05"));
 
-assert_eq!(doc.net_positions()[0].vat.unwrap().rate, dec!(0.19));
-assert_eq!(doc.net_positions()[1].vat.unwrap().rate, dec!(0.07));
-doc.verify_vat_attribution()?;
+let ae = Vat::exempt(TaxCategory::ReverseCharge, Exemption::Code("VATEX-EU-AE".into()))?;
+assert_eq!((ae.category().code(), ae.rate_percent()), ("AE", Percent::ZERO));
+
+let blank = Vat::exempt(TaxCategory::Exempt, Exemption::Text("  ".into())).unwrap_err();
+assert_eq!(blank.rule(), Some("BR-E-10"));
+
+// A 0 % IGIC line is lawful; a 0 % standard-rated one is not.
+assert!(Vat::regional(TaxCategory::CanaryIslands, Percent::new(dec!(0))).is_ok());
 ```
 
-### Two checks, not one
+Common pitfalls:
 
-`verify_vat_attribution()` checks that the attributions which **exist** agree with the
-breakdown — `BR-S-08`, plus `BR-CO-14` (`BT-110 = Σ BT-117`) and the `BR-O-12/13/14`
-family. It is deliberately not part of `validate()`, because
-[allocation](../allocation/) cannot preserve it: splitting the positions and the
-breakdown with independent penny corrections can leave the two a minor unit apart
-while both remain internally exact.
+- **`Z` must not have an exemption reason; `E` must.** Both carry zero tax.
+- **`B` is not `AE`.** Under Italian split payment the tax **is** stated; nothing
+  constrains `B`'s rate or reason, but `BR-B-02` forbids it beside `S`.
+- **`S` requires a rate above zero** (`BR-S-05`); `L` and `M` permit zero.
 
-It also passes **vacuously** on a document with no attributions at all. That is the
-right behaviour — this crate bills things that are not invoices — but it means passing
-it is not on its own a licence to emit. `unattributed_positions()` answers the other
-half:
+`TaxCategory` is `#[non_exhaustive]`; `TaxCategory::from_code` parses a code
+case-insensitively.
+
+### `O` and the rate that must be absent {#out-of-scope}
+
+For `O`, a line, allowance or charge must **not state its rate** (`BR-O-05`,
+`BR-O-06`, `BR-O-07`): `Vat::stated_rate()` is `None` (`rate_percent()` is 0 %). The
+breakdown rate BT-119 is always stated (`BR-DE-14`).
+
+## Exemption reasons: text, code or both
+
+The reason rules require a code (BT-121) **or** a text (BT-120); `Exemption` is
+`Text`, `Code` or `Both`, and a blank reason counts as none. VATEX code-list
+membership (`BR-CL-22`) is the format layer's check.
+
+## Document-wide rules
+
+`build()` enforces three document-wide rules:
+
+- **All-VAT or VAT-free.** Either every line and adjustment has a VAT treatment (its
+  own or the default), or none has. A line without one in a VAT document is
+  `ErrorKind::MissingVat` at `Location::Line(i)`, citing `BR-CO-04`.
+- **One reason per group.** Two members of one (category, rate) group with different
+  exemption reasons are `ErrorKind::ConflictingExemption`.
+- **`O` stands alone, `B` never beside `S`.** `O` beside any other group breaks
+  `BR-O-11`; `B` beside `S` breaks `BR-B-02`. Both are `ErrorKind::InvalidVat`.
 
 ```rust
-use billing::prelude::*;
+use billing::{AmountScale, Currency, Document, ErrorKind, Exemption, Line, Location, Percent, TaxCategory, Vat};
 use rust_decimal::dec;
 
-// The VAT layer is restricted to "energy", so nothing attributes a category to
-// the levy — which is a BG-21 charge, and BR-37 makes one mandatory.
-let doc = BillingDocument::builder()
-    .currency(Currency::EUR)
-    .positions(vec![LineItem::for_usage(
-        "Arbeit",
-        Quantity::new(dec!(1000), "kWh"),
-        UnitPrice::new(dec!(0.30), "EUR/kWh"),
-    ).tag("energy").build()?])
-    .extra_tax(PerUnitLevy::new("Stromsteuer", Amount::parse("0.02050")?, "kWh")?.boxed())
-    .extra_tax(FixedRateTax::new("MwSt", dec!(0.19))?.with_tag("energy").boxed())
-    .build()?;
+let out_of_scope = Vat::exempt(TaxCategory::OutOfScope, Exemption::Text("not subject to VAT".into()))?;
+let err = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .line(Line::fixed("damages", dec!(500)).with_vat(out_of_scope))
+    .line(Line::fixed("service", dec!(100)).with_vat(Vat::standard(Percent::new(dec!(19)))?))
+    .build()
+    .unwrap_err();
+assert_eq!(err.rule(), Some("BR-O-11"));
 
-doc.verify_vat_attribution()?;                       // consistent …
-assert_eq!(doc.unattributed_positions().count(), 1); // … but not yet emittable
+let err = Document::builder(Currency::EUR, AmountScale::EN16931)
+    .line(Line::fixed("a", dec!(1)).with_vat(Vat::standard(Percent::new(dec!(19)))?))
+    .line(Line::fixed("b", dec!(1)))
+    .build()
+    .unwrap_err();
+assert_eq!(err.kind(), &ErrorKind::MissingVat);
+assert_eq!(err.location(), Some(&Location::Line(1)));
+assert_eq!(err.rule(), Some("BR-CO-04"));
 ```
 
-Fix it by declaring the charge's own treatment — `PerUnitLevy::with_vat`,
-`PercentageCharge::with_vat`, `PercentageDiscount::with_vat`, `FixedDiscount::with_vat`
-— or by widening the VAT layer's base so it covers the charge.
+A **VAT-free** document (no `Vat` anywhere) builds with no groups — fine for quotes,
+but not an EN 16931 invoice (`BR-CO-18`).
 
-## `BR-CO-17`, and why it has a tolerance
-
-`BT-117 = BT-116 × (BT-119 / 100)`, rounded to two decimals. The engine checks it with
-EN 16931's own tolerance rather than exact equality, because the CEN reference
-Schematron asserts `|BT-117 − base × rate| < 1.00` and the slack is genuinely needed:
-merging two entries sums amounts that were each rounded, so `Σ(base_i × rate)` and
-`(Σ base_i) × rate` can legitimately differ in the last place.
-
-When assembling at an `AmountScale`, the engine reduces the base **first** and then
-derives the tax from the *reduced* base in a single rounding of the exact product —
-which is what a validator recomputes. Rounding an already-rounded tax answers a
-different question and can differ by a whole minor unit.
+A document discount over several rates must be split per group; see
+[`apportion`](../tax-and-discounts/#apportion).

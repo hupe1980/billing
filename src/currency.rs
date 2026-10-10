@@ -1,67 +1,32 @@
-//! [`Currency`] — an ISO 4217 alphabetic currency code.
-//!
-//! The engine performs **no** conversion, no rate lookup, and no formatting
-//! beyond the three-letter code itself.  `Currency` exists for two reasons:
-//!
-//! 1. **Label generation** — [`crate::RateSchedule`] and friends build unit-price
-//!    labels such as `"EUR/kWh"`.  Before `Currency` existed these were hardcoded
-//!    to `EUR`, which silently mislabelled every non-euro invoice.
-//! 2. **Mixing protection** — [`crate::merge_period_documents`] refuses to combine
-//!    documents whose currencies differ, turning a silent arithmetic error into
-//!    [`crate::BillingError::CurrencyMismatch`]. (Allocation splits a single
-//!    document, so it cannot mix currencies in the first place.)
-//!
-//! # No implicit default
-//!
-//! [`Currency::XXX`] is the ISO 4217 code for "no currency involved" and is what
-//! [`DocumentMeta::default`](crate::DocumentMeta) and every builder start with.
-//! It is deliberately *not* `EUR`: a document that reaches production still
-//! labelled `XXX` is a visible bug, whereas a silent `EUR` default is not.
-//!
-//! ```rust
-//! use billing::Currency;
-//!
-//! let eur = Currency::new("EUR").unwrap();
-//! assert_eq!(eur.code(), "EUR");
-//! assert_eq!(eur.to_string(), "EUR");
-//!
-//! // Lowercase input is normalised to uppercase.
-//! assert_eq!(Currency::new("usd").unwrap(), Currency::USD);
-//!
-//! // Anything that is not exactly three ASCII letters is rejected.
-//! assert!(Currency::new("EURO").is_err());
-//! assert!(Currency::new("E1R").is_err());
-//! assert!(Currency::new("").is_err());
-//! ```
+//! [`Currency`]: a validated three-letter code (BT-5), nothing more.
 
-use std::fmt;
-use std::str::FromStr;
+use core::fmt;
 
-use crate::error::BillingError;
+use crate::{ErrorKind, Result};
 
-/// An ISO 4217 alphabetic currency code (exactly three ASCII letters).
+/// A currency code: three ASCII letters, stored uppercase.
 ///
-/// Stored as three uppercase bytes — `Copy`, no heap allocation.
+/// The engine never interprets the code: ISO 4217 membership is the format
+/// layer's check, and the decimals come from the format's
+/// [`AmountScale`](crate::AmountScale), not the currency. No `Default`: a
+/// document's currency is always stated.
 ///
-/// Construct with [`Currency::new`] (validating) or use one of the associated
-/// constants ([`Currency::EUR`], [`Currency::USD`], …).
+/// ```
+/// use billing::Currency;
+///
+/// let pln = Currency::new("pln")?;
+/// assert_eq!(pln.code(), "PLN");
+/// assert_eq!(Currency::EUR.to_string(), "EUR");
+/// assert!(Currency::new("EURO").is_err());
+///
+/// const NOK: Currency = Currency::of(*b"NOK").unwrap();
+/// assert_eq!(NOK.code(), "NOK");
+/// # Ok::<(), billing::Error>(())
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Currency([u8; 3]);
 
 impl Currency {
-    /// ISO 4217 `XXX` — "no currency involved". The default for every builder.
-    ///
-    /// Seeing `XXX` on a rendered invoice means a currency was never configured.
-    ///
-    /// # A downstream consumer must reject it explicitly
-    ///
-    /// EN 16931 will not do it for you. `XXX` is a real ISO 4217 code, and rule
-    /// **BR-CL-04** ("Invoice currency code MUST be coded using ISO code list
-    /// 4217 alpha-3") accepts it along with the other 177 — so a document that was
-    /// never configured validates cleanly as an EN 16931 invoice claiming no
-    /// currency is involved. [`Currency::is_unset`] is the check to run at the
-    /// boundary before emitting.
-    pub const XXX: Self = Self(*b"XXX");
     /// Euro.
     pub const EUR: Self = Self(*b"EUR");
     /// US dollar.
@@ -70,219 +35,56 @@ impl Currency {
     pub const GBP: Self = Self(*b"GBP");
     /// Swiss franc.
     pub const CHF: Self = Self(*b"CHF");
-    /// Japanese yen.
+    /// Yen.
     pub const JPY: Self = Self(*b"JPY");
+    /// ISO 4217's "no currency involved" code.
+    pub const XXX: Self = Self(*b"XXX");
 
-    /// Parse an ISO 4217 alphabetic code, normalising ASCII lowercase to uppercase.
+    /// A code from three ASCII letters, uppercased.
     ///
     /// # Errors
-    /// Returns [`BillingError::InvalidInput`] unless `code` is exactly three
-    /// ASCII alphabetic characters.
-    ///
-    /// ```rust
-    /// use billing::Currency;
-    /// assert_eq!(Currency::new("chf").unwrap(), Currency::CHF);
-    /// assert!(Currency::new("€").is_err());
-    /// ```
-    pub fn new(code: &str) -> Result<Self, BillingError> {
-        let bytes = code.as_bytes();
-        if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_alphabetic) {
-            return Err(BillingError::InvalidInput {
-                reason: format!(
-                    "currency must be a 3-letter ISO 4217 alphabetic code, got {code:?}"
-                ),
-            });
+    /// [`ErrorKind::InvalidCurrency`] unless `code` is exactly three ASCII
+    /// letters.
+    pub fn new(code: &str) -> Result<Self> {
+        match code.as_bytes() {
+            &[a, b, c] if [a, b, c].iter().all(u8::is_ascii_alphabetic) => Ok(Self([
+                a.to_ascii_uppercase(),
+                b.to_ascii_uppercase(),
+                c.to_ascii_uppercase(),
+            ])),
+            _ => Err(ErrorKind::InvalidCurrency { input: code.into() }.into()),
         }
-        Ok(Self([
-            bytes[0].to_ascii_uppercase(),
-            bytes[1].to_ascii_uppercase(),
-            bytes[2].to_ascii_uppercase(),
-        ]))
     }
 
-    /// The three-letter code as a string slice.
+    /// A code usable in a `const` item, uppercased; `None` unless all three
+    /// bytes are ASCII letters. Never panics: in a `const` item,
+    /// `Currency::of(*b"NOK").unwrap()` turns an invalid code into a compile
+    /// error.
+    #[must_use]
+    pub const fn of(code: [u8; 3]) -> Option<Self> {
+        if code[0].is_ascii_alphabetic()
+            && code[1].is_ascii_alphabetic()
+            && code[2].is_ascii_alphabetic()
+        {
+            Some(Self([
+                code[0].to_ascii_uppercase(),
+                code[1].to_ascii_uppercase(),
+                code[2].to_ascii_uppercase(),
+            ]))
+        } else {
+            None
+        }
+    }
+
+    /// The three-letter code.
     #[must_use]
     pub fn code(&self) -> &str {
-        // SAFETY-free: the bytes are validated ASCII on every construction path,
-        // and the only const constructors use ASCII literals.
-        std::str::from_utf8(&self.0).unwrap_or("XXX")
-    }
-
-    /// Returns `true` for [`Currency::XXX`] — i.e. no currency was configured.
-    #[must_use]
-    pub fn is_unset(&self) -> bool {
-        *self == Self::XXX
-    }
-
-    /// Every alphabetic code EN 16931 admits, in ascending order.
-    ///
-    /// Transcribed verbatim from the `contains(' AED AFN … ZWG ')` list in
-    /// **BR-CL-03** of `ubl/schematron/codelist/EN16931-UBL-codes.sch`
-    /// (`ConnectingEurope/eInvoicing-EN16931`, tag `validation-1.3.16`) — the same
-    /// list BR-CL-04 and BR-CL-05 apply to BT-5 and BT-6. Sorted so
-    /// [`is_iso4217`](Self::is_iso4217) can binary-search it.
-    const ISO_4217: [&'static [u8; 3]; 178] = [
-        b"AED", b"AFN", b"ALL", b"AMD", b"AOA", b"ARS", b"AUD", b"AWG", b"AZN", b"BAM", b"BBD",
-        b"BDT", b"BHD", b"BIF", b"BMD", b"BND", b"BOB", b"BOV", b"BRL", b"BSD", b"BTN", b"BWP",
-        b"BYN", b"BZD", b"CAD", b"CDF", b"CHE", b"CHF", b"CHW", b"CLF", b"CLP", b"CNH", b"CNY",
-        b"COP", b"COU", b"CRC", b"CUP", b"CVE", b"CZK", b"DJF", b"DKK", b"DOP", b"DZD", b"EGP",
-        b"ERN", b"ETB", b"EUR", b"FJD", b"FKP", b"GBP", b"GEL", b"GHS", b"GIP", b"GMD", b"GNF",
-        b"GTQ", b"GYD", b"HKD", b"HNL", b"HTG", b"HUF", b"IDR", b"ILS", b"INR", b"IQD", b"IRR",
-        b"ISK", b"JMD", b"JOD", b"JPY", b"KES", b"KGS", b"KHR", b"KMF", b"KPW", b"KRW", b"KWD",
-        b"KYD", b"KZT", b"LAK", b"LBP", b"LKR", b"LRD", b"LSL", b"LYD", b"MAD", b"MDL", b"MGA",
-        b"MKD", b"MMK", b"MNT", b"MOP", b"MRU", b"MUR", b"MVR", b"MWK", b"MXN", b"MXV", b"MYR",
-        b"MZN", b"NAD", b"NGN", b"NIO", b"NOK", b"NPR", b"NZD", b"OMR", b"PAB", b"PEN", b"PGK",
-        b"PHP", b"PKR", b"PLN", b"PYG", b"QAR", b"RON", b"RSD", b"RUB", b"RWF", b"SAR", b"SBD",
-        b"SCR", b"SDG", b"SEK", b"SGD", b"SHP", b"SLE", b"SOS", b"SRD", b"SSP", b"STD", b"SVC",
-        b"SYP", b"SZL", b"THB", b"TJS", b"TMT", b"TND", b"TOP", b"TRY", b"TTD", b"TWD", b"TZS",
-        b"UAH", b"UGX", b"USD", b"USN", b"UYI", b"UYU", b"UYW", b"UZS", b"VED", b"VES", b"VND",
-        b"VUV", b"WST", b"XAF", b"XAG", b"XAU", b"XBA", b"XBB", b"XBC", b"XBD", b"XCD", b"XCG",
-        b"XDR", b"XOF", b"XPD", b"XPF", b"XPT", b"XSU", b"XTS", b"XUA", b"XXX", b"YER", b"ZAR",
-        b"ZMW", b"ZWG",
-    ];
-
-    /// Whether this code is in the ISO 4217 alphabetic list EN 16931 admits —
-    /// rules **BR-CL-03**, **BR-CL-04** and **BR-CL-05**, all *fatal*.
-    ///
-    /// # Why membership is a separate question from construction
-    ///
-    /// [`Currency::new`] accepts any three ASCII letters, and deliberately keeps
-    /// doing so: this crate bills things that are not EN 16931 invoices, and a
-    /// private clearing unit or an unlisted code is a legitimate thing to denominate
-    /// an internal document in. What it must not do is let such a code reach an
-    /// invoice **silently**, because BR-CL-04 rejects it at the access point rather
-    /// than at the boundary you control.
-    ///
-    /// This is the same split as [`crate::DocumentKind::is_peppol_billing_code`]:
-    /// model the value, and expose the profile question as a predicate the consumer
-    /// asks before it emits. Ask both, together with
-    /// [`is_unset`](Self::is_unset) — `XXX` is *in* the list, so membership alone
-    /// does not mean a currency was configured.
-    ///
-    /// ```rust
-    /// use billing::Currency;
-    ///
-    /// assert!(Currency::EUR.is_iso4217());
-    /// assert!(Currency::new("KWD").unwrap().is_iso4217());
-    /// // Well-formed, constructible, and fatal under BR-CL-04.
-    /// assert!(!Currency::new("XBT").unwrap().is_iso4217());
-    /// // `XXX` passes BR-CL-04 and still means "no currency was configured".
-    /// assert!(Currency::XXX.is_iso4217() && Currency::XXX.is_unset());
-    /// ```
-    ///
-    /// # Freshness
-    ///
-    /// The list is transcribed from the pinned CEN validation artefact
-    /// (`validation-1.3.16`), not from ISO's registry directly, so it answers the
-    /// question a validator will actually ask. It moves roughly annually; a code
-    /// added to ISO after that tag reports `false` here until the artefact and this
-    /// crate catch up, which is the safe direction — a false negative is a check you
-    /// look at, a false positive is a rejected invoice.
-    #[must_use]
-    pub fn is_iso4217(&self) -> bool {
-        Self::ISO_4217.binary_search(&&self.0).is_ok()
-    }
-
-    /// The ISO 4217 **minor unit** exponent: the number of decimal places the
-    /// currency is conventionally written with.
-    ///
-    /// Returns `None` for the codes ISO lists as `N.A.` — the precious metals
-    /// (`XAU`, `XAG`, `XPT`, `XPD`), the fund/bond-market units, `XTS`, and `XXX`
-    /// itself. These have no fractional subdivision, which is **not** the same as
-    /// having zero decimals, so the distinction is preserved in the type.
-    ///
-    /// Codes outside the list — the ones [`is_iso4217`](Self::is_iso4217) reports
-    /// `false` for — fall back to `Some(2)`, the overwhelmingly common case, since
-    /// [`Currency::new`] accepts any well-formed code. Ask `is_iso4217` first if
-    /// you need to know whether the answer is a fact or a default.
-    ///
-    /// # This is not the smallest transactable amount
-    ///
-    /// Minor units describe *notation*, not the smallest coin. `CHF` has two
-    /// minor units but its smallest coin is 5 Rappen, so Swiss cash totals round
-    /// to `0.05`. That is a jurisdictional payment rule, not a property of the
-    /// currency — configure it explicitly with [`crate::CashRounding`].
-    ///
-    /// ```rust
-    /// use billing::Currency;
-    /// assert_eq!(Currency::EUR.minor_units(), Some(2));
-    /// assert_eq!(Currency::JPY.minor_units(), Some(0));   // yen has no sen in practice
-    /// assert_eq!(Currency::new("KWD").unwrap().minor_units(), Some(3));
-    /// assert_eq!(Currency::new("CLF").unwrap().minor_units(), Some(4));
-    /// assert_eq!(Currency::XXX.minor_units(), None);      // "no currency involved"
-    /// ```
-    #[must_use]
-    pub fn minor_units(&self) -> Option<u8> {
-        // ISO 4217 List One, published 2026-01-01 (Amendment 180).
-        // Only the non-2 cases are enumerated; 2 is the default for everything else.
-        const ZERO: [&[u8; 3]; 17] = [
-            b"BIF", b"CLP", b"DJF", b"GNF", b"ISK", b"JPY", b"KMF", b"KRW", b"PYG", b"RWF", b"UGX",
-            b"UYI", b"VND", b"VUV", b"XAF", b"XOF", b"XPF",
-        ];
-        const THREE: [&[u8; 3]; 7] = [b"BHD", b"IQD", b"JOD", b"KWD", b"LYD", b"OMR", b"TND"];
-        const FOUR: [&[u8; 3]; 2] = [b"CLF", b"UYW"];
-        // ISO lists these with minor unit "N.A." — no fractional subdivision.
-        const NONE: [&[u8; 3]; 13] = [
-            b"XAU", b"XAG", b"XPT", b"XPD", b"XDR", b"XUA", b"XSU", b"XBA", b"XBB", b"XBC", b"XBD",
-            b"XTS", b"XXX",
-        ];
-
-        if NONE.iter().any(|c| **c == self.0) {
-            None
-        } else if ZERO.iter().any(|c| **c == self.0) {
-            Some(0)
-        } else if THREE.iter().any(|c| **c == self.0) {
-            Some(3)
-        } else if FOUR.iter().any(|c| **c == self.0) {
-            Some(4)
-        } else {
-            Some(2)
-        }
-    }
-
-    /// The smallest representable amount in this currency, as an [`crate::Amount<P>`].
-    ///
-    /// This is `10^-minor_units` — `0.01` for EUR, `1` for JPY, `0.001` for KWD.
-    /// Use it as the default increment when rounding a document to payable
-    /// precision.
-    ///
-    /// Returns `None` when the currency has no minor unit ([`Currency::minor_units`]
-    /// returned `None`), or when the currency is finer-grained than `P` can
-    /// represent (e.g. a 4-decimal currency at `P = 2`).
-    ///
-    /// ```rust
-    /// use billing::{Amount, Currency};
-    /// assert_eq!(Currency::EUR.minor_unit_increment::<5>(), Some(Amount::parse("0.01000").unwrap()));
-    /// assert_eq!(Currency::JPY.minor_unit_increment::<5>(), Some(Amount::parse("1.00000").unwrap()));
-    /// assert_eq!(Currency::XXX.minor_unit_increment::<5>(), None);
-    /// // CLF has 4 decimals, which Amount<2> cannot express:
-    /// assert_eq!(Currency::new("CLF").unwrap().minor_unit_increment::<2>(), None);
-    /// ```
-    #[must_use]
-    pub fn minor_unit_increment<const P: u8>(&self) -> Option<crate::Amount<P>> {
-        let units = self.minor_units()?;
-        if units > P {
-            return None;
-        }
-        // 10^(P - units) raw units == 10^-units in display terms.
-        let mut raw: i64 = 1;
-        for _ in 0..(P - units) {
-            raw = raw.checked_mul(10)?;
-        }
-        Some(crate::Amount::from_raw_units(raw))
-    }
-}
-
-impl Default for Currency {
-    /// [`Currency::XXX`] — deliberately not a real currency. See the module docs.
-    fn default() -> Self {
-        Self::XXX
+        // Three ASCII letters by construction.
+        core::str::from_utf8(&self.0).unwrap_or("???")
     }
 }
 
 impl fmt::Display for Currency {
-    /// Honours width, fill and alignment (`{:>8}`), left-aligned by default like
-    /// any other string-like value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(self.code())
     }
@@ -294,16 +96,9 @@ impl fmt::Debug for Currency {
     }
 }
 
-impl FromStr for Currency {
-    type Err = BillingError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(s)
-    }
-}
-
-impl TryFrom<&str> for Currency {
-    type Error = BillingError;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+impl core::str::FromStr for Currency {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> Result<Self> {
         Self::new(s)
     }
 }
@@ -317,144 +112,40 @@ impl serde::Serialize for Currency {
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Currency {
-    /// Validates on the way in — a malformed code is a deserialization error,
-    /// never a silently-accepted value.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = <std::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(d)?;
-        Self::new(&s).map_err(serde::de::Error::custom)
+        crate::decimal::serde_str::from_str(d, Self::new, "a three-letter currency code")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     #[test]
-    fn valid_codes() {
-        assert_eq!(Currency::new("EUR").unwrap(), Currency::EUR);
+    fn new_validates_and_uppercases() {
         assert_eq!(Currency::new("eur").unwrap(), Currency::EUR);
-        assert_eq!(Currency::new("Usd").unwrap(), Currency::USD);
-        assert_eq!(Currency::new("EUR").unwrap().code(), "EUR");
-    }
-
-    #[test]
-    fn invalid_codes_rejected() {
-        for bad in ["", "E", "EU", "EURO", "E1R", "€", "  E", "eu r"] {
-            assert!(Currency::new(bad).is_err(), "{bad:?} must be rejected");
+        assert_eq!(Currency::new("Chf").unwrap(), Currency::CHF);
+        for bad in ["", "EU", "EURO", "E1R", "€UR", " EU", "ÄBC"] {
+            assert_eq!(
+                Currency::new(bad).unwrap_err().kind(),
+                &ErrorKind::InvalidCurrency { input: bad.into() }
+            );
         }
     }
 
     #[test]
-    fn default_is_xxx_not_eur() {
-        assert_eq!(Currency::default(), Currency::XXX);
-        assert!(Currency::default().is_unset());
-        assert!(!Currency::EUR.is_unset());
+    fn const_constructor_and_formatting() {
+        const SEK: Currency = Currency::of(*b"sek").unwrap();
+        assert_eq!(SEK.code(), "SEK");
+        assert_eq!(format!("{SEK}"), "SEK");
+        assert_eq!(format!("{SEK:?}"), "Currency(SEK)");
+        assert_eq!("gbp".parse::<Currency>().unwrap(), Currency::GBP);
     }
 
     #[test]
-    fn display_and_parse_roundtrip() {
-        let c: Currency = "gbp".parse().unwrap();
-        assert_eq!(c.to_string(), "GBP");
-    }
-
-    #[test]
-    fn every_conversion_entry_point_validates() {
-        // `FromStr`, `TryFrom<&str>` and `new` are three doors into the same
-        // check. A door that returns the default instead of the parsed code is
-        // the worst possible failure here, because `Currency::default()` is XXX
-        // — "no currency" — and a document labelled XXX still validates.
-        assert_eq!(Currency::try_from("EUR").unwrap(), Currency::EUR);
-        assert_eq!(Currency::try_from("usd").unwrap(), Currency::USD);
-        assert_ne!(Currency::try_from("EUR").unwrap(), Currency::default());
-        assert!(Currency::try_from("EURO").is_err());
-        assert!(Currency::try_from("").is_err());
-
-        assert_eq!("JPY".parse::<Currency>().unwrap(), Currency::JPY);
-        assert!("JP".parse::<Currency>().is_err());
-    }
-
-    #[test]
-    fn debug_names_the_type_and_the_code() {
-        // `Currency(EUR)` rather than the derived `Currency { code: [69,85,82] }`
-        // — the byte array is what a reader sees in a failing assertion message,
-        // and it is unreadable.
-        assert_eq!(format!("{:?}", Currency::EUR), "Currency(EUR)");
-        assert_eq!(format!("{:?}", Currency::default()), "Currency(XXX)");
-        assert_eq!(
-            format!("{:?}", Currency::new("chf").unwrap()),
-            "Currency(CHF)"
-        );
-    }
-
-    /// `is_iso4217` binary-searches `ISO_4217`, so an out-of-order entry would make
-    /// it answer `false` for a real currency — a false rejection with no other
-    /// symptom. The length pins the transcription against the artefact.
-    #[test]
-    fn the_iso_4217_table_is_sorted_and_complete() {
-        assert_eq!(
-            Currency::ISO_4217.len(),
-            178,
-            "BR-CL-03 (validation-1.3.16) lists 178 alphabetic codes"
-        );
-        assert!(
-            Currency::ISO_4217.windows(2).all(|w| w[0] < w[1]),
-            "ISO_4217 must be strictly ascending for binary_search"
-        );
-        // Every entry finds itself.
-        for code in Currency::ISO_4217 {
-            let c = Currency::new(std::str::from_utf8(code).unwrap()).unwrap();
-            assert!(c.is_iso4217(), "{c} must be in the list");
-        }
-    }
-
-    #[test]
-    fn membership_is_decided_independently_of_construction() {
-        // Well-formed but not a currency EN 16931 admits — BR-CL-04 is fatal on it.
-        for bad in ["XBT", "ZZZ", "DEM", "FRF", "ABC"] {
-            let c = Currency::new(bad).unwrap();
-            assert!(!c.is_iso4217(), "{bad} must not be in the list");
-            // …and it is still constructible, because this crate bills things that
-            // are not EN 16931 invoices.
-            assert_eq!(c.code(), bad);
-        }
-        // Lowercase input normalises before the lookup.
-        assert!(Currency::new("eur").unwrap().is_iso4217());
-        // The two boundary questions are independent: XXX is listed *and* unset.
-        assert!(Currency::XXX.is_iso4217());
-        assert!(Currency::XXX.is_unset());
-        assert!(!Currency::EUR.is_unset());
-    }
-
-    #[test]
-    fn minor_unit_increment_spans_the_scale_it_exactly_fits() {
-        // The increment exists whenever the currency's minor units fit within
-        // `P`, including when they use it up exactly. Requiring headroom would
-        // silently drop cash rounding for every 2-decimal currency assembled at
-        // `Amount<2>` — the natural scale for an EN 16931 document.
-        assert_eq!(
-            Currency::EUR.minor_unit_increment::<2>(),
-            Some(crate::Amount::<2>::parse("0.01").unwrap())
-        );
-        assert_eq!(
-            Currency::EUR.minor_unit_increment::<5>(),
-            Some(crate::Amount::<5>::parse("0.01000").unwrap())
-        );
-
-        // JPY has zero minor units, so it fits every scale down to `Amount<0>`.
-        assert_eq!(
-            Currency::JPY.minor_unit_increment::<0>(),
-            Some(crate::Amount::<0>::parse("1").unwrap())
-        );
-
-        // CLF has four; it fits at 4 and above, and not below.
-        let clf = Currency::new("CLF").unwrap();
-        assert_eq!(
-            clf.minor_unit_increment::<4>(),
-            Some(crate::Amount::<4>::parse("0.0001").unwrap())
-        );
-        assert_eq!(clf.minor_unit_increment::<3>(), None);
-
-        // XXX has no minor units at all, at any scale.
-        assert_eq!(Currency::XXX.minor_unit_increment::<5>(), None);
+    fn const_constructor_refuses_bad_input_without_panicking() {
+        assert_eq!(Currency::of(*b"E1R"), None);
+        assert_eq!(Currency::of(*b"   "), None);
     }
 }

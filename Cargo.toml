@@ -1,71 +1,67 @@
 [package]
 name        = "billing"
-version     = "0.15.0"
+version     = "0.16.0"
 edition     = "2024"
 rust-version = "1.85"
 authors     = ["hupe1980"]
 description = """\
-Invoice and usage-billing calculation engine. Fixed-point money, tiered / volume / \
-block / capacity rate schedules, time-of-use bands, composable VAT and discount \
-layers, tax-inclusive pricing, exact multi-recipient allocation, and self-validating \
-documents whose totals, VAT breakdown and decimals satisfy EN 16931. \
-Zero I/O. No async. No domain assumptions.\
+EN 16931 invoice arithmetic. Fixed-point money, sign-symmetric rounding, exact \
+largest-remainder splits, tariffs, VAT derived by grouping, and documents whose \
+totals are derived once from their inputs. no_std. Zero I/O.\
 """
 keywords    = ["billing", "invoice", "pricing", "metering", "en16931"]
-categories  = ["finance", "mathematics", "data-structures"]
+categories  = ["finance", "mathematics", "no-std"]
 license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/hupe1980/billing"
+homepage    = "https://hupe1980.github.io/billing"
+documentation = "https://docs.rs/billing"
 readme      = "README.md"
+# Allowlist for the published package: source, the targets `cargo package` verifies,
+# licences and docs. Repository tooling (fuzz/, scripts/, site/, CI config) stays out.
+include     = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/*.proptest-regressions",
+    "/examples/*.rs",
+    "/benches/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
-# docs.rs builds with default features unless told otherwise, which would hide
-# every serde-gated item from the published documentation. `all-features` shows
-# them, and the `docsrs` cfg enables the feature badges on gated items.
+# Show the serde-gated items on docs.rs. `--cfg docsrs` is reserved for future
+# `doc_cfg` feature badges; the crate does not use it yet.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-## Enable serde Serialize / Deserialize on all public types.
-##
-## `Amount<P>` serialises as a decimal string ("0.03456"), never as a float or a
-## raw scaled integer. Types carrying invariants (schedules, allocations, rate
-## lookups, tax layers, documents) re-run their validation on deserialisation.
+## Serialize / Deserialize on every public data type. Decimals are strings in the
+## `Amount::parse` grammar, never floats; `rust_decimal/serde` covers the re-exported `Decimal`.
 serde = ["dep:serde", "rust_decimal/serde"]
 
 [dependencies]
-# `default-features = false` drops rust_decimal's own default `serde` feature, so a
-# downstream build without our `serde` feature does not pull serde in at all.
-# Our `serde` feature re-enables `rust_decimal/serde` explicitly (see above).
-rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
-thiserror    = "2"
-serde        = { version = "1", features = ["derive"], optional = true }
+# No default features: keeps the crate `no_std` (the defaults pull in `std` and `serde`).
+rust_decimal = { version = "1.43", default-features = false }
+serde        = { version = "1.0.166", default-features = false, features = ["derive", "alloc"], optional = true }
 
 [dev-dependencies]
-# Pinned to 0.7 rather than 0.8: criterion 0.8 requires rustc 1.86, which would
-# raise this crate's MSRV for a dev-only benchmarking tool that downstream users
-# never compile. 0.7 is the newest release compatible with rust-version = 1.85.
+# 0.7, not 0.8: criterion 0.8 needs rustc 1.86, above this crate's MSRV (1.85).
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
-# `dec!` moved into rust_decimal proper behind the `macros` feature in 1.34.
-# The standalone `rust_decimal_macros` crate has not been republished since 1.40.0,
-# so depending on it invites version skew against rust_decimal 1.42. Declaring the
-# `macros` feature dev-only keeps the proc-macro out of downstream dependency trees
-# while still making `dec!` available to tests, examples and doctests.
-rust_decimal = { version = "1.42", features = ["macros"] }
-serde_json   = "1"
+# `dec!` via rust_decimal's `macros` feature, so the macro version always matches. Dev-only.
+rust_decimal = { version = "1.43", default-features = false, features = ["macros"] }
+serde_json   = "1.0.100"
 
 [[bench]]
-name = "billing"
+name    = "billing"
 harness = false
 
-# Build profile used by `cargo mutants --profile mutants` (see .cargo/mutants.toml).
-#
-# A mutation run compiles the crate ~1000 times and debugs it zero times, so
-# debuginfo is paid for on every one of those and never read. Incremental state is
-# worse than useless here: each mutant is a different source tree, so the cache
-# never hits and is only written. Turning both off is the cheapest large win
-# available, and it changes nothing about which mutants are caught.
+# Profile for `cargo mutants` (.cargo/mutants.toml): ~1000 builds that never read
+# debuginfo or hit the incremental cache, so both are off. Catches the same mutants.
 [profile.mutants]
 inherits = "dev"
 debug = false
