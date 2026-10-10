@@ -1,10 +1,5 @@
-# Zola configuration for the `billing` landing page and documentation site.
-#
-# Deployed to GitHub Pages by .github/workflows/site.yml. `base_url` must match the
-# deployment origin exactly: it is what canonical links, Open Graph URLs and
-# sitemap.xml are built from, and a wrong value makes every one of them point at a
-# page that does not exist — the single most common way a static docs site loses
-# its search ranking.
+# Zola config for the landing page and docs, deployed by .github/workflows/site.yml.
+# `base_url` must match the deployment origin (canonical links, Open Graph, sitemap).
 base_url = "https://hupe1980.github.io/billing"
 
 title = "billing — EN 16931 invoice arithmetic for Rust"
@@ -15,8 +10,6 @@ totals are derived once from their inputs.\
 """
 author = "hupe1980"
 
-# `default_language` sets <html lang>, which screen readers and search engines both
-# read. Left as English because every word of the content is.
 default_language = "en"
 
 compile_sass = true
@@ -24,7 +17,6 @@ minify_html = true
 build_search_index = true
 generate_feeds = false
 
-# Trailing-slash-free URLs would need server rewrites GitHub Pages does not do.
 hard_link_static = false
 
 [markdown]
@@ -32,9 +24,7 @@ render_emoji = false
 smart_punctuation = true
 insert_anchor_links = "left"
 
-# Emit highlighting as CSS classes rather than inline hex colours, so one rendering
-# of the HTML can serve both palettes. Zola generates the two stylesheets from the
-# light/dark theme pair; the shell switches between them without a reflow.
+# CSS classes, not inline colours, so one HTML serves both light and dark themes.
 [markdown.highlighting]
 style = "class"
 light_theme = "github-light"
@@ -52,7 +42,8 @@ version = "0.16"
 og_image = "/og.png"
 
 [link_checker]
-# `zola check` follows external links too, which is what catches a dead citation.
-# GitHub renders heading anchors client-side, so an anchor check against a GitHub
-# URL reports a false negative — skip those, not the URLs themselves.
+# External links are checked (a dead citation fails the build). This repo's own
+# files are skipped: GitHub answers runner requests to them with 429/503.
+# GitHub renders heading anchors client-side, so its anchors cannot be checked.
+skip_prefixes = ["https://github.com/hupe1980/billing/"]
 skip_anchor_prefixes = ["https://github.com/"]
